@@ -1,0 +1,9 @@
+/build*/
+/deps/
+*.addon64
+*.dll
+*.exe
+*.obj
+*.pdb
+*.log
+github*key*
