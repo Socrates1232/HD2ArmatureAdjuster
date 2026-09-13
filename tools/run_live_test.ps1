@@ -118,12 +118,20 @@ else {
 
 Write-Host "Observing process $($running.Id) for $ObserveSeconds seconds. Move and turn the character now."
 $latestTelemetry = $null
+$strongestTelemetry = $null
+$maxSelectedChanges = -1
+$maxCandidates = 0
 $deadline = [DateTime]::UtcNow.AddSeconds($ObserveSeconds)
 while ([DateTime]::UtcNow -lt $deadline) {
     if (!(Get-Process -Id $running.Id -ErrorAction SilentlyContinue)) { break }
     $sample = Read-Telemetry
     if ($sample -and $sample.process_id -eq $running.Id -and $sample.session_id -ne $previousSession) {
         $latestTelemetry = $sample
+        $maxCandidates = [Math]::Max($maxCandidates, [int]$sample.candidates)
+        if ([int]$sample.selected_changed_slots -gt $maxSelectedChanges) {
+            $maxSelectedChanges = [int]$sample.selected_changed_slots
+            $strongestTelemetry = $sample
+        }
         Write-Host ("frame={0} buffers={1}/{2} candidates={3} moving={4} selected-change={5}" -f
             $sample.frame, $sample.mapped_buffers, $sample.tracked_buffers, $sample.candidates,
             $sample.moving_candidates, $sample.selected_changed_slots)
@@ -139,7 +147,7 @@ $registered = [bool]($interestingLog | Where-Object { $_ -match 'Registered add-
 $loadError = [bool]($interestingLog | Where-Object { $_ -match 'ERROR.*(HD2PaletteProbe|requested API version|Failed to (load|register) add-on)' })
 $telemetrySeen = $null -ne $latestTelemetry
 $runtimeActive = $telemetrySeen -and $latestTelemetry.frame -gt 0 -and $latestTelemetry.tracked_buffers -gt 0
-$motionDetected = $telemetrySeen -and ($latestTelemetry.moving_candidates -gt 0 -or $latestTelemetry.selected_changed_slots -gt 0)
+$motionDetected = $telemetrySeen -and ($latestTelemetry.moving_candidates -gt 0 -or $maxSelectedChanges -gt 0)
 $status = if ($loadError) { 'failed-load' } elseif (!$registered -and !$telemetrySeen) { 'inconclusive-load' } elseif (!$runtimeActive) { 'failed-runtime' } elseif ($motionDetected) { 'passed-with-motion' } else { 'passed-no-motion-yet' }
 
 New-Item -ItemType Directory -Force -Path $resultDir | Out-Null
@@ -162,7 +170,10 @@ $summary = [ordered]@{
     telemetry_seen = $telemetrySeen
     runtime_active = $runtimeActive
     motion_detected = $motionDetected
+    max_candidates = $maxCandidates
+    max_selected_changed_slots = [Math]::Max(0, $maxSelectedChanges)
     telemetry = $latestTelemetry
+    strongest_telemetry = $strongestTelemetry
 }
 $summaryPath = Join-Path $resultDir 'summary.json'
 $summary | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $summaryPath -Encoding utf8

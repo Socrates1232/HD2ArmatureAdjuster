@@ -90,6 +90,8 @@ bool heap_is_cpu_visible(memory_heap heap)
 	return heap == memory_heap::cpu_to_gpu || heap == memory_heap::cpu_only;
 }
 
+void translation_of(const candidate &c, uint32_t slot, float &x, float &y, float &z);
+
 void initialize_telemetry()
 {
 	wchar_t base[32768] = {};
@@ -120,6 +122,13 @@ uint64_t unix_time_ms()
 
 void write_telemetry(uint32_t draws)
 {
+	struct slot_sample
+	{
+		uint32_t slot = 0;
+		float delta = 0.0f;
+		float x = 0.0f, y = 0.0f, z = 0.0f;
+	};
+
 	const auto now = std::chrono::steady_clock::now();
 	if (g_telemetry_path.empty() || now - g_last_telemetry < std::chrono::seconds(1))
 		return;
@@ -128,6 +137,7 @@ void write_telemetry(uint32_t draws)
 	size_t buffer_count = 0, mapped_count = 0, candidate_count = 0, moving_count = 0;
 	uint32_t selected_id = 0, selected_slots = 0, selected_changed = 0;
 	bool paused = false;
+	std::vector<slot_sample> top_slots;
 	{
 		std::lock_guard lock(g_mutex);
 		buffer_count = g_buffers.size();
@@ -143,8 +153,20 @@ void write_telemetry(uint32_t draws)
 			selected_id = selected.id;
 			selected_slots = selected.detected_slots;
 			selected_changed = selected.changed_slots;
+			for (uint32_t slot = 0; slot < selected.slots; ++slot)
+			{
+				slot_sample sample;
+				sample.slot = slot;
+				sample.delta = selected.delta[slot];
+				translation_of(selected, slot, sample.x, sample.y, sample.z);
+				top_slots.push_back(sample);
+			}
 		}
 	}
+	std::sort(top_slots.begin(), top_slots.end(),
+		[](const slot_sample &a, const slot_sample &b) { return a.delta > b.delta; });
+	if (top_slots.size() > 12)
+		top_slots.resize(12);
 
 	std::ostringstream json;
 	json << "{\n"
@@ -164,8 +186,19 @@ void write_telemetry(uint32_t draws)
 		<< "  \"selected_candidate\": " << selected_id << ",\n"
 		<< "  \"selected_slots\": " << selected_slots << ",\n"
 		<< "  \"selected_changed_slots\": " << selected_changed << ",\n"
-		<< "  \"paused\": " << (paused ? "true" : "false") << "\n"
-		<< "}\n";
+		<< "  \"paused\": " << (paused ? "true" : "false") << ",\n"
+		<< "  \"top_changed_slots\": [";
+	for (size_t i = 0; i < top_slots.size(); ++i)
+	{
+		const slot_sample &slot = top_slots[i];
+		json << (i == 0 ? "\n" : ",\n")
+			<< "    { \"slot\": " << slot.slot
+			<< ", \"delta\": " << std::setprecision(8) << slot.delta
+			<< ", \"translation\": [" << slot.x << ", " << slot.y << ", " << slot.z << "] }";
+	}
+	if (!top_slots.empty())
+		json << '\n';
+	json << "  ]\n}\n";
 	const std::string bytes = json.str();
 	const std::wstring temporary = g_telemetry_path + L".tmp";
 	HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
