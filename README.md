@@ -2,6 +2,8 @@
 
 > **Validated mechanism:** the add-on found four B-01 converted inverse-bind tables and produced a reversible visible slot-7 deformation by switching exact B/A/B bytes. See [`LIVE_VALIDATION_2026-09-14.md`](LIVE_VALIDATION_2026-09-14.md). [`REVIEW_RESPONSE_2026-09-14.md`](REVIEW_RESPONSE_2026-09-14.md) records the architectural correction, and [`TEST_REPORT_2026-09-14.md`](TEST_REPORT_2026-09-14.md) preserves the earlier 69-run ledger.
 
+[`CURRENT_STAGE_LOG_2026-09-14.md`](CURRENT_STAGE_LOG_2026-09-14.md) is the authoritative consolidated description of the current mechanism, implementation, workflow, evidence, limitations, and next milestones.
+
 The current validation build searches process memory for an exact offline-generated A/B profile of B-01's converted inverse binds. Its default scan is read-only. An explicit automated edit test can switch the known slot between exact A and B bytes and restore the installed state.
 
 The older generic mapped-buffer and upload-ring experiments remain in the history, but they are not the verified control path.
