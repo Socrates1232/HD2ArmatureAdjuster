@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "result": "passed-reversible-visible-deformation",
+  "camera": "fixed rear view",
+  "pose": "idle",
+  "before": "profile B: large left-shoulder-weighted displacement visible",
+  "active": "profile A: displaced geometry disappears and arm returns to normal position",
+  "restored": "profile B: displaced geometry reappears",
+  "note": "The magenta material is incidental; the spatial B/A/B transition is the evidence."
+}

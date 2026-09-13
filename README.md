@@ -1,10 +1,10 @@
 # HD2 Armature Adjuster
 
-> **Current stage:** the add-on is a read-only, B-01-specific scanner for the loader-converted 48-byte inverse-bind table. It has not yet produced a verified runtime match or visible runtime deformation. Read [`REVIEW_RESPONSE_2026-09-14.md`](REVIEW_RESPONSE_2026-09-14.md) before running it; [`TEST_REPORT_2026-09-14.md`](TEST_REPORT_2026-09-14.md) preserves the earlier 69-run ledger.
+> **Validated mechanism:** the add-on found four B-01 converted inverse-bind tables and produced a reversible visible slot-7 deformation by switching exact B/A/B bytes. See [`LIVE_VALIDATION_2026-09-14.md`](LIVE_VALIDATION_2026-09-14.md). [`REVIEW_RESPONSE_2026-09-14.md`](REVIEW_RESPONSE_2026-09-14.md) records the architectural correction, and [`TEST_REPORT_2026-09-14.md`](TEST_REPORT_2026-09-14.md) preserves the earlier 69-run ledger.
 
-The current validation build searches process memory for an exact offline-generated A/B profile of B-01's converted inverse binds. Its experiment mode is explicit in the console and telemetry. The current mode does not write game memory.
+The current validation build searches process memory for an exact offline-generated A/B profile of B-01's converted inverse binds. Its default scan is read-only. An explicit automated edit test can switch the known slot between exact A and B bytes and restore the installed state.
 
-The older generic mapped-buffer and upload-ring experiments remain in the history, but they are not the current acceptance path. A full converted-table match is the next evidence gate.
+The older generic mapped-buffer and upload-ring experiments remain in the history, but they are not the verified control path.
 
 ## Build
 
@@ -37,7 +37,7 @@ The scanner excludes mapped graphics buffers, its own module, and its scratch st
 
 The add-on writes a one-second heartbeat to `%LOCALAPPDATA%\HD2ArmatureAdjuster\telemetry.json`.
 
-Before launch, the runner requires the installed B-01 patch triplet to match exact profile A or B. The current marker-expanded patch intentionally fails this gate. After installing a controlled triplet and building, run:
+Before launch, the runner requires the installed B-01 patch triplet to match exact profile A or B. Any other patch intentionally fails this gate. After installing a controlled triplet and building, run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/run_live_test.ps1 `
@@ -45,9 +45,16 @@ powershell -ExecutionPolicy Bypass -File tools/run_live_test.ps1 `
   -ObserveSeconds 90
 ```
 
+For the explicit reversible A/B edit and Steam evidence captures:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/run_live_test.ps1 `
+  -ObserveSeconds 90 -AutomateInput -EditTest -SteamCapture -ShutdownAfterTest
+```
+
 The runner validates and deploys the newest DLL, launches through Steam if necessary, reads only the latest 600 ReShade log lines, watches telemetry, and saves `test-results/<timestamp>/summary.json`. A pass requires fresh telemetry from the exact process, `experiment_mode == converted_ib_scan`, and at least one full converted-table match. Anonymous motion and CPU write/readback are not pass conditions.
 
-`-EditTest`, add-on capture, and direct window capture are disabled for this crash-sensitive read-only stage. With `-AutomateInput -SteamCapture`, the runner uses Steam's screenshot key for named load, ready, walk, and stretch states. `-ShutdownAfterTest` terminates only the exact tested process; omit it to leave the game open.
+Add-on capture and direct window capture remain disabled. With `-AutomateInput -SteamCapture`, a scan run records named load, ready, walk, and stretch states. Adding `-EditTest` switches every exact converted-table hit from the installed A/B slot bytes to the opposite profile, holds the state, captures before/active/restored through Steam, and restores the installed bytes. `-ShutdownAfterTest` terminates only the exact tested process; omit it to leave the game open.
 
 Run `tools/run_live_test.ps1 -RecoverOnly` after a crash. It checks live and half-terminated `helldivers2.exe` entries, attempts ordinary exact-PID cleanup, and verifies that the installed add-on is unlocked. If an already-exited process remains, `tools/recover_game_elevated.ps1` can repeat exact-PID cleanup through a UAC prompt. Both procedures refuse PID reuse and never manage Steam. If Windows still retains the process, restart Windows instead of terminating individual threads.
 
@@ -55,10 +62,10 @@ Synthetic input may be ignored by the game or its anti-cheat. The runner waits f
 
 Use `-PreflightOnly` to validate the paths, exact A/B patch state, ReShade installation, DLL architecture, hash, and deployment without launching the game.
 
-The positive report state is `passed-converted-scan`. A clean run with no exact match reports `failed-no-converted-match`; inspect the partial-candidate fields before changing the search.
+Positive report states are `passed-converted-scan` and `passed-converted-edit`. A clean run with no exact match reports `failed-no-converted-match`; inspect the partial-candidate fields before changing the search.
 
 `runtime_active` requires a heartbeat no more than five seconds old. The report also records whether the game process is alive and whether ReShade's last add-on event was registration or unregistration, so a frozen or detached runtime is not reported as a pass.
 
 ## What a useful result looks like
 
-An exact profile A or B hit establishes that a converted representation exists at the reported allocation. It does not yet prove that the active rendered instance consumes that allocation. The following stage must switch the known weighted slot between exact A and B bytes and obtain a controlled visual result.
+An exact A/B hit establishes the profiled converted representation. A reversible visible B/A/B edit establishes render consumption. Both gates passed for B-01 slot 7; general unit discovery and semantic armature reconstruction remain future work.

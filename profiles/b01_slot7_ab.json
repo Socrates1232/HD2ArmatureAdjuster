@@ -25,7 +25,7 @@
     "triplet": {
       "main": {
         "bytes": 50184,
-        "sha256": "fabd2c95511310686b0ee4e4531dc733d18106b505b34af3a19cb1c54913a16f"
+        "sha256": "7d8d0fa1c3203ffdc993aeaac925cf148c04c4f41dff0ab10f10b1994591110e"
       },
       "gpu": {
         "bytes": 5173272,
@@ -37,7 +37,7 @@
       }
     }
   },
-  "main_bytes_changed": 40,
+  "main_bytes_changed": 48,
   "changed_bytes_are_only_target_translation_rows": true,
   "gpu_and_stream_identical": true,
   "lods": [
@@ -45,49 +45,49 @@
       "lod": 0,
       "bones": 88,
       "a_file64_sha256": "2b7b804090b824da059fe7b112c5e2cf4461706933bfefbb769f4a2e065741a6",
-      "b_file64_sha256": "e107c71713894a72548a2bf7edc0b7a1eaae04f98345ec1bc650e6ffdcc8b341",
+      "b_file64_sha256": "5e9c6ffb45eee9cd7eed3dabfa7acee525be93cc32c7928d56bf004bcb530cee",
       "a_t48_sha256": "13941f8e263792a830854eece1ac61a432e2dba79dc2a30b8cdac24282b2740b",
-      "b_t48_sha256": "308497a8c85f3920e33d576efd80110be639e7c31f0ed05e12f3c265e42e567c",
+      "b_t48_sha256": "f757d9be7d3cedc0878e0194d51fdbbc70857bc8c15c38cac455e43eb404b635",
       "a_slot_file64": "469e5dbfe17569bdfc9ffebe00000080556f4a3d79957fbfae95e83c00000000200affbe0500b032a6fa5d3f00000080eacacfbd347fa4bdea5498be0000803f",
-      "b_slot_file64": "469e5dbfe17569bdfc9ffebe00000080556f4a3d79957fbfae95e83c00000000200affbe0500b032a6fa5d3f00000080db98e83cc3fc92bda24664be0000803f",
+      "b_slot_file64": "469e5dbfe17569bdfc9ffebe00000080556f4a3d79957fbfae95e83c00000000200affbe0500b032a6fa5d3f00000080063a993f6093a93b109be53e0000803f",
       "a_slot_t48": "469e5dbf556f4a3d200affbeeacacfbde17569bd79957fbf0500b032347fa4bdfc9ffebeae95e83ca6fa5d3fea5498be",
-      "b_slot_t48": "469e5dbf556f4a3d200affbedb98e83ce17569bd79957fbf0500b032c3fc92bdfc9ffebeae95e83ca6fa5d3fa24664be"
+      "b_slot_t48": "469e5dbf556f4a3d200affbe063a993fe17569bd79957fbf0500b0326093a93bfc9ffebeae95e83ca6fa5d3f109be53e"
     },
     {
       "lod": 1,
       "bones": 88,
       "a_file64_sha256": "2b7b804090b824da059fe7b112c5e2cf4461706933bfefbb769f4a2e065741a6",
-      "b_file64_sha256": "e107c71713894a72548a2bf7edc0b7a1eaae04f98345ec1bc650e6ffdcc8b341",
+      "b_file64_sha256": "5e9c6ffb45eee9cd7eed3dabfa7acee525be93cc32c7928d56bf004bcb530cee",
       "a_t48_sha256": "13941f8e263792a830854eece1ac61a432e2dba79dc2a30b8cdac24282b2740b",
-      "b_t48_sha256": "308497a8c85f3920e33d576efd80110be639e7c31f0ed05e12f3c265e42e567c",
+      "b_t48_sha256": "f757d9be7d3cedc0878e0194d51fdbbc70857bc8c15c38cac455e43eb404b635",
       "a_slot_file64": "469e5dbfe17569bdfc9ffebe00000080556f4a3d79957fbfae95e83c00000000200affbe0500b032a6fa5d3f00000080eacacfbd347fa4bdea5498be0000803f",
-      "b_slot_file64": "469e5dbfe17569bdfc9ffebe00000080556f4a3d79957fbfae95e83c00000000200affbe0500b032a6fa5d3f00000080db98e83cc3fc92bda24664be0000803f",
+      "b_slot_file64": "469e5dbfe17569bdfc9ffebe00000080556f4a3d79957fbfae95e83c00000000200affbe0500b032a6fa5d3f00000080063a993f6093a93b109be53e0000803f",
       "a_slot_t48": "469e5dbf556f4a3d200affbeeacacfbde17569bd79957fbf0500b032347fa4bdfc9ffebeae95e83ca6fa5d3fea5498be",
-      "b_slot_t48": "469e5dbf556f4a3d200affbedb98e83ce17569bd79957fbf0500b032c3fc92bdfc9ffebeae95e83ca6fa5d3fa24664be"
+      "b_slot_t48": "469e5dbf556f4a3d200affbe063a993fe17569bd79957fbf0500b0326093a93bfc9ffebeae95e83ca6fa5d3f109be53e"
     },
     {
       "lod": 2,
       "bones": 88,
       "a_file64_sha256": "2b7b804090b824da059fe7b112c5e2cf4461706933bfefbb769f4a2e065741a6",
-      "b_file64_sha256": "e107c71713894a72548a2bf7edc0b7a1eaae04f98345ec1bc650e6ffdcc8b341",
+      "b_file64_sha256": "5e9c6ffb45eee9cd7eed3dabfa7acee525be93cc32c7928d56bf004bcb530cee",
       "a_t48_sha256": "13941f8e263792a830854eece1ac61a432e2dba79dc2a30b8cdac24282b2740b",
-      "b_t48_sha256": "308497a8c85f3920e33d576efd80110be639e7c31f0ed05e12f3c265e42e567c",
+      "b_t48_sha256": "f757d9be7d3cedc0878e0194d51fdbbc70857bc8c15c38cac455e43eb404b635",
       "a_slot_file64": "469e5dbfe17569bdfc9ffebe00000080556f4a3d79957fbfae95e83c00000000200affbe0500b032a6fa5d3f00000080eacacfbd347fa4bdea5498be0000803f",
-      "b_slot_file64": "469e5dbfe17569bdfc9ffebe00000080556f4a3d79957fbfae95e83c00000000200affbe0500b032a6fa5d3f00000080db98e83cc3fc92bda24664be0000803f",
+      "b_slot_file64": "469e5dbfe17569bdfc9ffebe00000080556f4a3d79957fbfae95e83c00000000200affbe0500b032a6fa5d3f00000080063a993f6093a93b109be53e0000803f",
       "a_slot_t48": "469e5dbf556f4a3d200affbeeacacfbde17569bd79957fbf0500b032347fa4bdfc9ffebeae95e83ca6fa5d3fea5498be",
-      "b_slot_t48": "469e5dbf556f4a3d200affbedb98e83ce17569bd79957fbf0500b032c3fc92bdfc9ffebeae95e83ca6fa5d3fa24664be"
+      "b_slot_t48": "469e5dbf556f4a3d200affbe063a993fe17569bd79957fbf0500b0326093a93bfc9ffebeae95e83ca6fa5d3f109be53e"
     },
     {
       "lod": 3,
       "bones": 88,
       "a_file64_sha256": "2b7b804090b824da059fe7b112c5e2cf4461706933bfefbb769f4a2e065741a6",
-      "b_file64_sha256": "e107c71713894a72548a2bf7edc0b7a1eaae04f98345ec1bc650e6ffdcc8b341",
+      "b_file64_sha256": "5e9c6ffb45eee9cd7eed3dabfa7acee525be93cc32c7928d56bf004bcb530cee",
       "a_t48_sha256": "13941f8e263792a830854eece1ac61a432e2dba79dc2a30b8cdac24282b2740b",
-      "b_t48_sha256": "308497a8c85f3920e33d576efd80110be639e7c31f0ed05e12f3c265e42e567c",
+      "b_t48_sha256": "f757d9be7d3cedc0878e0194d51fdbbc70857bc8c15c38cac455e43eb404b635",
       "a_slot_file64": "469e5dbfe17569bdfc9ffebe00000080556f4a3d79957fbfae95e83c00000000200affbe0500b032a6fa5d3f00000080eacacfbd347fa4bdea5498be0000803f",
-      "b_slot_file64": "469e5dbfe17569bdfc9ffebe00000080556f4a3d79957fbfae95e83c00000000200affbe0500b032a6fa5d3f00000080db98e83cc3fc92bda24664be0000803f",
+      "b_slot_file64": "469e5dbfe17569bdfc9ffebe00000080556f4a3d79957fbfae95e83c00000000200affbe0500b032a6fa5d3f00000080063a993f6093a93b109be53e0000803f",
       "a_slot_t48": "469e5dbf556f4a3d200affbeeacacfbde17569bd79957fbf0500b032347fa4bdfc9ffebeae95e83ca6fa5d3fea5498be",
-      "b_slot_t48": "469e5dbf556f4a3d200affbedb98e83ce17569bd79957fbf0500b032c3fc92bdfc9ffebeae95e83ca6fa5d3fa24664be"
+      "b_slot_t48": "469e5dbf556f4a3d200affbe063a993fe17569bd79957fbf0500b0326093a93bfc9ffebeae95e83ca6fa5d3f109be53e"
     },
     {
       "lod": 4,

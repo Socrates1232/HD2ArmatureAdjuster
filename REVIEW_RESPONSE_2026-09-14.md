@@ -1,5 +1,7 @@
 # Converted Inverse-Bind Review Response
 
+> **Subsequent result:** Tests B and C are now complete. Four converted tables were found and a fixed-camera exaggerated B/A/B edit produced reversible visible deformation. See [`LIVE_VALIDATION_2026-09-14.md`](LIVE_VALIDATION_2026-09-14.md).
+
 Date: 2026-09-14
 Scope: response to the review of `TEST_REPORT_2026-09-14.md` and preparation for the next controlled experiment
 

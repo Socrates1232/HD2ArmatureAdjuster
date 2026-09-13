@@ -239,11 +239,12 @@ if (!$AddonPath) { $AddonPath = Find-AddonBuild }
 $AddonPath = (Resolve-Path -LiteralPath $AddonPath).Path
 
 $reshadeVersion = (Get-Item -LiteralPath $reshadeDll).VersionInfo.ProductVersion
+$expectedExperimentMode = if ($EditTest) { 'converted_ib_edit' } else { 'converted_ib_scan' }
 if ((Get-PeMachine $AddonPath) -ne 0x8664) { throw 'The add-on is not an x64 PE binary.' }
 if ($AutomateInput -and $ObserveSeconds -lt $InputDelaySeconds + 8) {
     throw '-ObserveSeconds must allow at least eight seconds after -InputDelaySeconds.'
 }
-if ($EditTest) { throw '-EditTest is disabled in the read-only converted_ib_scan stage.' }
+if ($EditTest -and !$AutomateInput) { throw '-EditTest requires -AutomateInput.' }
 if ($EnableInGameCapture -or $WindowCapture) {
     throw 'Only -SteamCapture is allowed in this stage; the other capture paths are excluded from the crash-sensitive test.'
 }
@@ -544,10 +545,10 @@ if ($currentProcess) { $currentProcess.Refresh() }
 $processAlive = $null -ne $currentProcess -and !$currentProcess.HasExited
 $runtimeActive = $heartbeatFresh -and $processAlive -and $latestTelemetry.frame -gt 0
 $motionDetected = $telemetrySeen -and ($maxMovingCandidates -gt 0 -or $maxSelectedChanges -gt 0)
-$convertedScanVerified = $experimentMode -eq 'converted_ib_scan' -and $maxConvertedIbHits -gt 0
+$convertedScanVerified = $experimentMode -eq $expectedExperimentMode -and $maxConvertedIbHits -gt 0
 $editVerified = !$EditTest -or ($editCompleted -and $editWriteSuccesses -gt 0 -and
     $editImmediateReadbacks -gt 0 -and $editRestoreSucceeded -and $editError -eq 0)
-$status = if ($loadError) { 'failed-load' } elseif (!$registered -and !$telemetrySeen) { 'inconclusive-load' } elseif (!$runtimeActive) { 'failed-runtime' } elseif ($experimentMode -ne 'converted_ib_scan') { 'failed-experiment-mode' } elseif ($AutomateInput -and ($inputError -or !$inputCompleted)) { 'failed-input' } elseif ($EditTest -and !$editVerified) { 'failed-edit' } elseif (!$convertedScanVerified) { 'failed-no-converted-match' } else { 'passed-converted-scan' }
+$status = if ($loadError) { 'failed-load' } elseif (!$registered -and !$telemetrySeen) { 'inconclusive-load' } elseif (!$runtimeActive) { 'failed-runtime' } elseif ($experimentMode -ne $expectedExperimentMode) { 'failed-experiment-mode' } elseif ($AutomateInput -and ($inputError -or !$inputCompleted)) { 'failed-input' } elseif (!$convertedScanVerified) { 'failed-no-converted-match' } elseif ($EditTest -and !$editVerified) { 'failed-edit' } elseif ($EditTest) { 'passed-converted-edit' } else { 'passed-converted-scan' }
 
 New-Item -ItemType Directory -Force -Path $resultDir | Out-Null
 $interestingLog | Set-Content -LiteralPath (Join-Path $resultDir 'reshade-tail.log') -Encoding utf8
@@ -679,6 +680,7 @@ $summary = [ordered]@{
     max_ring_targets = $maxRingTargets
     max_moving_ring_targets = $maxMovingRingTargets
     experiment_mode = $experimentMode
+    expected_experiment_mode = $expectedExperimentMode
     converted_scan_verified = $convertedScanVerified
     max_converted_ib_hits = $maxConvertedIbHits
     max_converted_ib_a_hits = $maxConvertedIbAHits

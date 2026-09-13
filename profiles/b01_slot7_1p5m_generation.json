@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "unit_id": "fa269172bd08695b",
+  "slot": 7,
+  "factor": 10.0,
+  "lods_touched": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "main_bytes": 50184,
+  "main_bytes_changed": 48,
+  "changes_only_target_translation_rows": true,
+  "main_sha256": "7d8d0fa1c3203ffdc993aeaac925cf148c04c4f41dff0ab10f10b1994591110e",
+  "gpu_sha256": "a4cb635c27ff4ca0056df2a5ab9caaef7cabd3aafc698038b01ce962cb10fd1f",
+  "stream_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

@@ -66,9 +66,12 @@ enum class experiment_mode
 };
 
 constexpr experiment_mode k_experiment_mode = experiment_mode::converted_ib_scan;
+std::atomic<bool> g_converted_edit_requested { false };
 
 const char *experiment_mode_name()
 {
+	if (g_converted_edit_requested.load(std::memory_order_relaxed))
+		return "converted_ib_edit";
 	switch (k_experiment_mode)
 	{
 	case experiment_mode::file64_reference_scan: return "file64_reference_scan";
@@ -276,6 +279,12 @@ bool has_reused_marker_target()
 	std::lock_guard lock(g_mutex);
 	return std::any_of(g_ring_targets.begin(), g_ring_targets.end(),
 		[](const ring_target &target) { return target.changes != 0; });
+}
+
+bool has_converted_ib_target()
+{
+	std::lock_guard lock(g_mutex);
+	return !g_converted_ib_hits.empty();
 }
 
 bool writable_data_page(DWORD protect)
@@ -575,6 +584,7 @@ bool read_automation_request()
 	g_automation_delay_ms = std::min(delay_ms, 120000u);
 	g_skip_intro = skip_intro != 0;
 	g_edit.requested = edit_test != 0;
+	g_converted_edit_requested.store(g_edit.requested, std::memory_order_release);
 	g_capture_enabled = capture_enabled != 0;
 	g_steam_capture_enabled = steam_capture_enabled != 0;
 	return true;
@@ -755,6 +765,13 @@ void on_reshade_present(effect_runtime *runtime)
 			fail_automation(4);
 			return;
 		}
+		if (g_edit.requested)
+		{
+			g_automation_input_started = true;
+			g_automation_deadline = now + std::chrono::seconds(5);
+			g_automation_stage = 13;
+			return;
+		}
 		if (!send_key('W', true))
 		{
 			fail_automation(1);
@@ -812,7 +829,7 @@ void on_reshade_present(effect_runtime *runtime)
 			g_automation_error = 3;
 		if (g_steam_capture_enabled)
 		{
-			g_automation_deadline = now + std::chrono::seconds(1);
+			g_automation_deadline = now + std::chrono::milliseconds(300);
 			g_automation_stage = 16;
 			return;
 		}
@@ -823,7 +840,7 @@ void on_reshade_present(effect_runtime *runtime)
 	else if (g_automation_stage == 16 && now >= g_automation_deadline)
 	{
 		end_edit_pulse();
-		g_automation_deadline = now + std::chrono::seconds(2);
+		g_automation_deadline = now + std::chrono::milliseconds(500);
 		g_automation_stage = 11;
 	}
 	else if (g_automation_stage == 11 && now >= g_automation_deadline)
@@ -846,8 +863,10 @@ void on_reshade_present(effect_runtime *runtime)
 	}
 	else if (g_automation_stage == 13 && now >= g_automation_deadline)
 	{
+		const bool converted_edit = g_converted_edit_requested.load(std::memory_order_acquire);
+		const bool target_ready = converted_edit ? has_converted_ib_target() : has_reused_marker_target();
 		if (now < g_ib_hunt_deadline &&
-			(g_ib_hunt_phase.load(std::memory_order_acquire) == 1 || !has_reused_marker_target()))
+			(g_ib_hunt_phase.load(std::memory_order_acquire) == 1 || !target_ready))
 			return;
 		if (g_steam_capture_enabled)
 		{
@@ -856,7 +875,7 @@ void on_reshade_present(effect_runtime *runtime)
 				fail_automation(3);
 				return;
 			}
-			g_automation_deadline = now + std::chrono::seconds(1);
+			g_automation_deadline = now + std::chrono::milliseconds(300);
 			g_automation_stage = 15;
 			return;
 		}
@@ -894,6 +913,7 @@ void write_telemetry(uint32_t draws)
 	size_t buffer_count = 0, mapped_count = 0, candidate_count = 0, moving_count = 0;
 	size_t ring_count = 0, moving_ring_count = 0;
 	size_t converted_count = 0, converted_a_count = 0, converted_b_count = 0;
+	std::vector<converted_ib_hit> converted_hits;
 	uint32_t selected_id = 0, selected_slots = 0, selected_changed = 0;
 	uint64_t live_resource = 0, live_end = 0, focus_draws = 0, live_locations = 0,
 		residency_restores = 0;
@@ -906,6 +926,7 @@ void write_telemetry(uint32_t draws)
 		candidate_count = g_candidates.size();
 		ring_count = g_ring_targets.size();
 		converted_count = g_converted_ib_hits.size();
+		converted_hits = g_converted_ib_hits;
 		for (const converted_ib_hit &hit : g_converted_ib_hits)
 			if (hit.variant == armature_probe::profile_variant::a)
 				++converted_a_count;
@@ -978,6 +999,19 @@ void write_telemetry(uint32_t draws)
 		<< g_converted_partial_candidates.load(std::memory_order_relaxed) << ",\n"
 		<< "  \"converted_ib_best_partial_entries\": "
 		<< g_converted_best_partial_entries.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"converted_ib_tables\": [";
+	for (size_t index = 0; index < converted_hits.size(); ++index)
+	{
+		const converted_ib_hit &hit = converted_hits[index];
+		if (index != 0)
+			json << ',';
+		json << "{\"address\":\"0x" << std::hex << hit.address
+			<< "\",\"variant\":\""
+			<< (hit.variant == armature_probe::profile_variant::a ? 'A' : 'B')
+			<< "\",\"region_base\":\"0x" << hit.region_base << "\",\"region_size\":"
+			<< std::dec << hit.region_size << ",\"protection\":" << hit.protection << '}';
+	}
+	json << "],\n"
 		<< "  \"animated_palette_hits\": " << ring_count << ",\n"
 		<< "  \"live_palette_resource\": " << live_resource << ",\n"
 		<< "  \"live_palette_end\": " << live_end << ",\n"
@@ -1210,8 +1244,73 @@ void make_displaced_runtime_transform(const uint8_t *original, uint8_t *injected
 	std::memcpy(injected, matrix, sizeof(matrix));
 }
 
+bool begin_converted_edit_test(std::chrono::steady_clock::time_point now)
+{
+	if (g_ib_hunt_phase.load(std::memory_order_acquire) != 2)
+		return false;
+
+	std::lock_guard lock(g_mutex);
+	g_active_edit_targets.clear();
+	g_edit = edit_probe_state {};
+	g_edit.requested = true;
+	g_edit.stride = k_marker_stride;
+	g_edit.slot = armature_ib_profile::slot;
+	g_edit.slots_modified = 1;
+	g_edit.round = 1;
+	g_edit.total_rounds = 1;
+	g_edit.targets_selected = static_cast<uint32_t>(g_converted_ib_hits.size());
+	const size_t slot_offset = static_cast<size_t>(armature_ib_profile::slot) * k_marker_stride;
+
+	for (const converted_ib_hit &hit : g_converted_ib_hits)
+	{
+		active_edit_target target;
+		target.address = hit.address + slot_offset;
+		const uint8_t *source = hit.variant == armature_probe::profile_variant::a ?
+			armature_ib_profile::a_t48.data() : armature_ib_profile::b_t48.data();
+		const uint8_t *destination = hit.variant == armature_probe::profile_variant::a ?
+			armature_ib_profile::b_t48.data() : armature_ib_profile::a_t48.data();
+		target.original.assign(source + slot_offset, source + slot_offset + k_marker_stride);
+		target.injected.assign(destination + slot_offset, destination + slot_offset + k_marker_stride);
+
+		std::array<uint8_t, k_marker_stride> current = {};
+		if (!read_process_bytes(target.address, current.data(), current.size()) ||
+			std::memcmp(current.data(), target.original.data(), current.size()) != 0)
+		{
+			++g_edit.stale_skips;
+			continue;
+		}
+		++g_edit.write_attempts;
+		if (!write_process_bytes(target.address, target.injected.data(), target.injected.size()))
+			continue;
+		if (!read_process_bytes(target.address, current.data(), current.size()) ||
+			std::memcmp(current.data(), target.injected.data(), current.size()) != 0)
+		{
+			write_process_bytes(target.address, target.original.data(), target.original.size());
+			continue;
+		}
+		target.wrote = true;
+		++g_edit.write_successes;
+		++g_edit.immediate_readbacks;
+		++g_edit.targets_written;
+		g_active_edit_targets.push_back(std::move(target));
+	}
+
+	g_edit.active = !g_active_edit_targets.empty();
+	if (!g_edit.active)
+	{
+		g_edit.error = 2;
+		return false;
+	}
+	g_edit_active.store(true, std::memory_order_release);
+	g_automation_deadline = now + std::chrono::seconds(1);
+	g_automation_stage = 10;
+	return true;
+}
+
 bool begin_edit_test(effect_runtime *runtime, std::chrono::steady_clock::time_point now)
 {
+	if (g_converted_edit_requested.load(std::memory_order_acquire))
+		return begin_converted_edit_test(now);
 	if (k_experiment_mode != experiment_mode::animated_palette_edit)
 		return false;
 	if (g_ib_hunt_phase.load(std::memory_order_acquire) != 2)
@@ -1292,6 +1391,38 @@ void write_edit_probe()
 	std::unique_lock lock(g_mutex, std::try_to_lock);
 	if (!lock.owns_lock() || !g_edit.active)
 		return;
+	if (g_converted_edit_requested.load(std::memory_order_acquire))
+	{
+		for (active_edit_target &target : g_active_edit_targets)
+		{
+			std::array<uint8_t, k_marker_stride> current = {};
+			if (!read_process_bytes(target.address, current.data(), current.size()))
+			{
+				++g_edit.stale_skips;
+				continue;
+			}
+			if (std::memcmp(current.data(), target.injected.data(), current.size()) == 0)
+			{
+				++g_edit.present_readbacks;
+				continue;
+			}
+			if (std::memcmp(current.data(), target.original.data(), current.size()) != 0)
+			{
+				++g_edit.stale_skips;
+				continue;
+			}
+			++g_edit.refills_observed;
+			++g_edit.write_attempts;
+			if (write_process_bytes(target.address, target.injected.data(), target.injected.size()) &&
+				read_process_bytes(target.address, current.data(), current.size()) &&
+				std::memcmp(current.data(), target.injected.data(), current.size()) == 0)
+			{
+				++g_edit.write_successes;
+				++g_edit.immediate_readbacks;
+			}
+		}
+		return;
+	}
 	for (active_edit_target &target : g_active_edit_targets)
 	{
 		++g_edit.write_attempts;
@@ -1340,6 +1471,39 @@ void end_edit_pulse()
 	g_edit_active.store(false, std::memory_order_release);
 	std::lock_guard lock(g_mutex);
 	g_edit.active = false;
+	if (g_converted_edit_requested.load(std::memory_order_acquire))
+	{
+		bool restored = true;
+		for (active_edit_target &target : g_active_edit_targets)
+		{
+			std::array<uint8_t, k_marker_stride> current = {};
+			g_edit.restore_attempted = true;
+			if (!read_process_bytes(target.address, current.data(), current.size()))
+			{
+				restored = false;
+				continue;
+			}
+			if (std::memcmp(current.data(), target.original.data(), current.size()) == 0)
+			{
+				++g_edit.targets_restored;
+				continue;
+			}
+			if (std::memcmp(current.data(), target.injected.data(), current.size()) != 0 ||
+				!write_process_bytes(target.address, target.original.data(), target.original.size()) ||
+				!read_process_bytes(target.address, current.data(), current.size()) ||
+				std::memcmp(current.data(), target.original.data(), current.size()) != 0)
+			{
+				restored = false;
+				continue;
+			}
+			++g_edit.targets_restored;
+		}
+		g_edit.restore_succeeded = restored &&
+			g_edit.targets_restored == g_edit.targets_written && g_edit.targets_written != 0;
+		if (!g_edit.restore_succeeded)
+			g_edit.error = 3;
+		return;
+	}
 	bool restored = true;
 	for (active_edit_target &target : g_active_edit_targets)
 	{
@@ -2252,7 +2416,8 @@ void on_unmap_buffer(device *device, resource resource)
 bool on_draw_indexed(command_list *, uint32_t index_count, uint32_t, uint32_t, int32_t, uint32_t)
 {
 	g_draws.fetch_add(1, std::memory_order_relaxed);
-	if (g_edit_active.load(std::memory_order_acquire) &&
+	if (!g_converted_edit_requested.load(std::memory_order_acquire) &&
+		g_edit_active.load(std::memory_order_acquire) &&
 		(index_count == k_focus_index_count_a || index_count == k_focus_index_count_b))
 	{
 		{
@@ -2300,6 +2465,9 @@ void on_present(command_queue *queue, swapchain *, const rect *, const rect *, u
 	{
 		if (hunt_phase == 0)
 			ensure_ib_hunt_thread();
+		if (g_converted_edit_requested.load(std::memory_order_acquire) &&
+			g_edit_active.load(std::memory_order_acquire))
+			write_edit_probe();
 	}
 	else if ((k_experiment_mode == experiment_mode::animated_palette_scan ||
 		k_experiment_mode == experiment_mode::animated_palette_edit) &&
@@ -2316,7 +2484,7 @@ extern "C"
 {
 __declspec(dllexport) const char *NAME = "HD2 Palette Probe";
 __declspec(dllexport) const char *DESCRIPTION =
-	"Read-only exact scanner for a profiled converted inverse-bind table.";
+	"Exact converted inverse-bind scanner with an explicit reversible A/B edit test.";
 }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
