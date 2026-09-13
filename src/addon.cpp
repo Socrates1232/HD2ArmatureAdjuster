@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
@@ -81,9 +82,24 @@ HANDLE g_console = INVALID_HANDLE_VALUE;
 std::chrono::steady_clock::time_point g_last_display;
 std::chrono::steady_clock::time_point g_last_telemetry;
 std::atomic<uint32_t> g_draws { 0 };
+std::atomic<uint32_t> g_last_draws { 0 };
 thread_local bool g_self_map = false;
 std::wstring g_telemetry_path;
+std::wstring g_automation_path;
+std::wstring g_capture_directory;
 uint64_t g_session_id = 0;
+uint32_t g_automation_stage = 0;
+uint32_t g_automation_delay_ms = 20000;
+uint32_t g_capture_count = 0;
+uint32_t g_automation_error = 0;
+bool g_skip_intro = false;
+bool g_automation_input_started = false;
+bool g_automation_completed = false;
+bool g_escape_held = false;
+bool g_w_held = false;
+bool g_d_held = false;
+std::chrono::steady_clock::time_point g_automation_start;
+std::chrono::steady_clock::time_point g_automation_deadline;
 
 bool heap_is_cpu_visible(memory_heap heap)
 {
@@ -107,6 +123,8 @@ void initialize_telemetry()
 	directory += L"HD2ArmatureAdjuster";
 	CreateDirectoryW(directory.c_str(), nullptr);
 	g_telemetry_path = directory + L"\\telemetry.json";
+	g_automation_path = directory + L"\\automation.request";
+	g_capture_directory = directory;
 	g_session_id = (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^ GetTickCount64();
 }
 
@@ -118,6 +136,244 @@ uint64_t unix_time_ms()
 	ticks.LowPart = file_time.dwLowDateTime;
 	ticks.HighPart = file_time.dwHighDateTime;
 	return (ticks.QuadPart - 116444736000000000ull) / 10000ull;
+}
+
+bool game_has_focus()
+{
+	DWORD process_id = 0;
+	GetWindowThreadProcessId(GetForegroundWindow(), &process_id);
+	return process_id == GetCurrentProcessId();
+}
+
+bool focus_runtime_window(effect_runtime *runtime)
+{
+	if (game_has_focus())
+		return true;
+	HWND window = static_cast<HWND>(runtime->get_hwnd());
+	return window != nullptr && SetForegroundWindow(window) && game_has_focus();
+}
+
+bool send_key(WORD virtual_key, bool down)
+{
+	INPUT input = {};
+	input.type = INPUT_KEYBOARD;
+	input.ki.wVk = virtual_key;
+	input.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+	return SendInput(1, &input, sizeof(input)) == 1;
+}
+
+void release_automation_keys()
+{
+	if (g_escape_held)
+		send_key(VK_ESCAPE, false);
+	if (g_w_held)
+		send_key('W', false);
+	if (g_d_held)
+		send_key('D', false);
+	g_escape_held = false;
+	g_w_held = false;
+	g_d_held = false;
+}
+
+bool read_automation_request()
+{
+	if (g_automation_path.empty())
+		return false;
+	HANDLE file = CreateFileW(g_automation_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+		OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE)
+		return false;
+	char text[64] = {};
+	DWORD read = 0;
+	const bool ok = ReadFile(file, text, sizeof(text) - 1, &read, nullptr) != FALSE;
+	CloseHandle(file);
+	DeleteFileW(g_automation_path.c_str());
+	unsigned delay_ms = 20000, skip_intro = 0;
+	if (!ok || sscanf_s(text, "%u %u", &delay_ms, &skip_intro) < 1)
+		return false;
+	g_automation_delay_ms = std::min(delay_ms, 120000u);
+	g_skip_intro = skip_intro != 0;
+	return true;
+}
+
+bool capture_frame(effect_runtime *runtime, const wchar_t *name)
+{
+	uint32_t width = 0, height = 0;
+	runtime->get_screenshot_width_and_height(&width, &height);
+	if (width == 0 || height == 0 || width > 16384 || height > 16384)
+		return false;
+
+	std::vector<uint8_t> source(static_cast<size_t>(width) * height * 4);
+	if (!runtime->capture_screenshot(source.data()))
+		return false;
+
+	const uint32_t output_width = std::min(width, 480u);
+	const uint32_t output_height = std::max(1u, static_cast<uint32_t>(
+		static_cast<uint64_t>(height) * output_width / width));
+	const uint32_t row_size = (output_width * 3 + 3) & ~3u;
+	std::vector<uint8_t> image(static_cast<size_t>(row_size) * output_height);
+	for (uint32_t y = 0; y < output_height; ++y)
+	{
+		const uint32_t source_y = static_cast<uint32_t>(static_cast<uint64_t>(y) * height / output_height);
+		uint8_t *row = image.data() + static_cast<size_t>(output_height - 1 - y) * row_size;
+		for (uint32_t x = 0; x < output_width; ++x)
+		{
+			const uint32_t source_x = static_cast<uint32_t>(static_cast<uint64_t>(x) * width / output_width);
+			const uint8_t *pixel = source.data() + (static_cast<size_t>(source_y) * width + source_x) * 4;
+			row[x * 3 + 0] = pixel[2];
+			row[x * 3 + 1] = pixel[1];
+			row[x * 3 + 2] = pixel[0];
+		}
+	}
+
+	BITMAPFILEHEADER file_header = {};
+	BITMAPINFOHEADER info_header = {};
+	file_header.bfType = 0x4D42;
+	file_header.bfOffBits = sizeof(file_header) + sizeof(info_header);
+	file_header.bfSize = file_header.bfOffBits + static_cast<DWORD>(image.size());
+	info_header.biSize = sizeof(info_header);
+	info_header.biWidth = static_cast<LONG>(output_width);
+	info_header.biHeight = static_cast<LONG>(output_height);
+	info_header.biPlanes = 1;
+	info_header.biBitCount = 24;
+	info_header.biCompression = BI_RGB;
+	info_header.biSizeImage = static_cast<DWORD>(image.size());
+
+	const std::wstring path = g_capture_directory + L"\\" + name;
+	const std::wstring temporary = path + L".tmp";
+	HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE)
+		return false;
+	DWORD written = 0;
+	bool ok = WriteFile(file, &file_header, sizeof(file_header), &written, nullptr) != FALSE;
+	ok = ok && WriteFile(file, &info_header, sizeof(info_header), &written, nullptr) != FALSE;
+	ok = ok && WriteFile(file, image.data(), static_cast<DWORD>(image.size()), &written, nullptr) != FALSE;
+	CloseHandle(file);
+	if (!ok || !MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+	{
+		DeleteFileW(temporary.c_str());
+		return false;
+	}
+	++g_capture_count;
+	return true;
+}
+
+void fail_automation(uint32_t error)
+{
+	release_automation_keys();
+	g_automation_error = error;
+	g_automation_stage = 9;
+}
+
+void on_reshade_present(effect_runtime *runtime)
+{
+	if (runtime->get_device() != g_device)
+		return;
+	const auto now = std::chrono::steady_clock::now();
+	if (g_automation_stage == 0 && read_automation_request())
+		g_automation_stage = 1;
+
+	if ((g_escape_held || g_w_held || g_d_held) && !game_has_focus())
+	{
+		fail_automation(2);
+		return;
+	}
+
+	if (g_automation_stage == 1)
+	{
+		if (!focus_runtime_window(runtime))
+			return;
+		if (g_skip_intro)
+		{
+			g_automation_deadline = now + std::chrono::seconds(10);
+			g_automation_stage = 2;
+		}
+		else
+		{
+			if (!capture_frame(runtime, L"capture-start.bmp"))
+				g_automation_error = 3;
+			g_automation_start = now;
+			g_automation_deadline = now + std::chrono::milliseconds(g_automation_delay_ms);
+			g_automation_stage = 3;
+		}
+	}
+	else if (g_automation_stage == 2 && now >= g_automation_deadline)
+	{
+		if (!g_escape_held)
+		{
+			if (!game_has_focus() || !send_key(VK_ESCAPE, true))
+			{
+				fail_automation(1);
+				return;
+			}
+			g_escape_held = true;
+			g_automation_deadline = now + std::chrono::seconds(4);
+		}
+		else
+		{
+			send_key(VK_ESCAPE, false);
+			g_escape_held = false;
+			if (!capture_frame(runtime, L"capture-start.bmp"))
+				g_automation_error = 3;
+			g_automation_start = now;
+			g_automation_deadline = now + std::chrono::milliseconds(g_automation_delay_ms);
+			g_automation_stage = 3;
+		}
+	}
+	else if (g_automation_stage == 3 && now >= g_automation_deadline &&
+		g_last_draws.load(std::memory_order_relaxed) >= 20)
+	{
+		if (!game_has_focus())
+			return;
+		if (!send_key('W', true))
+		{
+			fail_automation(1);
+			return;
+		}
+		g_w_held = true;
+		g_automation_input_started = true;
+		g_automation_deadline = now + std::chrono::seconds(3);
+		g_automation_stage = 4;
+	}
+	else if (g_automation_stage == 4 && now >= g_automation_deadline)
+	{
+		if (!send_key('D', true))
+		{
+			fail_automation(1);
+			return;
+		}
+		g_d_held = true;
+		g_automation_deadline = now + std::chrono::seconds(2);
+		g_automation_stage = 5;
+	}
+	else if (g_automation_stage == 5 && now >= g_automation_deadline)
+	{
+		release_automation_keys();
+		if (!capture_frame(runtime, L"capture-walk.bmp"))
+			g_automation_error = 3;
+		g_automation_deadline = now + std::chrono::seconds(1);
+		g_automation_stage = 6;
+	}
+	else if (g_automation_stage == 6 && now >= g_automation_deadline)
+	{
+		if (!game_has_focus())
+			return;
+		if (!send_key('B', true) || !send_key('B', false))
+		{
+			fail_automation(1);
+			return;
+		}
+		g_automation_deadline = now + std::chrono::seconds(4);
+		g_automation_stage = 7;
+	}
+	else if (g_automation_stage == 7 && now >= g_automation_deadline)
+	{
+		if (!capture_frame(runtime, L"capture-stretch.bmp"))
+			g_automation_error = 3;
+		g_automation_completed = true;
+		g_automation_stage = 8;
+	}
 }
 
 void write_telemetry(uint32_t draws)
@@ -187,6 +443,11 @@ void write_telemetry(uint32_t draws)
 		<< "  \"selected_slots\": " << selected_slots << ",\n"
 		<< "  \"selected_changed_slots\": " << selected_changed << ",\n"
 		<< "  \"paused\": " << (paused ? "true" : "false") << ",\n"
+		<< "  \"automation_stage\": " << g_automation_stage << ",\n"
+		<< "  \"automation_input_started\": " << (g_automation_input_started ? "true" : "false") << ",\n"
+		<< "  \"automation_completed\": " << (g_automation_completed ? "true" : "false") << ",\n"
+		<< "  \"automation_error\": " << g_automation_error << ",\n"
+		<< "  \"captures\": " << g_capture_count << ",\n"
 		<< "  \"top_changed_slots\": [";
 	for (size_t i = 0; i < top_slots.size(); ++i)
 	{
@@ -533,7 +794,7 @@ void draw_console(uint32_t draws)
 
 	std::ostringstream out;
 	out << "\x1b[2J\x1b[H"
-		<< "HD2 Palette Probe 0.1  |  READ ONLY  |  D3D12\n"
+		<< "HD2 Palette Probe 0.2  |  BUFFER READ ONLY  |  D3D12\n"
 		<< "Anonymous matrix runs only; vertex ownership and bone names are not decoded.\n\n";
 
 	std::lock_guard lock(g_mutex);
@@ -684,6 +945,7 @@ void on_present(command_queue *queue, swapchain *, const rect *, const rect *, u
 		return;
 	++g_frame;
 	const uint32_t draws = g_draws.exchange(0, std::memory_order_relaxed);
+	g_last_draws.store(draws, std::memory_order_relaxed);
 	handle_keys();
 
 	uint32_t selected_id = 0, rotating_id = 0;
@@ -732,9 +994,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 		reshade::register_event<addon_event::unmap_buffer_region>(on_unmap_buffer);
 		reshade::register_event<addon_event::draw_indexed>(on_draw_indexed);
 		reshade::register_event<addon_event::present>(on_present);
+		reshade::register_event<addon_event::reshade_present>(on_reshade_present);
 	}
 	else if (reason == DLL_PROCESS_DETACH)
 	{
+		release_automation_keys();
+		reshade::unregister_event<addon_event::reshade_present>(on_reshade_present);
 		reshade::unregister_event<addon_event::present>(on_present);
 		reshade::unregister_event<addon_event::draw_indexed>(on_draw_indexed);
 		reshade::unregister_event<addon_event::unmap_buffer_region>(on_unmap_buffer);

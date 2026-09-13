@@ -46,7 +46,7 @@ int wmain(int argc, wchar_t **argv)
 		std::cerr << "LoadLibrary failed: " << GetLastError() << '\n';
 		return 1;
 	}
-	if (g_addons != 1 || g_events != 8 || GetProcAddress(addon, "NAME") == nullptr ||
+	if (g_addons != 1 || g_events != 9 || GetProcAddress(addon, "NAME") == nullptr ||
 		GetProcAddress(addon, "DESCRIPTION") == nullptr)
 	{
 		std::cerr << "Registration or metadata export check failed.\n";
@@ -55,11 +55,11 @@ int wmain(int argc, wchar_t **argv)
 	}
 
 	FreeLibrary(addon);
-	if (g_addons != 0 || g_unregistered_events != 8)
+	if (g_addons != 0 || g_unregistered_events != 9)
 	{
 		std::cerr << "Unregistration check failed.\n";
 		return 1;
 	}
-	std::cout << "Loaded, registered 8 callbacks, exported metadata, and unloaded cleanly.\n";
+	std::cout << "Loaded, registered 9 callbacks, exported metadata, and unloaded cleanly.\n";
 	return 0;
 }

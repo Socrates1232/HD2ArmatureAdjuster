@@ -50,10 +50,16 @@ After building, close the game and run:
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/run_live_test.ps1 `
   -GameRoot "F:\Steam\steamapps\common\Helldivers 2" `
-  -ObserveSeconds 90
+  -ObserveSeconds 90 `
+  -AutomateInput `
+  -ShutdownAfterTest
 ```
 
-The runner validates and deploys the DLL, launches the game through Steam if necessary, reads only the latest 600 ReShade log lines, watches telemetry, and saves a compact report under `test-results/<timestamp>/summary.json`. It never closes the game or sends gameplay input. During the observation window, enter a scene and move or turn the character.
+The runner validates and deploys the DLL, launches the game through Steam if necessary, reads only the latest 600 ReShade log lines, watches telemetry, and saves a compact report under `test-results/<timestamp>/summary.json`. With `-AutomateInput`, the loaded add-on waits for the opening movie and attempts a four-second `Esc` hold on runner-launched sessions. Movement begins only after the delay and normal indexed scene rendering are both visible, so an unskippable movie cannot consume the walking test. It then walks forward for three seconds, adds right movement for two seconds, and taps `B` for the stretch animation. Held keys are released if the game loses foreground focus.
+
+The add-on also captures `capture-start.bmp`, `capture-walk.bmp`, and `capture-stretch.bmp` directly from ReShade's back buffer. They are downscaled to 480 pixels wide and copied next to the JSON report. `-ShutdownAfterTest` terminates only the exact tested process after evidence collection; omit it to leave the game open.
+
+Synthetic input may be ignored by the game or its anti-cheat. The runner waits for normal scene rendering and reports `failed-input` instead of claiming a walking pass when the opening movie remains active.
 
 Use `-PreflightOnly` to validate the paths, ReShade installation, DLL architecture, hash, and deployment without launching the game.
 
@@ -61,7 +67,7 @@ Possible report states:
 
 - `passed-with-motion`: loading, callbacks, scanning, and moving candidates were observed.
 - `passed-no-motion-yet`: the runtime works, but the observation window did not catch candidate motion.
-- `failed-load`, `failed-runtime`, or `inconclusive-load`: inspect the adjacent `reshade-tail.log`.
+- `failed-load`, `failed-runtime`, `failed-input`, `failed-shutdown`, or `inconclusive-load`: inspect the adjacent `reshade-tail.log` and summary fields.
 
 `runtime_active` requires a heartbeat no more than five seconds old. The report also records whether the game process is alive and whether ReShade's last add-on event was registration or unregistration, so a frozen or detached runtime is not reported as a pass.
 
