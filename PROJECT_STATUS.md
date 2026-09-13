@@ -10,12 +10,13 @@ The intended finished tool should not require a user-supplied armature, VRM file
 
 ## Current stage
 
-This repository is at the read-only proof-of-concept stage. It contains:
+This repository is at the anonymous discovery and bounded-edit proof-of-concept stage. It contains:
 
 - A loadable ReShade add-on that observes CPU-visible D3D12 buffers.
 - A conservative scanner for transform-shaped arrays using 64-byte matrices, 48-byte packed affine matrices, and 32-byte dual quaternions.
 - A standalone console that reports anonymous candidate slots and value changes.
 - A live-test runner with process-state checks, exact game-window input gating, low-resolution screenshots, shutdown handling, and recovery-only mode.
+- An opt-in edit probe that pulses one transform candidate, verifies readback, and restores the original bytes.
 
 The add-on can expose changing transform-like values, but it cannot yet prove that a candidate is a character bone palette or associate a slot with vertices, a draw, a mesh, or a semantic bone name.
 
@@ -35,6 +36,8 @@ The add-on can expose changing transform-like values, but it cannot yet prove th
 | Run `20260913-180954` | Reached automation stage 7; sent `W`, then `W+D`, then `B`; captured gameplay; 1,179 draws in the last frame; up to three candidates; no candidate marked moving | Input emission is confirmed, but avatar displacement and slot correlation were not verified |
 | Run `20260913-181357` | Three repeated intro-skip `W` attempts; 134 draws; one non-moving candidate; game crashed with Windows application errors `0xc000000d` and `0xc0000026` | Repeated injection was removed. The test is a crash correlation, not proof of its cause |
 | Recovery-only test | Detected the exited-but-present game process, attempted exact-PID cleanup, refused unsafe thread termination, and blocked deployment | Recovery behavior worked as designed; Windows restart was the safe fallback while the stale process remained |
+| Run `20260913-184754` | First edit-channel pass wrote and read back one 48-byte candidate, then restored it; target had no prior motion; shutdown briefly observed an exited process object which cleared immediately afterward | Memory channel verified, render ownership not established |
+| Run `20260913-185144` | Motion-backed candidate 7, slot 5, 48-byte layout; 178,616 successful writes and immediate readbacks; three present-time readbacks; restoration and later engine overwrite observed; movement visibly displaced the character; clean shutdown | Control/feedback loop and writable allocation verified; captures show no unambiguous skeletal deformation |
 
 The stale process later cleared naturally. At the time of this update, no `helldivers2.exe` process is present.
 
@@ -95,8 +98,8 @@ A bone-hash dictionary can be used during development to validate recovered name
 ## Current limitations and open risks
 
 - The scanner recognizes plausible numeric layouts, not skinning ownership. Intro and UI rendering can produce false positives, including repeated `[2, 0, 0]`-like values.
-- There is no descriptor/draw ownership tracking, vertex influence mapping, semantic naming, or runtime editing yet.
-- A moving candidate has not been captured consistently by the automated runner.
+- There is no descriptor/draw ownership tracking, vertex influence mapping, or semantic naming yet.
+- Anonymous buffer editing works, but a rendered character edit has not been proven. A moving transform-shaped candidate can still belong to camera, lighting, physics, or unrelated shader data.
 - The game crash cause is not proven. Repeated input injection was correlated with one crash, and console teardown was a plausible contributor, so both areas were simplified. Neither should be treated as the confirmed root cause.
 - Individual thread termination is intentionally not used for zombie recovery because it can corrupt process and driver state.
 
@@ -106,22 +109,16 @@ A bone-hash dictionary can be used during development to validate recovered name
 - Match both PID and process start time so a restarted process is never mistaken for the original test target.
 - Send input only while the exact game render window has foreground focus.
 - Use one delayed intro input attempt instead of repeated injection.
-- Capture five low-resolution checkpoints: load, start, ready, walk, and stretch. High-resolution capture is reserved for cases where small visual details matter.
+- Capture low-resolution load, start, ready, walk, stretch, edit-before, edit-active, and edit-restored checkpoints. High-resolution capture is reserved for cases where small visual details matter.
 - Treat an exited-but-still-present process as a failed shutdown. Recovery-only mode attempts safe exact-PID cleanup, blocks DLL replacement while it is locked, and requests a Windows restart rather than terminating individual threads.
 
 ## Current deployment state
 
 - Repository baseline before this document: `db49ad4` (`Add crash recovery checks and state captures`).
 - No game process is currently present, and no automation request is pending.
-- The latest locally built DLL is not the DLL currently installed in the game directory; their SHA-256 hashes differ.
-- Therefore, the newest focus, console-lifecycle, and recovery changes have not yet been deployed and live-tested.
+- The current edit-test build was deployed and live-tested successfully. Run `20260913-185144` used SHA-256 `2988A682DB46693EEB49D7BB6049A7ED00BC80E0868B136A97F08F900C160190`.
+- The tested process shut down cleanly, and a fresh process query found no remaining `helldivers2.exe`.
 
 ## Recommended next verification
 
-Before implementing the offline patcher, deploy the current build and separate the next live checks into three small tests:
-
-1. Scanner enabled with no automated input.
-2. Automated input and screenshots with scanning disabled or minimized.
-3. Scanner and one-shot input combined only after both isolated tests remain stable.
-
-If those pass, the next development milestone is a minimal offline marker patch plus runtime recognition of that marker. Slot editing and semantic naming should follow only after ownership and mapping are repeatable.
+The next development milestone is a minimal offline marker patch plus runtime recognition of that marker. The marker is needed to distinguish a character palette consumed by a draw from merely writable, animated transform-shaped data. Repeat the same bounded pulse against the marked palette; a visible before/active/restored difference will validate the final render path before semantic naming or full vertex mapping begins.

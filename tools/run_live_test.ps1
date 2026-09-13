@@ -7,6 +7,7 @@ param(
     [ValidateRange(10, 300)]
     [int]$StartupTimeoutSeconds = 120,
     [switch]$AutomateInput,
+    [switch]$EditTest,
     [ValidateRange(0, 120)]
     [int]$InputDelaySeconds = 10,
     [switch]$ShutdownAfterTest,
@@ -31,7 +32,10 @@ $captureNames = @(
     'capture-start.bmp',
     'capture-ready.bmp',
     'capture-walk.bmp',
-    'capture-stretch.bmp'
+    'capture-stretch.bmp',
+    'capture-edit-before.bmp',
+    'capture-edit-active.bmp',
+    'capture-edit-restored.bmp'
 )
 $resultRoot = Join-Path $projectRoot 'test-results'
 $sessionName = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -164,6 +168,7 @@ if ((Get-PeMachine $AddonPath) -ne 0x8664) { throw 'The add-on is not an x64 PE 
 if ($AutomateInput -and $ObserveSeconds -lt $InputDelaySeconds + 8) {
     throw '-ObserveSeconds must allow at least eight seconds after -InputDelaySeconds.'
 }
+if ($EditTest -and !$AutomateInput) { throw '-EditTest currently requires -AutomateInput.' }
 $addonHash = (Get-FileHash -LiteralPath $AddonPath -Algorithm SHA256).Hash
 $running = Get-GameProcess
 if (!$running -and !(Test-AddonUnlocked)) {
@@ -219,8 +224,9 @@ if ($AutomateInput) {
         Remove-Item -LiteralPath (Join-Path $runtimeDirectory $name) -Force -ErrorAction SilentlyContinue
     }
     $skipIntro = if ($launchedByRunner) { 1 } else { 0 }
-    "$(1000 * $InputDelaySeconds) $skipIntro" | Set-Content -LiteralPath $automationPath -Encoding ascii
-    Write-Host "Requested in-game input and low-resolution captures (skip intro: $([bool]$skipIntro))."
+    $editRequested = if ($EditTest) { 1 } else { 0 }
+    "$(1000 * $InputDelaySeconds) $skipIntro $editRequested" | Set-Content -LiteralPath $automationPath -Encoding ascii
+    Write-Host "Requested in-game input, edit test $([bool]$EditTest), and low-resolution captures (skip intro: $([bool]$skipIntro))."
 }
 
 Write-Host "Observing process $($running.Id) for $ObserveSeconds seconds. Move and turn the character now."
@@ -237,6 +243,15 @@ $inputCompleted = $false
 $inputError = $null
 $automationStage = 0
 $introAttempts = 0
+$editCompleted = $false
+$editTargetHadMotion = $false
+$editWriteSuccesses = 0
+$editImmediateReadbacks = 0
+$editPresentReadbacks = 0
+$editRestoreSucceeded = $false
+$editOverwriteObserved = $false
+$editError = 0
+$completedAt = $null
 $deadline = [DateTime]::UtcNow.AddSeconds($ObserveSeconds)
 while ([DateTime]::UtcNow -lt $deadline) {
     $currentProcess = Get-Process -Id $running.Id -ErrorAction SilentlyContinue
@@ -253,6 +268,14 @@ while ([DateTime]::UtcNow -lt $deadline) {
         $introAttempts = [Math]::Max($introAttempts, [int]$sample.automation_intro_attempts)
         $inputStarted = $inputStarted -or [bool]$sample.automation_input_started
         $inputCompleted = $inputCompleted -or [bool]$sample.automation_completed
+        $editCompleted = $editCompleted -or [bool]$sample.edit_test_completed
+        $editTargetHadMotion = $editTargetHadMotion -or [bool]$sample.edit_target_had_motion
+        $editWriteSuccesses = [Math]::Max($editWriteSuccesses, [int64]$sample.edit_write_successes)
+        $editImmediateReadbacks = [Math]::Max($editImmediateReadbacks, [int64]$sample.edit_immediate_readbacks)
+        $editPresentReadbacks = [Math]::Max($editPresentReadbacks, [int64]$sample.edit_present_readbacks)
+        $editRestoreSucceeded = $editRestoreSucceeded -or [bool]$sample.edit_restore_succeeded
+        $editOverwriteObserved = $editOverwriteObserved -or [bool]$sample.edit_overwrite_observed
+        $editError = [Math]::Max($editError, [int]$sample.edit_error)
         if ([int]$sample.automation_error -ne 0) {
             $inputError = "In-game automation error $($sample.automation_error)."
         }
@@ -269,10 +292,15 @@ while ([DateTime]::UtcNow -lt $deadline) {
             $lastReportedFrame = [int64]$sample.frame
             $lastReportedAutomation = [int]$sample.automation_stage
             $lastReportAt = $now
-            Write-Host ("frame={0} buffers={1}/{2} candidates={3} moving={4} selected-change={5} automation={6}" -f
+            Write-Host ("frame={0} buffers={1}/{2} candidates={3} moving={4} selected-change={5} automation={6} edit-writes={7}" -f
                 $sample.frame, $sample.mapped_buffers, $sample.tracked_buffers, $sample.candidates,
-                $sample.moving_candidates, $sample.selected_changed_slots, $sample.automation_stage)
+                $sample.moving_candidates, $sample.selected_changed_slots, $sample.automation_stage,
+                $sample.edit_write_successes)
         }
+    }
+    if ($AutomateInput -and $inputCompleted) {
+        if (!$completedAt) { $completedAt = [DateTime]::UtcNow }
+        elseif (([DateTime]::UtcNow - $completedAt).TotalSeconds -ge 5) { break }
     }
     Start-Sleep -Seconds 1
 }
@@ -307,7 +335,9 @@ if ($currentProcess) { $currentProcess.Refresh() }
 $processAlive = $null -ne $currentProcess -and !$currentProcess.HasExited
 $runtimeActive = $heartbeatFresh -and $processAlive -and $latestTelemetry.frame -gt 0 -and $latestTelemetry.tracked_buffers -gt 0
 $motionDetected = $telemetrySeen -and ($maxMovingCandidates -gt 0 -or $maxSelectedChanges -gt 0)
-$status = if ($loadError) { 'failed-load' } elseif (!$registered -and !$telemetrySeen) { 'inconclusive-load' } elseif (!$runtimeActive) { 'failed-runtime' } elseif ($AutomateInput -and ($inputError -or !$inputCompleted)) { 'failed-input' } elseif ($motionDetected) { 'passed-with-motion' } else { 'passed-no-motion-yet' }
+$editVerified = !$EditTest -or ($editCompleted -and $editWriteSuccesses -gt 0 -and
+    $editImmediateReadbacks -gt 0 -and $editRestoreSucceeded -and $editError -eq 0)
+$status = if ($loadError) { 'failed-load' } elseif (!$registered -and !$telemetrySeen) { 'inconclusive-load' } elseif (!$runtimeActive) { 'failed-runtime' } elseif ($AutomateInput -and ($inputError -or !$inputCompleted)) { 'failed-input' } elseif ($EditTest -and !$editVerified) { 'failed-edit' } elseif ($EditTest) { 'passed-edit-channel' } elseif ($motionDetected) { 'passed-with-motion' } else { 'passed-no-motion-yet' }
 
 New-Item -ItemType Directory -Force -Path $resultDir | Out-Null
 $interestingLog | Set-Content -LiteralPath (Join-Path $resultDir 'reshade-tail.log') -Encoding utf8
@@ -338,6 +368,14 @@ if ($ShutdownAfterTest) {
         }
         $remaining = Get-Process -Id $running.Id -ErrorAction SilentlyContinue
         if ($remaining) { $remaining.Refresh() }
+        if ($remaining -and $remaining.HasExited) {
+            $clearDeadline = [DateTime]::UtcNow.AddSeconds(3)
+            do {
+                Start-Sleep -Milliseconds 250
+                $remaining = Get-Process -Id $running.Id -ErrorAction SilentlyContinue
+                if ($remaining) { $remaining.Refresh() }
+            } while ($remaining -and $remaining.HasExited -and [DateTime]::UtcNow -lt $clearDeadline)
+        }
         $shutdownSucceeded = $null -eq $remaining
         if (!$shutdownSucceeded) {
             $shutdownError = if ($remaining.HasExited) {
@@ -379,6 +417,16 @@ $summary = [ordered]@{
     input_started = $inputStarted
     input_completed = $inputCompleted
     input_error = $inputError
+    edit_test_requested = [bool]$EditTest
+    edit_test_completed = $editCompleted
+    edit_target_had_motion = $editTargetHadMotion
+    edit_write_successes = $editWriteSuccesses
+    edit_immediate_readbacks = $editImmediateReadbacks
+    edit_present_readbacks = $editPresentReadbacks
+    edit_restore_succeeded = $editRestoreSucceeded
+    edit_overwrite_observed = $editOverwriteObserved
+    edit_error = $editError
+    edit_channel_verified = $editVerified
     automation_stage = $automationStage
     intro_attempts = $introAttempts
     capture_files = $captureFiles

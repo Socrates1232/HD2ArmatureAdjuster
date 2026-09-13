@@ -1,6 +1,6 @@
 # HD2 Armature Adjuster
 
-The first-stage palette probe for a future HD2 armature-adjustment tool. This deliberately small, read-only ReShade add-on uses no mod, armature, VRM, Lua, or address cheat sheet. It scans CPU-visible D3D12 buffers for consecutive transform-shaped values and displays anonymous slots plus their frame-to-frame movement in its own console.
+The first-stage palette probe for a future HD2 armature-adjustment tool. This deliberately small ReShade add-on uses no mod, armature, VRM, Lua, or address cheat sheet. It scans CPU-visible D3D12 buffers for consecutive transform-shaped values and displays anonymous slots plus their frame-to-frame movement in its own console. Writes occur only during an explicitly requested, bounded edit test.
 
 This version does **not** prove which draw or vertices consume a candidate. A `candidate / resource / offset / slot` is an observation, not yet a named bone. Descriptor-to-draw correlation and vertex-weight decoding belong in the next stage.
 
@@ -39,7 +39,7 @@ Keys are read while the game is running:
 - `F8`: pause/resume discovery scanning (candidate sampling continues)
 - `F9`: clear candidates and rescan from the start
 
-The scanner reads at most one 64 KiB discovery window per presented frame, plus small snapshots of the selected and one rotating candidate. It never maps or writes GPU-only resources and never writes into a game buffer.
+The scanner reads at most one 64 KiB discovery window per presented frame, plus small snapshots of the selected and one rotating candidate. It never maps or writes GPU-only resources. Normal interactive operation is read-only.
 
 ## Automated live test
 
@@ -52,12 +52,15 @@ powershell -ExecutionPolicy Bypass -File tools/run_live_test.ps1 `
   -GameRoot "F:\Steam\steamapps\common\Helldivers 2" `
   -ObserveSeconds 90 `
   -AutomateInput `
+  -EditTest `
   -ShutdownAfterTest
 ```
 
 The runner validates and deploys the DLL, launches the game through Steam if necessary, reads only the latest 600 ReShade log lines, watches telemetry, and saves a compact report under `test-results/<timestamp>/summary.json`. With `-AutomateInput`, the loaded add-on focuses ReShade's exact game window, lets startup settle for 25 seconds, and makes one short `W` intro attempt. Movement begins only after the configured delay and normal indexed scene rendering are both visible, so startup loading cannot consume the walking test. It then walks forward for three seconds, adds right movement for two seconds, and taps `B` for the stretch animation. Held keys are released if the exact game window loses foreground focus.
 
-The add-on captures `capture-load.bmp`, `capture-start.bmp`, `capture-ready.bmp`, `capture-walk.bmp`, and `capture-stretch.bmp` directly from ReShade's back buffer. Casual state captures are downscaled to 480 pixels wide and copied next to the JSON report; high-resolution capture is intentionally left off until a test needs visual detail. `-ShutdownAfterTest` terminates only the exact tested process after evidence collection; omit it to leave the game open.
+With `-EditTest`, the add-on waits briefly for a moving 48- or 64-byte candidate, adds `0.35` to one translation component for two seconds, verifies every write by readback, captures the active state, restores the exact original element, and records whether the game later overwrites that allocation normally. The additional captures are `capture-edit-before.bmp`, `capture-edit-active.bmp`, and `capture-edit-restored.bmp`. This validates the memory channel; only a clear visual change validates render ownership.
+
+All captures come directly from ReShade's back buffer and are downscaled to 480 pixels wide. `-ShutdownAfterTest` terminates only the exact tested process after evidence collection; omit it to leave the game open.
 
 Run `tools/run_live_test.ps1 -RecoverOnly` after a crash. It checks live and half-terminated `helldivers2.exe` entries, attempts ordinary exact-PID cleanup, and verifies that the installed add-on is unlocked. If Windows retains an already-exited process after cleanup, the procedure refuses deployment and asks for a Windows restart instead of using unsafe thread termination.
 
@@ -69,7 +72,8 @@ Possible report states:
 
 - `passed-with-motion`: loading, callbacks, scanning, and moving candidates were observed.
 - `passed-no-motion-yet`: the runtime works, but the observation window did not catch candidate motion.
-- `failed-load`, `failed-runtime`, `failed-input`, `failed-shutdown`, or `inconclusive-load`: inspect the adjacent `reshade-tail.log` and summary fields.
+- `passed-edit-channel`: bounded writes, readback, and restoration succeeded. This does not by itself mean the edited candidate affected the character.
+- `failed-load`, `failed-runtime`, `failed-input`, `failed-edit`, `failed-shutdown`, or `inconclusive-load`: inspect the adjacent `reshade-tail.log` and summary fields.
 
 `runtime_active` requires a heartbeat no more than five seconds old. The report also records whether the game process is alive and whether ReShade's last add-on event was registration or unregistration, so a frozen or detached runtime is not reported as a pass.
 

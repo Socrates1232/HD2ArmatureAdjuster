@@ -5,6 +5,7 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -30,6 +31,7 @@ constexpr uint32_t k_min_slots = 8;
 constexpr uint32_t k_max_slots = 256;
 constexpr size_t k_max_candidates = 64;
 constexpr float k_motion_epsilon = 1.0e-5f;
+constexpr float k_edit_translation = 0.35f;
 
 struct buffer_info
 {
@@ -63,6 +65,30 @@ struct candidate
 	bool fresh = true;
 	std::vector<uint8_t> bytes;
 	std::vector<float> delta;
+	std::vector<float> peak_delta;
+};
+
+struct edit_probe_state
+{
+	bool requested = false;
+	bool active = false;
+	bool completed = false;
+	bool target_had_motion = false;
+	uint32_t candidate_id = 0;
+	uint32_t slot = 0;
+	uint32_t stride = 0;
+	uint64_t resource = 0;
+	uint64_t offset = 0;
+	uint64_t write_attempts = 0;
+	uint64_t write_successes = 0;
+	uint64_t immediate_readbacks = 0;
+	uint64_t present_readbacks = 0;
+	bool restore_attempted = false;
+	bool restore_succeeded = false;
+	bool overwrite_observed = false;
+	uint32_t error = 0;
+	std::array<uint8_t, 64> original {};
+	std::array<uint8_t, 64> injected {};
 };
 
 std::mutex g_mutex;
@@ -100,6 +126,9 @@ bool g_automation_completed = false;
 bool g_w_held = false;
 bool g_d_held = false;
 std::chrono::steady_clock::time_point g_automation_deadline;
+std::chrono::steady_clock::time_point g_edit_selection_deadline;
+edit_probe_state g_edit;
+std::atomic<bool> g_edit_active { false };
 
 bool heap_is_cpu_visible(memory_heap heap)
 {
@@ -107,6 +136,10 @@ bool heap_is_cpu_visible(memory_heap heap)
 }
 
 void translation_of(const candidate &c, uint32_t slot, float &x, float &y, float &z);
+bool begin_edit_test(effect_runtime *runtime, std::chrono::steady_clock::time_point now);
+bool has_motion_edit_candidate();
+void end_edit_pulse();
+void write_edit_probe();
 
 void initialize_telemetry()
 {
@@ -183,11 +216,12 @@ bool read_automation_request()
 	const bool ok = ReadFile(file, text, sizeof(text) - 1, &read, nullptr) != FALSE;
 	CloseHandle(file);
 	DeleteFileW(g_automation_path.c_str());
-	unsigned delay_ms = 20000, skip_intro = 0;
-	if (!ok || sscanf_s(text, "%u %u", &delay_ms, &skip_intro) < 1)
+	unsigned delay_ms = 20000, skip_intro = 0, edit_test = 0;
+	if (!ok || sscanf_s(text, "%u %u %u", &delay_ms, &skip_intro, &edit_test) < 1)
 		return false;
 	g_automation_delay_ms = std::min(delay_ms, 120000u);
 	g_skip_intro = skip_intro != 0;
+	g_edit.requested = edit_test != 0;
 	return true;
 }
 
@@ -352,10 +386,45 @@ void on_reshade_present(effect_runtime *runtime)
 		if (!capture_frame(runtime, L"capture-walk.bmp"))
 			g_automation_error = 3;
 		g_automation_deadline = now + std::chrono::seconds(1);
+		g_edit_selection_deadline = now + std::chrono::seconds(6);
 		g_automation_stage = 6;
 	}
 	else if (g_automation_stage == 6 && now >= g_automation_deadline)
 	{
+		if (g_edit.requested)
+		{
+			if (now < g_edit_selection_deadline && !has_motion_edit_candidate())
+				return;
+			if (!begin_edit_test(runtime, now))
+				fail_automation(4);
+			return;
+		}
+		if (!game_has_focus())
+			return;
+		if (!send_key('B', true) || !send_key('B', false))
+		{
+			fail_automation(1);
+			return;
+		}
+		g_automation_deadline = now + std::chrono::seconds(4);
+		g_automation_stage = 7;
+	}
+	else if (g_automation_stage == 10 && now >= g_automation_deadline)
+	{
+		if (!capture_frame(runtime, L"capture-edit-active.bmp"))
+			g_automation_error = 3;
+		end_edit_pulse();
+		g_automation_deadline = now + std::chrono::seconds(2);
+		g_automation_stage = 11;
+	}
+	else if (g_automation_stage == 11 && now >= g_automation_deadline)
+	{
+		if (!capture_frame(runtime, L"capture-edit-restored.bmp"))
+			g_automation_error = 3;
+		{
+			std::lock_guard lock(g_mutex);
+			g_edit.completed = true;
+		}
 		if (!game_has_focus())
 			return;
 		if (!send_key('B', true) || !send_key('B', false))
@@ -392,12 +461,14 @@ void write_telemetry(uint32_t draws)
 	size_t buffer_count = 0, mapped_count = 0, candidate_count = 0, moving_count = 0;
 	uint32_t selected_id = 0, selected_slots = 0, selected_changed = 0;
 	bool paused = false;
+	edit_probe_state edit;
 	std::vector<slot_sample> top_slots;
 	{
 		std::lock_guard lock(g_mutex);
 		buffer_count = g_buffers.size();
 		candidate_count = g_candidates.size();
 		paused = g_paused;
+		edit = g_edit;
 		for (const auto &[unused, info] : g_buffers)
 			mapped_count += info.map_ptr != nullptr;
 		for (const candidate &c : g_candidates)
@@ -425,7 +496,7 @@ void write_telemetry(uint32_t draws)
 
 	std::ostringstream json;
 	json << "{\n"
-		<< "  \"schema\": 1,\n"
+		<< "  \"schema\": 2,\n"
 		<< "  \"addon\": \"HD2 Palette Probe\",\n"
 		<< "  \"api_version\": " << RESHADE_API_VERSION << ",\n"
 		<< "  \"process_id\": " << GetCurrentProcessId() << ",\n"
@@ -448,6 +519,22 @@ void write_telemetry(uint32_t draws)
 		<< "  \"automation_completed\": " << (g_automation_completed ? "true" : "false") << ",\n"
 		<< "  \"automation_error\": " << g_automation_error << ",\n"
 		<< "  \"captures\": " << g_capture_count << ",\n"
+		<< "  \"edit_test_requested\": " << (edit.requested ? "true" : "false") << ",\n"
+		<< "  \"edit_test_active\": " << (edit.active ? "true" : "false") << ",\n"
+		<< "  \"edit_test_completed\": " << (edit.completed ? "true" : "false") << ",\n"
+		<< "  \"edit_target_had_motion\": " << (edit.target_had_motion ? "true" : "false") << ",\n"
+		<< "  \"edit_candidate\": " << edit.candidate_id << ",\n"
+		<< "  \"edit_slot\": " << edit.slot << ",\n"
+		<< "  \"edit_stride\": " << edit.stride << ",\n"
+		<< "  \"edit_translation_delta\": " << k_edit_translation << ",\n"
+		<< "  \"edit_write_attempts\": " << edit.write_attempts << ",\n"
+		<< "  \"edit_write_successes\": " << edit.write_successes << ",\n"
+		<< "  \"edit_immediate_readbacks\": " << edit.immediate_readbacks << ",\n"
+		<< "  \"edit_present_readbacks\": " << edit.present_readbacks << ",\n"
+		<< "  \"edit_restore_attempted\": " << (edit.restore_attempted ? "true" : "false") << ",\n"
+		<< "  \"edit_restore_succeeded\": " << (edit.restore_succeeded ? "true" : "false") << ",\n"
+		<< "  \"edit_overwrite_observed\": " << (edit.overwrite_observed ? "true" : "false") << ",\n"
+		<< "  \"edit_error\": " << edit.error << ",\n"
 		<< "  \"top_changed_slots\": [";
 	for (size_t i = 0; i < top_slots.size(); ++i)
 	{
@@ -545,6 +632,128 @@ void translation_of(const candidate &c, uint32_t slot, float &x, float &y, float
 		y = 2.0f * (-dw * ry + rw * dy + rz * dx - rx * dz);
 		z = 2.0f * (-dw * rz + rw * dz + rx * dy - ry * dx);
 	}
+}
+
+bool write_edit_bytes_locked(const std::array<uint8_t, 64> &bytes, bool verify)
+{
+	auto it = g_buffers.find(g_edit.resource);
+	if (it == g_buffers.end() || it->second.map_ptr == nullptr || g_edit.offset < it->second.map_offset)
+		return false;
+	const uint64_t relative = g_edit.offset - it->second.map_offset;
+	if (relative > it->second.map_size || g_edit.stride > it->second.map_size - relative)
+		return false;
+	uint8_t *target = static_cast<uint8_t *>(it->second.map_ptr) + relative;
+	std::memcpy(target, bytes.data(), g_edit.stride);
+	return !verify || std::memcmp(target, bytes.data(), g_edit.stride) == 0;
+}
+
+bool has_motion_edit_candidate()
+{
+	std::lock_guard lock(g_mutex);
+	for (const candidate &c : g_candidates)
+		if (c.fresh && (c.stride == 48 || c.stride == 64) &&
+			std::any_of(c.peak_delta.begin(), c.peak_delta.end(),
+				[](float delta) { return delta > k_motion_epsilon; }))
+			return true;
+	return false;
+}
+
+bool begin_edit_test(effect_runtime *runtime, std::chrono::steady_clock::time_point now)
+{
+	if (!capture_frame(runtime, L"capture-edit-before.bmp"))
+		g_automation_error = 3;
+
+	std::lock_guard lock(g_mutex);
+	candidate *best = nullptr;
+	uint32_t best_slot = 0;
+	float best_peak = -1.0f;
+	for (candidate &c : g_candidates)
+	{
+		if (!c.fresh || (c.stride != 48 && c.stride != 64) || c.bytes.size() < c.stride)
+			continue;
+		uint32_t slot = 0;
+		float peak = 0.0f;
+		for (uint32_t i = 0; i < c.slots; ++i)
+			if (c.peak_delta[i] > peak)
+			{
+				peak = c.peak_delta[i];
+				slot = i;
+			}
+		const bool moved = peak > k_motion_epsilon;
+		const bool best_moved = best_peak > k_motion_epsilon;
+		if (best == nullptr || moved > best_moved ||
+			(moved == best_moved && c.stride == 48 && best->stride != 48) ||
+			(moved == best_moved && c.stride == best->stride && peak > best_peak))
+		{
+			best = &c;
+			best_slot = slot;
+			best_peak = peak;
+		}
+	}
+	if (best == nullptr)
+	{
+		g_edit.error = 1;
+		return false;
+	}
+
+	edit_probe_state next;
+	next.requested = true;
+	next.active = true;
+	next.target_had_motion = best_peak > k_motion_epsilon;
+	next.candidate_id = best->id;
+	next.slot = best_slot;
+	next.stride = best->stride;
+	next.resource = best->resource;
+	next.offset = best->offset + static_cast<uint64_t>(best_slot) * best->stride;
+	const uint8_t *source = best->bytes.data() + static_cast<size_t>(best_slot) * best->stride;
+	std::memcpy(next.original.data(), source, best->stride);
+	std::memcpy(next.injected.data(), source, best->stride);
+	const size_t translation_index = best->stride == 64 ?
+		(best->alternate_layout ? 3 : 12) : (best->alternate_layout ? 9 : 3);
+	float translated = read_float(next.injected.data(), translation_index) + k_edit_translation;
+	if (!std::isfinite(translated) || std::fabs(translated) >= 1.0e6f)
+	{
+		g_edit.error = 1;
+		return false;
+	}
+	std::memcpy(next.injected.data() + translation_index * sizeof(float), &translated, sizeof(translated));
+	g_edit = next;
+	g_edit_active.store(true, std::memory_order_release);
+	g_automation_deadline = now + std::chrono::seconds(2);
+	g_automation_stage = 10;
+	return true;
+}
+
+void write_edit_probe()
+{
+	if (!g_edit_active.load(std::memory_order_acquire))
+		return;
+	std::lock_guard lock(g_mutex);
+	if (!g_edit.active)
+		return;
+	++g_edit.write_attempts;
+	if (write_edit_bytes_locked(g_edit.injected, true))
+	{
+		++g_edit.write_successes;
+		++g_edit.immediate_readbacks;
+	}
+	else
+	{
+		g_edit.error = 2;
+		g_edit.active = false;
+		g_edit_active.store(false, std::memory_order_release);
+	}
+}
+
+void end_edit_pulse()
+{
+	g_edit_active.store(false, std::memory_order_release);
+	std::lock_guard lock(g_mutex);
+	g_edit.active = false;
+	g_edit.restore_attempted = true;
+	g_edit.restore_succeeded = write_edit_bytes_locked(g_edit.original, true);
+	if (!g_edit.restore_succeeded && g_edit.error == 0)
+		g_edit.error = 3;
 }
 
 size_t copy_buffer(uint64_t handle, uint64_t offset, uint64_t wanted, std::vector<uint8_t> &out)
@@ -653,10 +862,19 @@ void refresh_candidate(uint32_t id)
 		for (size_t p = begin; p < begin + stride; p += sizeof(float))
 			largest = std::max(largest, std::fabs(read_float(bytes.data() + p, 0) - read_float(it->bytes.data() + p, 0)));
 		it->delta[slot] = largest;
+		it->peak_delta[slot] = std::max(it->peak_delta[slot], largest);
 		if (largest > k_motion_epsilon)
 			++it->changed_slots;
 	}
 	it->bytes.swap(bytes);
+	if (it->id == g_edit.candidate_id && g_edit.slot < it->slots)
+	{
+		const uint8_t *element = it->bytes.data() + static_cast<size_t>(g_edit.slot) * it->stride;
+		if (g_edit.active && std::memcmp(element, g_edit.injected.data(), it->stride) == 0)
+			++g_edit.present_readbacks;
+		else if (g_edit.restore_attempted && std::memcmp(element, g_edit.injected.data(), it->stride) != 0)
+			g_edit.overwrite_observed = true;
+	}
 	++it->samples;
 	if (it->changed_slots != 0)
 	{
@@ -701,6 +919,7 @@ void remember_run(uint64_t handle, uint64_t offset, const armature_probe::matrix
 	found.last_seen_frame = g_frame;
 	found.bytes.assign(bytes, bytes + byte_count);
 	found.delta.resize(slots);
+	found.peak_delta.resize(slots);
 	if (run.stride == 64)
 		found.alternate_layout = score.layout_b > score.layout_a;
 	else if (run.stride == 48)
@@ -796,7 +1015,7 @@ void draw_console(uint32_t draws)
 
 	std::ostringstream out;
 	out << "\x1b[2J\x1b[H"
-		<< "HD2 Palette Probe 0.2  |  BUFFER READ ONLY  |  D3D12\n"
+		<< "HD2 Palette Probe 0.3  |  READ + BOUNDED EDIT TEST  |  D3D12\n"
 		<< "Anonymous matrix runs only; vertex ownership and bone names are not decoded.\n\n";
 
 	std::lock_guard lock(g_mutex);
@@ -809,7 +1028,12 @@ void draw_console(uint32_t draws)
 		<< (static_cast<double>(g_scanned_bytes) / (1024.0 * 1024.0)) << " MiB"
 		<< "  candidates " << g_candidates.size()
 		<< (g_paused ? "  [PAUSED]\n" : "\n")
-		<< "F6 next candidate   F7 next 16 slots   F8 pause   F9 rescan\n\n";
+		<< "F6 next candidate   F7 next 16 slots   F8 pause   F9 rescan\n"
+		<< "edit: " << (g_edit.active ? "ACTIVE" : g_edit.completed ? "complete" : g_edit.requested ? "armed" : "off")
+		<< "  target " << g_edit.candidate_id << ':' << g_edit.slot
+		<< "  writes " << g_edit.write_successes << '/' << g_edit.write_attempts
+		<< "  readback " << g_edit.present_readbacks
+		<< "  restored " << (g_edit.restore_succeeded ? "yes" : "no") << "\n\n";
 
 	if (g_candidates.empty())
 	{
@@ -867,6 +1091,8 @@ void on_destroy_device(device *device)
 	g_buffers.clear();
 	g_buffer_order.clear();
 	g_candidates.clear();
+	g_edit_active.store(false, std::memory_order_release);
+	g_edit.active = false;
 	g_device = nullptr;
 }
 
@@ -894,6 +1120,12 @@ void on_destroy_resource(device *device, resource resource)
 		g_buffers.erase(it);
 		g_candidates.erase(std::remove_if(g_candidates.begin(), g_candidates.end(),
 			[resource](const candidate &c) { return c.resource == resource.handle; }), g_candidates.end());
+		if (g_edit.resource == resource.handle)
+		{
+			g_edit.active = false;
+			g_edit.error = 4;
+			g_edit_active.store(false, std::memory_order_release);
+		}
 		if (g_selected >= g_candidates.size())
 			g_selected = 0;
 	}
@@ -937,6 +1169,7 @@ void on_unmap_buffer(device *device, resource resource)
 
 bool on_draw_indexed(command_list *, uint32_t, uint32_t, uint32_t, int32_t, uint32_t)
 {
+	write_edit_probe();
 	g_draws.fetch_add(1, std::memory_order_relaxed);
 	return false;
 }
@@ -978,7 +1211,7 @@ extern "C"
 {
 __declspec(dllexport) const char *NAME = "HD2 Palette Probe";
 __declspec(dllexport) const char *DESCRIPTION =
-	"Read-only D3D12 scanner that displays anonymous, animated transform slots in a standalone console.";
+	"D3D12 transform scanner with a bounded, reversible anonymous-slot edit probe.";
 }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
