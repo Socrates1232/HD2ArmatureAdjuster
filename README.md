@@ -1,5 +1,7 @@
 # HD2 Armature Adjuster
 
+> **Experimental review snapshot:** The current source is no longer the generic dependency-free probe described by the original introduction below. It contains B-01-specific natural-fingerprint and marker-tail experiments, and it has not yet produced a verified visible runtime deformation. Read [`TEST_REPORT_2026-09-14.md`](TEST_REPORT_2026-09-14.md) before reviewing or running it.
+
 The first-stage palette probe for a future HD2 armature-adjustment tool. This deliberately small ReShade add-on uses no mod, armature, VRM, Lua, or address cheat sheet. It scans CPU-visible D3D12 buffers for consecutive transform-shaped values and displays anonymous slots plus their frame-to-frame movement in its own console. Writes occur only during an explicitly requested, bounded edit test.
 
 This version does **not** prove which draw or vertices consume a candidate. A `candidate / resource / offset / slot` is an observation, not yet a named bone. Descriptor-to-draw correlation and vertex-weight decoding belong in the next stage.

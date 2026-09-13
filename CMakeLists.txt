@@ -14,7 +14,7 @@ if(NOT EXISTS "${RESHADE_INCLUDE_DIR}/reshade.hpp")
 endif()
 
 add_library(HD2PaletteProbe SHARED src/addon.cpp)
-target_sources(HD2PaletteProbe PRIVATE src/matrix_scan.hpp)
+target_sources(HD2PaletteProbe PRIVATE src/matrix_scan.hpp src/fingerprint_data.hpp src/wc_read.hpp)
 target_compile_features(HD2PaletteProbe PRIVATE cxx_std_17)
 target_include_directories(HD2PaletteProbe PRIVATE
 	"${RESHADE_INCLUDE_DIR}")

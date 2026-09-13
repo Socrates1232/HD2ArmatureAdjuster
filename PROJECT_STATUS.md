@@ -1,5 +1,7 @@
 # HD2 Armature Adjuster: Project Status and Findings
 
+> **Review hold (2026-09-14):** This document describes an earlier stage and contains conclusions that later tests weakened or disproved. See [`TEST_REPORT_2026-09-14.md`](TEST_REPORT_2026-09-14.md) for the complete 69-run ledger, assumption audit, crash analysis, current installed hashes, and corrected project verdict. No further live testing should be based on this older summary alone.
+
 Updated: 2026-09-13
 
 ## Goal

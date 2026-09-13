@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace armature_probe
 {
@@ -163,6 +164,38 @@ inline matrix_run find_longest_run(const uint8_t *data, size_t size)
 		}
 	}
 	return best;
+}
+
+inline std::vector<matrix_run> find_runs(const uint8_t *data, size_t size,
+	uint32_t stride, uint32_t min_elements)
+{
+	std::vector<matrix_run> runs;
+	for (uint32_t phase = 0; phase < stride; phase += 16)
+	{
+		size_t start = phase;
+		uint32_t length = 0, non_identity = 0;
+		auto finish = [&]() {
+			if (length >= min_elements && non_identity != 0)
+				runs.push_back({ stride, length, non_identity, start });
+			length = 0;
+			non_identity = 0;
+		};
+		for (size_t offset = phase; offset + stride <= size; offset += stride)
+		{
+			if (!transform_like(data + offset, stride))
+			{
+				finish();
+				continue;
+			}
+			if (length == 0)
+				start = offset;
+			++length;
+			if (!identity_like(data + offset, stride))
+				++non_identity;
+		}
+		finish();
+	}
+	return runs;
 }
 
 inline format_score assess(const uint8_t *data, size_t size, uint32_t stride)

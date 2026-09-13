@@ -8,6 +8,9 @@ param(
     [int]$StartupTimeoutSeconds = 120,
     [switch]$AutomateInput,
     [switch]$EditTest,
+    [switch]$EnableInGameCapture,
+    [switch]$SteamCapture,
+    [switch]$WindowCapture,
     [ValidateRange(0, 120)]
     [int]$InputDelaySeconds = 10,
     [switch]$ShutdownAfterTest,
@@ -150,6 +153,39 @@ function Confirm-GameProcess($Expected, [string]$Stage) {
     return $current
 }
 
+function Save-GameWindowCapture([int]$ProcessId, [int64]$WindowHandle, [string]$Path) {
+    $captureTarget = Get-Process -Id $ProcessId -ErrorAction Stop
+    $captureTarget.Refresh()
+    $handle = [IntPtr]::new($WindowHandle)
+    if ($handle -eq [IntPtr]::Zero) { $handle = $captureTarget.MainWindowHandle }
+    if ($handle -eq [IntPtr]::Zero) {
+        $handle = [WindowCaptureNative]::FindLargestWindow([uint32]$ProcessId)
+    }
+    if ($handle -eq [IntPtr]::Zero) { throw 'No visible game window was found for the exact PID.' }
+    $rect = [WindowCaptureNative+RECT]::new()
+    if (![WindowCaptureNative]::GetClientRect($handle, [ref]$rect)) { throw 'GetClientRect failed.' }
+    $origin = [WindowCaptureNative+POINT]::new()
+    if (![WindowCaptureNative]::ClientToScreen($handle, [ref]$origin)) { throw 'ClientToScreen failed.' }
+    $width = $rect.Right - $rect.Left
+    $height = $rect.Bottom - $rect.Top
+    if ($width -le 0 -or $height -le 0) { throw "Invalid game client size $width x $height." }
+
+    $full = [System.Drawing.Bitmap]::new($width, $height)
+    try {
+        $graphics = [System.Drawing.Graphics]::FromImage($full)
+        try {
+            $graphics.CopyFromScreen($origin.X, $origin.Y, 0, 0, $full.Size)
+        }
+        finally { $graphics.Dispose() }
+        $outputWidth = [Math]::Min(480, $width)
+        $outputHeight = [Math]::Max(1, [int]($height * $outputWidth / $width))
+        $small = [System.Drawing.Bitmap]::new($full, $outputWidth, $outputHeight)
+        try { $small.Save($Path, [System.Drawing.Imaging.ImageFormat]::Jpeg) }
+        finally { $small.Dispose() }
+    }
+    finally { $full.Dispose() }
+}
+
 if (!(Test-Path -LiteralPath $gameExe)) { throw "Game executable not found: $gameExe" }
 if (!(Test-Path -LiteralPath $reshadeDll)) { throw "ReShade dxgi.dll not found: $reshadeDll" }
 Recover-ZombieGameProcesses
@@ -169,6 +205,60 @@ if ($AutomateInput -and $ObserveSeconds -lt $InputDelaySeconds + 8) {
     throw '-ObserveSeconds must allow at least eight seconds after -InputDelaySeconds.'
 }
 if ($EditTest -and !$AutomateInput) { throw '-EditTest currently requires -AutomateInput.' }
+if (@($EnableInGameCapture, $SteamCapture, $WindowCapture).Where({ $_ }).Count -gt 1) {
+    throw 'Choose only one screenshot method.'
+}
+if ($WindowCapture) {
+    Add-Type -AssemblyName System.Drawing
+    Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class WindowCaptureNative {
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr state);
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr state);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hWnd, ref RECT rect);
+    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hWnd, ref POINT point);
+    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    public static IntPtr FindLargestWindow(uint wantedProcessId) {
+        IntPtr best = IntPtr.Zero;
+        long bestArea = 0;
+        EnumWindows((window, state) => {
+            uint processId;
+            GetWindowThreadProcessId(window, out processId);
+            RECT rect = new RECT();
+            if (processId == wantedProcessId && IsWindowVisible(window) && GetClientRect(window, ref rect)) {
+                long area = (long)(rect.Right - rect.Left) * (rect.Bottom - rect.Top);
+                if (area > bestArea) { best = window; bestArea = area; }
+            }
+            return true;
+        }, IntPtr.Zero);
+        return best;
+    }
+}
+'@
+    [WindowCaptureNative]::SetProcessDpiAwarenessContext([IntPtr]::new(-4)) | Out-Null
+}
+$steamScreenshotDirectory = $null
+$steamScreenshotsBefore = @{}
+if ($SteamCapture) {
+    $steamRoot = Split-Path -Parent (Find-Steam)
+    $userdata = Join-Path $steamRoot 'userdata'
+    $screenshotDirectories = @(foreach ($account in @(Get-ChildItem -LiteralPath $userdata -Directory)) {
+        $path = Join-Path $account.FullName '760\remote\553850\screenshots'
+        if (Test-Path -LiteralPath $path) { $path }
+    })
+    if ($screenshotDirectories.Count -ne 1) {
+        throw "Expected one Helldivers 2 Steam screenshot directory, found $($screenshotDirectories.Count)."
+    }
+    $steamScreenshotDirectory = $screenshotDirectories[0]
+    foreach ($file in @(Get-ChildItem -LiteralPath $steamScreenshotDirectory -File)) {
+        $steamScreenshotsBefore[$file.Name] = $true
+    }
+}
 $addonHash = (Get-FileHash -LiteralPath $AddonPath -Algorithm SHA256).Hash
 $running = Get-GameProcess
 if (!$running -and !(Test-AddonUnlocked)) {
@@ -227,8 +317,10 @@ if ($AutomateInput) {
         Remove-Item -Force -ErrorAction SilentlyContinue
     $skipIntro = if ($launchedByRunner) { 1 } else { 0 }
     $editRequested = if ($EditTest) { 1 } else { 0 }
-    "$(1000 * $InputDelaySeconds) $skipIntro $editRequested" | Set-Content -LiteralPath $automationPath -Encoding ascii
-    Write-Host "Requested in-game input, edit test $([bool]$EditTest), and low-resolution captures (skip intro: $([bool]$skipIntro))."
+    $captureRequested = if ($EnableInGameCapture) { 1 } else { 0 }
+    $steamCaptureRequested = if ($SteamCapture) { 1 } else { 0 }
+    "$(1000 * $InputDelaySeconds) $skipIntro $editRequested $captureRequested $steamCaptureRequested" | Set-Content -LiteralPath $automationPath -Encoding ascii
+    Write-Host "Requested input and edit test $([bool]$EditTest) (skip intro: $([bool]$skipIntro), ReShade capture: $([bool]$captureRequested), Steam capture: $([bool]$steamCaptureRequested))."
 }
 
 Write-Host "Observing process $($running.Id) for $ObserveSeconds seconds. Move and turn the character now."
@@ -237,6 +329,8 @@ $strongestTelemetry = $null
 $maxSelectedChanges = -1
 $maxCandidates = 0
 $maxMovingCandidates = 0
+$maxRingTargets = 0
+$maxMovingRingTargets = 0
 $lastReportedFrame = -1
 $lastReportedAutomation = -1
 $lastReportAt = [DateTime]::MinValue
@@ -250,12 +344,22 @@ $editTargetHadMotion = $false
 $editWriteSuccesses = 0
 $editImmediateReadbacks = 0
 $editPresentReadbacks = 0
+$editStaleSkips = 0
+$editTargetsSelected = 0
+$editTargetsWritten = 0
+$editTargetsRestored = 0
 $editRestoreSucceeded = $false
 $editOverwriteObserved = $false
 $editError = 0
 $editRound = 0
 $editTotalRounds = 0
 $completedAt = $null
+$lastProgressAt = [DateTime]::UtcNow
+$lastProgressFrame = -1
+$activeStageSeenAt = $null
+$captureFiles = @()
+$windowCaptured = @{}
+New-Item -ItemType Directory -Force -Path $resultDir | Out-Null
 $deadline = [DateTime]::UtcNow.AddSeconds($ObserveSeconds)
 while ([DateTime]::UtcNow -lt $deadline) {
     $currentProcess = Get-Process -Id $running.Id -ErrorAction SilentlyContinue
@@ -266,8 +370,14 @@ while ([DateTime]::UtcNow -lt $deadline) {
     if ($sample -and $sample.process_id -eq $running.Id -and
         ($null -eq $previousSession -or $sample.session_id -ne $previousSession)) {
         $latestTelemetry = $sample
+        if ([int64]$sample.frame -gt $lastProgressFrame) {
+            $lastProgressFrame = [int64]$sample.frame
+            $lastProgressAt = [DateTime]::UtcNow
+        }
         $maxCandidates = [Math]::Max($maxCandidates, [int]$sample.candidates)
         $maxMovingCandidates = [Math]::Max($maxMovingCandidates, [int]$sample.moving_candidates)
+        $maxRingTargets = [Math]::Max($maxRingTargets, [int]$sample.ring_targets)
+        $maxMovingRingTargets = [Math]::Max($maxMovingRingTargets, [int]$sample.moving_ring_targets)
         $automationStage = [Math]::Max($automationStage, [int]$sample.automation_stage)
         $introAttempts = [Math]::Max($introAttempts, [int]$sample.automation_intro_attempts)
         $inputStarted = $inputStarted -or [bool]$sample.automation_input_started
@@ -277,11 +387,44 @@ while ([DateTime]::UtcNow -lt $deadline) {
         $editWriteSuccesses = [Math]::Max($editWriteSuccesses, [int64]$sample.edit_write_successes)
         $editImmediateReadbacks = [Math]::Max($editImmediateReadbacks, [int64]$sample.edit_immediate_readbacks)
         $editPresentReadbacks = [Math]::Max($editPresentReadbacks, [int64]$sample.edit_present_readbacks)
+        $editStaleSkips = [Math]::Max($editStaleSkips, [int64]$sample.edit_stale_skips)
+        $editTargetsSelected = [Math]::Max($editTargetsSelected, [int]$sample.edit_targets_selected)
+        $editTargetsWritten = [Math]::Max($editTargetsWritten, [int]$sample.edit_targets_written)
+        $editTargetsRestored = [Math]::Max($editTargetsRestored, [int]$sample.edit_targets_restored)
         $editRestoreSucceeded = $editRestoreSucceeded -or [bool]$sample.edit_restore_succeeded
         $editOverwriteObserved = $editOverwriteObserved -or [bool]$sample.edit_overwrite_observed
         $editError = [Math]::Max($editError, [int]$sample.edit_error)
         $editRound = [Math]::Max($editRound, [int]$sample.edit_round)
         $editTotalRounds = [Math]::Max($editTotalRounds, [int]$sample.edit_total_rounds)
+        if ($WindowCapture) {
+            $stage = [int]$sample.automation_stage
+            if ($stage -eq 10 -and !$activeStageSeenAt) { $activeStageSeenAt = [DateTime]::UtcNow }
+            $windowName = switch ($stage) {
+                3 { 'capture-ready-window.jpg' }
+                4 { 'capture-before-walk-window.jpg' }
+                6 { 'capture-walk-window.jpg' }
+                7 { 'capture-stretch-window.jpg' }
+                12 { 'capture-stretch-window.jpg' }
+                13 { 'capture-edit-before-window.jpg' }
+                10 {
+                    if (([DateTime]::UtcNow - $activeStageSeenAt).TotalSeconds -ge 3) {
+                        'capture-edit-active-window.jpg'
+                    }
+                }
+                11 { 'capture-edit-restored-window.jpg' }
+            }
+            if ($windowName -and !$windowCaptured.ContainsKey($windowName)) {
+                try {
+                    $captureProcess = Confirm-GameProcess $running "window capture $windowName"
+                    Save-GameWindowCapture -ProcessId $captureProcess.Id -WindowHandle ([int64]$sample.window_handle) `
+                        -Path (Join-Path $resultDir $windowName)
+                    $windowCaptured[$windowName] = $true
+                    $captureFiles += $windowName
+                    Write-Host "Captured $windowName."
+                }
+                catch { Write-Warning "Window capture failed: $($_.Exception.Message)" }
+            }
+        }
         if ([int]$sample.automation_error -ne 0) {
             $inputError = "In-game automation error $($sample.automation_error)."
         }
@@ -298,13 +441,17 @@ while ([DateTime]::UtcNow -lt $deadline) {
             $lastReportedFrame = [int64]$sample.frame
             $lastReportedAutomation = [int]$sample.automation_stage
             $lastReportAt = $now
-            Write-Host ("frame={0} buffers={1}/{2} candidates={3} moving={4} selected-change={5} automation={6} edit={7}/{8} writes={9}" -f
+            Write-Host ("frame={0} buffers={1}/{2} candidates={3} moving={4} ring={5}/{6} automation={7} edit={8}/{9} writes={10}" -f
                 $sample.frame, $sample.mapped_buffers, $sample.tracked_buffers, $sample.candidates,
-                $sample.moving_candidates, $sample.selected_changed_slots, $sample.automation_stage,
+                $sample.moving_candidates, $sample.moving_ring_targets, $sample.ring_targets, $sample.automation_stage,
                 $sample.edit_round, $sample.edit_total_rounds, $sample.edit_write_successes)
         }
     }
-    if ($AutomateInput -and $inputCompleted) {
+    if ($latestTelemetry -and ([DateTime]::UtcNow - $lastProgressAt).TotalSeconds -ge 20) {
+        Write-Warning "Telemetry stopped advancing at frame $lastProgressFrame."
+        break
+    }
+    if ($AutomateInput -and ($inputCompleted -or $inputError)) {
         if (!$completedAt) { $completedAt = [DateTime]::UtcNow }
         elseif (([DateTime]::UtcNow - $completedAt).TotalSeconds -ge 5) { break }
     }
@@ -339,7 +486,7 @@ $heartbeatFresh = $telemetrySeen -and $heartbeatAgeSeconds -le 5.0
 $currentProcess = Get-Process -Id $running.Id -ErrorAction SilentlyContinue
 if ($currentProcess) { $currentProcess.Refresh() }
 $processAlive = $null -ne $currentProcess -and !$currentProcess.HasExited
-$runtimeActive = $heartbeatFresh -and $processAlive -and $latestTelemetry.frame -gt 0 -and $latestTelemetry.tracked_buffers -gt 0
+$runtimeActive = $heartbeatFresh -and $processAlive -and $latestTelemetry.frame -gt 0
 $motionDetected = $telemetrySeen -and ($maxMovingCandidates -gt 0 -or $maxSelectedChanges -gt 0)
 $editVerified = !$EditTest -or ($editCompleted -and $editWriteSuccesses -gt 0 -and
     $editImmediateReadbacks -gt 0 -and $editRestoreSucceeded -and $editError -eq 0)
@@ -350,7 +497,20 @@ $interestingLog | Set-Content -LiteralPath (Join-Path $resultDir 'reshade-tail.l
 if ($telemetrySeen) {
     $latestTelemetry | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $resultDir 'telemetry.json') -Encoding utf8
 }
-$captureFiles = @()
+if ($SteamCapture) {
+    $newScreenshots = @(Get-ChildItem -LiteralPath $steamScreenshotDirectory -File |
+        Where-Object { !$steamScreenshotsBefore.ContainsKey($_.Name) } |
+        Sort-Object LastWriteTime)
+    $steamCaptureNames = @(
+        'capture-edit-before-steam.jpg',
+        'capture-edit-active-steam.jpg',
+        'capture-edit-restored-steam.jpg'
+    )
+    for ($i = 0; $i -lt [Math]::Min($newScreenshots.Count, $steamCaptureNames.Count); ++$i) {
+        Copy-Item -LiteralPath $newScreenshots[$i].FullName -Destination (Join-Path $resultDir $steamCaptureNames[$i])
+        $captureFiles += $steamCaptureNames[$i]
+    }
+}
 foreach ($name in $captureNames) {
     $source = Join-Path $runtimeDirectory $name
     if (Test-Path -LiteralPath $source) {
@@ -433,6 +593,11 @@ $summary = [ordered]@{
     edit_write_successes = $editWriteSuccesses
     edit_immediate_readbacks = $editImmediateReadbacks
     edit_present_readbacks = $editPresentReadbacks
+    edit_refills_observed = $editPresentReadbacks
+    edit_stale_skips = $editStaleSkips
+    edit_targets_selected = $editTargetsSelected
+    edit_targets_written = $editTargetsWritten
+    edit_targets_restored = $editTargetsRestored
     edit_restore_succeeded = $editRestoreSucceeded
     edit_overwrite_observed = $editOverwriteObserved
     edit_error = $editError
@@ -442,12 +607,16 @@ $summary = [ordered]@{
     automation_stage = $automationStage
     intro_attempts = $introAttempts
     capture_files = $captureFiles
+    steam_capture_requested = [bool]$SteamCapture
+    window_capture_requested = [bool]$WindowCapture
     shutdown_requested = [bool]$ShutdownAfterTest
     shutdown_succeeded = $shutdownSucceeded
     shutdown_error = $shutdownError
     motion_detected = $motionDetected
     max_candidates = $maxCandidates
     max_moving_candidates = $maxMovingCandidates
+    max_ring_targets = $maxRingTargets
+    max_moving_ring_targets = $maxMovingRingTargets
     max_selected_changed_slots = [Math]::Max(0, $maxSelectedChanges)
     telemetry = $latestTelemetry
     strongest_telemetry = $strongestTelemetry
