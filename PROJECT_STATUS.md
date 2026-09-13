@@ -42,6 +42,7 @@ The add-on can expose changing transform-like values, but it cannot yet prove th
 | Run `20260913-185144` | Motion-backed candidate 7, slot 5, 48-byte layout; 178,616 successful writes and immediate readbacks; three present-time readbacks; restoration and later engine overwrite observed; movement visibly displaced the character; clean shutdown | Control/feedback loop and writable allocation verified; captures show no unambiguous skeletal deformation |
 | Run `20260913-192430` | Callback-timed drastic sweep completed 47/47 candidates and 367,495 verified writes; every slot received alternating XYZ translations of `+/-4`, `+/-8`, and `+/-12`; 14 candidate captures; clean shutdown | No capture showed credible skeletal deformation; writes made from the graphics callback still did not establish render ownership |
 | Run `20260913-204351` | Passive mapped-range scanner; movement and stretch completed; 41/41 hammer-thread rounds; 7,372 successful writes and immediate readbacks; 30 present-time readbacks; 35 captures; final restoration and clean shutdown; one transient unmap produced edit error 2 | Stability regression passed with no crash. The memory channel is live, but the run is conservatively classified `failed-edit` because one target became inaccessible before an exact restore. No visible character deformation was found |
+| Run `20260913-205746` | Exaggerated passive sweep with alternating XYZ translations of `+/-40`, `+/-80`, and `+/-120`; movement and stretch completed; 49/49 rounds; 9,569 successful writes and immediate readbacks; 29 present-time readbacks; 42 captures; final restoration and clean shutdown; one transient unmap produced edit error 2 | No player or NPC deformation, disappearance, or displacement is visible in the contact sheet. The tested anonymous mapped candidates are not the render-driving skinning palette at the time of the writes |
 
 The stale process later cleared naturally. At the time of this update, no `helldivers2.exe` process is present.
 
@@ -121,7 +122,7 @@ A bone-hash dictionary can be used during development to validate recovered name
 
 - Last published repository commit before this update: `c79024b` (`Add bounded runtime edit validation`).
 - No game process is currently present, and no automation request is pending.
-- The passive edit-test build used SHA-256 `74B077E9B52CAB0B13F45445F4044220AB07C46058CDE6CF10D492509FACFA1E` in run `20260913-204351`.
+- The exaggerated passive edit-test build used SHA-256 `37F996176F572196BE478B88016E46F9B0A5B39F97A1D44A1C57E8B018EAC340` in run `20260913-205746`.
 - The tested process shut down cleanly. A fresh process query found no remaining `helldivers2.exe`.
 
 ## Recommended next verification

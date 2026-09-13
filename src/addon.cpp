@@ -31,7 +31,7 @@ constexpr uint32_t k_min_slots = 8;
 constexpr uint32_t k_max_slots = 256;
 constexpr size_t k_max_candidates = 64;
 constexpr float k_motion_epsilon = 1.0e-5f;
-constexpr float k_edit_translation = 4.0f;
+constexpr float k_edit_translation = 40.0f;
 
 struct buffer_info
 {
