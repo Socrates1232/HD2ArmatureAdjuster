@@ -223,6 +223,8 @@ if ($AutomateInput) {
     foreach ($name in $captureNames) {
         Remove-Item -LiteralPath (Join-Path $runtimeDirectory $name) -Force -ErrorAction SilentlyContinue
     }
+    Get-ChildItem -LiteralPath $runtimeDirectory -Filter 'capture-edit-c*.bmp' -File -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
     $skipIntro = if ($launchedByRunner) { 1 } else { 0 }
     $editRequested = if ($EditTest) { 1 } else { 0 }
     "$(1000 * $InputDelaySeconds) $skipIntro $editRequested" | Set-Content -LiteralPath $automationPath -Encoding ascii
@@ -251,6 +253,8 @@ $editPresentReadbacks = 0
 $editRestoreSucceeded = $false
 $editOverwriteObserved = $false
 $editError = 0
+$editRound = 0
+$editTotalRounds = 0
 $completedAt = $null
 $deadline = [DateTime]::UtcNow.AddSeconds($ObserveSeconds)
 while ([DateTime]::UtcNow -lt $deadline) {
@@ -276,6 +280,8 @@ while ([DateTime]::UtcNow -lt $deadline) {
         $editRestoreSucceeded = $editRestoreSucceeded -or [bool]$sample.edit_restore_succeeded
         $editOverwriteObserved = $editOverwriteObserved -or [bool]$sample.edit_overwrite_observed
         $editError = [Math]::Max($editError, [int]$sample.edit_error)
+        $editRound = [Math]::Max($editRound, [int]$sample.edit_round)
+        $editTotalRounds = [Math]::Max($editTotalRounds, [int]$sample.edit_total_rounds)
         if ([int]$sample.automation_error -ne 0) {
             $inputError = "In-game automation error $($sample.automation_error)."
         }
@@ -292,10 +298,10 @@ while ([DateTime]::UtcNow -lt $deadline) {
             $lastReportedFrame = [int64]$sample.frame
             $lastReportedAutomation = [int]$sample.automation_stage
             $lastReportAt = $now
-            Write-Host ("frame={0} buffers={1}/{2} candidates={3} moving={4} selected-change={5} automation={6} edit-writes={7}" -f
+            Write-Host ("frame={0} buffers={1}/{2} candidates={3} moving={4} selected-change={5} automation={6} edit={7}/{8} writes={9}" -f
                 $sample.frame, $sample.mapped_buffers, $sample.tracked_buffers, $sample.candidates,
                 $sample.moving_candidates, $sample.selected_changed_slots, $sample.automation_stage,
-                $sample.edit_write_successes)
+                $sample.edit_round, $sample.edit_total_rounds, $sample.edit_write_successes)
         }
     }
     if ($AutomateInput -and $inputCompleted) {
@@ -351,6 +357,10 @@ foreach ($name in $captureNames) {
         Copy-Item -LiteralPath $source -Destination (Join-Path $resultDir $name)
         $captureFiles += $name
     }
+}
+foreach ($source in @(Get-ChildItem -LiteralPath $runtimeDirectory -Filter 'capture-edit-c*.bmp' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+    Copy-Item -LiteralPath $source.FullName -Destination (Join-Path $resultDir $source.Name)
+    $captureFiles += $source.Name
 }
 
 $shutdownSucceeded = $false
@@ -427,6 +437,8 @@ $summary = [ordered]@{
     edit_overwrite_observed = $editOverwriteObserved
     edit_error = $editError
     edit_channel_verified = $editVerified
+    edit_rounds_completed = $editRound
+    edit_total_rounds = $editTotalRounds
     automation_stage = $automationStage
     intro_attempts = $introAttempts
     capture_files = $captureFiles

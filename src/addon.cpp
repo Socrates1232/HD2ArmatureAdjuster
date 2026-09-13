@@ -31,20 +31,15 @@ constexpr uint32_t k_min_slots = 8;
 constexpr uint32_t k_max_slots = 256;
 constexpr size_t k_max_candidates = 64;
 constexpr float k_motion_epsilon = 1.0e-5f;
-constexpr float k_edit_translation = 0.35f;
+constexpr float k_edit_translation = 4.0f;
 
 struct buffer_info
 {
-	device *owner = nullptr;
 	uint64_t size = 0;
-	memory_heap heap = memory_heap::unknown;
 	void *map_ptr = nullptr;
 	uint64_t map_offset = 0;
 	uint64_t map_size = 0;
 	uint64_t scan_offset = 0;
-	bool mapped_by_probe = false;
-	bool ever_mapped_by_game = false;
-	bool map_failed = false;
 };
 
 struct candidate
@@ -76,6 +71,7 @@ struct edit_probe_state
 	bool target_had_motion = false;
 	uint32_t candidate_id = 0;
 	uint32_t slot = 0;
+	uint32_t slots_modified = 0;
 	uint32_t stride = 0;
 	uint64_t resource = 0;
 	uint64_t offset = 0;
@@ -83,12 +79,14 @@ struct edit_probe_state
 	uint64_t write_successes = 0;
 	uint64_t immediate_readbacks = 0;
 	uint64_t present_readbacks = 0;
+	uint32_t round = 0;
+	uint32_t total_rounds = 0;
 	bool restore_attempted = false;
 	bool restore_succeeded = false;
 	bool overwrite_observed = false;
 	uint32_t error = 0;
-	std::array<uint8_t, 64> original {};
-	std::array<uint8_t, 64> injected {};
+	std::vector<uint8_t> original;
+	std::vector<uint8_t> injected;
 };
 
 std::mutex g_mutex;
@@ -110,7 +108,6 @@ std::chrono::steady_clock::time_point g_last_display;
 std::chrono::steady_clock::time_point g_last_telemetry;
 std::atomic<uint32_t> g_draws { 0 };
 std::atomic<uint32_t> g_last_draws { 0 };
-thread_local bool g_self_map = false;
 std::wstring g_telemetry_path;
 std::wstring g_automation_path;
 std::wstring g_capture_directory;
@@ -126,20 +123,19 @@ bool g_automation_completed = false;
 bool g_w_held = false;
 bool g_d_held = false;
 std::chrono::steady_clock::time_point g_automation_deadline;
-std::chrono::steady_clock::time_point g_edit_selection_deadline;
 edit_probe_state g_edit;
 std::atomic<bool> g_edit_active { false };
-
-bool heap_is_cpu_visible(memory_heap heap)
-{
-	return heap == memory_heap::cpu_to_gpu || heap == memory_heap::cpu_only;
-}
+std::atomic<bool> g_edit_thread_stop { false };
+HANDLE g_edit_thread = nullptr;
+std::vector<uint32_t> g_edit_queue;
+size_t g_edit_queue_index = 0;
 
 void translation_of(const candidate &c, uint32_t slot, float &x, float &y, float &z);
 bool begin_edit_test(effect_runtime *runtime, std::chrono::steady_clock::time_point now);
-bool has_motion_edit_candidate();
+bool start_next_edit_target(std::chrono::steady_clock::time_point now);
 void end_edit_pulse();
 void write_edit_probe();
+bool ensure_edit_thread();
 
 void initialize_telemetry()
 {
@@ -179,9 +175,32 @@ bool game_has_focus()
 bool focus_runtime_window(effect_runtime *runtime)
 {
 	g_game_window = static_cast<HWND>(runtime->get_hwnd());
+	if (g_game_window == nullptr || !IsWindow(g_game_window))
+		return false;
 	if (game_has_focus())
 		return true;
-	return g_game_window != nullptr && SetForegroundWindow(g_game_window) && game_has_focus();
+
+	const HWND foreground = GetForegroundWindow();
+	const DWORD current_thread = GetCurrentThreadId();
+	const DWORD foreground_thread = foreground != nullptr ?
+		GetWindowThreadProcessId(foreground, nullptr) : 0;
+	const DWORD game_thread = GetWindowThreadProcessId(g_game_window, nullptr);
+	const bool attached_foreground = foreground_thread != 0 && foreground_thread != current_thread &&
+		AttachThreadInput(current_thread, foreground_thread, TRUE) != FALSE;
+	const bool attached_game = game_thread != 0 && game_thread != current_thread &&
+		game_thread != foreground_thread && AttachThreadInput(current_thread, game_thread, TRUE) != FALSE;
+
+	ShowWindowAsync(g_game_window, SW_RESTORE);
+	BringWindowToTop(g_game_window);
+	SetForegroundWindow(g_game_window);
+	SetActiveWindow(g_game_window);
+	SetFocus(g_game_window);
+
+	if (attached_game)
+		AttachThreadInput(current_thread, game_thread, FALSE);
+	if (attached_foreground)
+		AttachThreadInput(current_thread, foreground_thread, FALSE);
+	return game_has_focus();
 }
 
 bool send_key(WORD virtual_key, bool down)
@@ -320,6 +339,8 @@ void on_reshade_present(effect_runtime *runtime)
 
 	if (g_automation_stage == 1)
 	{
+		if (const HWND console_window = GetConsoleWindow(); console_window != nullptr)
+			ShowWindowAsync(console_window, SW_MINIMIZE);
 		if (!focus_runtime_window(runtime))
 			return;
 		if (!capture_frame(runtime, L"capture-load.bmp"))
@@ -355,7 +376,7 @@ void on_reshade_present(effect_runtime *runtime)
 	else if (g_automation_stage == 3 && now >= g_automation_deadline &&
 		g_last_draws.load(std::memory_order_relaxed) >= 20)
 	{
-		if (!game_has_focus())
+		if (!focus_runtime_window(runtime))
 			return;
 		if (!capture_frame(runtime, L"capture-ready.bmp"))
 			g_automation_error = 3;
@@ -386,20 +407,24 @@ void on_reshade_present(effect_runtime *runtime)
 		if (!capture_frame(runtime, L"capture-walk.bmp"))
 			g_automation_error = 3;
 		g_automation_deadline = now + std::chrono::seconds(1);
-		g_edit_selection_deadline = now + std::chrono::seconds(6);
 		g_automation_stage = 6;
 	}
 	else if (g_automation_stage == 6 && now >= g_automation_deadline)
 	{
 		if (g_edit.requested)
 		{
-			if (now < g_edit_selection_deadline && !has_motion_edit_candidate())
+			if (!focus_runtime_window(runtime))
 				return;
-			if (!begin_edit_test(runtime, now))
-				fail_automation(4);
+			if (!send_key('B', true) || !send_key('B', false))
+			{
+				fail_automation(1);
+				return;
+			}
+			g_automation_deadline = now + std::chrono::seconds(4);
+			g_automation_stage = 12;
 			return;
 		}
-		if (!game_has_focus())
+		if (!focus_runtime_window(runtime))
 			return;
 		if (!send_key('B', true) || !send_key('B', false))
 		{
@@ -411,29 +436,38 @@ void on_reshade_present(effect_runtime *runtime)
 	}
 	else if (g_automation_stage == 10 && now >= g_automation_deadline)
 	{
-		if (!capture_frame(runtime, L"capture-edit-active.bmp"))
+		wchar_t name[64] = {};
+		swprintf_s(name, L"capture-edit-c%03u-all.bmp", g_edit.candidate_id);
+		if (!capture_frame(runtime, name))
 			g_automation_error = 3;
 		end_edit_pulse();
-		g_automation_deadline = now + std::chrono::seconds(2);
+		g_automation_deadline = now + std::chrono::milliseconds(250);
 		g_automation_stage = 11;
 	}
 	else if (g_automation_stage == 11 && now >= g_automation_deadline)
 	{
+		if (start_next_edit_target(now))
+			return;
 		if (!capture_frame(runtime, L"capture-edit-restored.bmp"))
 			g_automation_error = 3;
 		{
 			std::lock_guard lock(g_mutex);
 			g_edit.completed = true;
 		}
-		if (!game_has_focus())
-			return;
-		if (!send_key('B', true) || !send_key('B', false))
-		{
-			fail_automation(1);
-			return;
-		}
-		g_automation_deadline = now + std::chrono::seconds(4);
-		g_automation_stage = 7;
+		g_automation_completed = true;
+		g_automation_stage = 8;
+	}
+	else if (g_automation_stage == 12 && now >= g_automation_deadline)
+	{
+		if (!capture_frame(runtime, L"capture-stretch.bmp"))
+			g_automation_error = 3;
+		g_automation_deadline = now + std::chrono::seconds(2);
+		g_automation_stage = 13;
+	}
+	else if (g_automation_stage == 13 && now >= g_automation_deadline)
+	{
+		if (!begin_edit_test(runtime, now))
+			fail_automation(4);
 	}
 	else if (g_automation_stage == 7 && now >= g_automation_deadline)
 	{
@@ -525,12 +559,15 @@ void write_telemetry(uint32_t draws)
 		<< "  \"edit_target_had_motion\": " << (edit.target_had_motion ? "true" : "false") << ",\n"
 		<< "  \"edit_candidate\": " << edit.candidate_id << ",\n"
 		<< "  \"edit_slot\": " << edit.slot << ",\n"
+		<< "  \"edit_slots_modified\": " << edit.slots_modified << ",\n"
 		<< "  \"edit_stride\": " << edit.stride << ",\n"
 		<< "  \"edit_translation_delta\": " << k_edit_translation << ",\n"
 		<< "  \"edit_write_attempts\": " << edit.write_attempts << ",\n"
 		<< "  \"edit_write_successes\": " << edit.write_successes << ",\n"
 		<< "  \"edit_immediate_readbacks\": " << edit.immediate_readbacks << ",\n"
 		<< "  \"edit_present_readbacks\": " << edit.present_readbacks << ",\n"
+		<< "  \"edit_round\": " << edit.round << ",\n"
+		<< "  \"edit_total_rounds\": " << edit.total_rounds << ",\n"
 		<< "  \"edit_restore_attempted\": " << (edit.restore_attempted ? "true" : "false") << ",\n"
 		<< "  \"edit_restore_succeeded\": " << (edit.restore_succeeded ? "true" : "false") << ",\n"
 		<< "  \"edit_overwrite_observed\": " << (edit.overwrite_observed ? "true" : "false") << ",\n"
@@ -634,94 +671,140 @@ void translation_of(const candidate &c, uint32_t slot, float &x, float &y, float
 	}
 }
 
-bool write_edit_bytes_locked(const std::array<uint8_t, 64> &bytes, bool verify)
+bool write_edit_bytes_locked(const std::vector<uint8_t> &bytes, bool verify)
 {
 	auto it = g_buffers.find(g_edit.resource);
 	if (it == g_buffers.end() || it->second.map_ptr == nullptr || g_edit.offset < it->second.map_offset)
 		return false;
 	const uint64_t relative = g_edit.offset - it->second.map_offset;
-	if (relative > it->second.map_size || g_edit.stride > it->second.map_size - relative)
+	if (relative > it->second.map_size || bytes.size() > it->second.map_size - relative)
 		return false;
 	uint8_t *target = static_cast<uint8_t *>(it->second.map_ptr) + relative;
-	std::memcpy(target, bytes.data(), g_edit.stride);
-	return !verify || std::memcmp(target, bytes.data(), g_edit.stride) == 0;
-}
-
-bool has_motion_edit_candidate()
-{
-	std::lock_guard lock(g_mutex);
-	for (const candidate &c : g_candidates)
-		if (c.fresh && (c.stride == 48 || c.stride == 64) &&
-			std::any_of(c.peak_delta.begin(), c.peak_delta.end(),
-				[](float delta) { return delta > k_motion_epsilon; }))
-			return true;
-	return false;
+	std::memcpy(target, bytes.data(), bytes.size());
+	return !verify || std::memcmp(target, bytes.data(), bytes.size()) == 0;
 }
 
 bool begin_edit_test(effect_runtime *runtime, std::chrono::steady_clock::time_point now)
 {
-	if (!capture_frame(runtime, L"capture-edit-before.bmp"))
-		g_automation_error = 3;
-
-	std::lock_guard lock(g_mutex);
-	candidate *best = nullptr;
-	uint32_t best_slot = 0;
-	float best_peak = -1.0f;
-	for (candidate &c : g_candidates)
+	if (!ensure_edit_thread())
 	{
-		if (!c.fresh || (c.stride != 48 && c.stride != 64) || c.bytes.size() < c.stride)
-			continue;
-		uint32_t slot = 0;
+		std::lock_guard lock(g_mutex);
+		g_edit.error = 5;
+		return false;
+	}
+
+	struct ranked_candidate
+	{
+		uint32_t id = 0;
+		uint32_t stride = 0;
 		float peak = 0.0f;
-		for (uint32_t i = 0; i < c.slots; ++i)
-			if (c.peak_delta[i] > peak)
-			{
-				peak = c.peak_delta[i];
-				slot = i;
-			}
-		const bool moved = peak > k_motion_epsilon;
-		const bool best_moved = best_peak > k_motion_epsilon;
-		if (best == nullptr || moved > best_moved ||
-			(moved == best_moved && c.stride == 48 && best->stride != 48) ||
-			(moved == best_moved && c.stride == best->stride && peak > best_peak))
+	};
+	std::vector<ranked_candidate> ranked;
+	{
+		std::lock_guard lock(g_mutex);
+		for (const candidate &c : g_candidates)
 		{
-			best = &c;
-			best_slot = slot;
-			best_peak = peak;
+			if (!c.fresh || (c.stride != 48 && c.stride != 64) || c.bytes.size() < c.stride)
+				continue;
+			const float peak = *std::max_element(c.peak_delta.begin(), c.peak_delta.end());
+			ranked.push_back({ c.id, c.stride, peak });
 		}
 	}
-	if (best == nullptr)
+	if (ranked.empty())
 	{
+		std::lock_guard lock(g_mutex);
 		g_edit.error = 1;
 		return false;
 	}
+	std::sort(ranked.begin(), ranked.end(), [](const ranked_candidate &a, const ranked_candidate &b) {
+		const bool a_moved = a.peak > k_motion_epsilon;
+		const bool b_moved = b.peak > k_motion_epsilon;
+		if (a_moved != b_moved)
+			return a_moved > b_moved;
+		if (a.stride != b.stride)
+			return a.stride == 48;
+		return a.peak > b.peak;
+	});
+	g_edit_queue.clear();
+	for (const ranked_candidate &entry : ranked)
+		g_edit_queue.push_back(entry.id);
+	g_edit_queue_index = 0;
+	{
+		std::lock_guard lock(g_mutex);
+		g_edit.requested = true;
+		g_edit.total_rounds = static_cast<uint32_t>(g_edit_queue.size());
+	}
+	if (!capture_frame(runtime, L"capture-edit-before.bmp"))
+		g_automation_error = 3;
+	return start_next_edit_target(now);
+}
 
-	edit_probe_state next;
-	next.requested = true;
-	next.active = true;
-	next.target_had_motion = best_peak > k_motion_epsilon;
-	next.candidate_id = best->id;
-	next.slot = best_slot;
-	next.stride = best->stride;
-	next.resource = best->resource;
-	next.offset = best->offset + static_cast<uint64_t>(best_slot) * best->stride;
-	const uint8_t *source = best->bytes.data() + static_cast<size_t>(best_slot) * best->stride;
-	std::memcpy(next.original.data(), source, best->stride);
-	std::memcpy(next.injected.data(), source, best->stride);
-	const size_t translation_index = best->stride == 64 ?
-		(best->alternate_layout ? 3 : 12) : (best->alternate_layout ? 9 : 3);
-	float translated = read_float(next.injected.data(), translation_index) + k_edit_translation;
-	if (!std::isfinite(translated) || std::fabs(translated) >= 1.0e6f)
+bool start_next_edit_target(std::chrono::steady_clock::time_point now)
+
+{
+	while (g_edit_queue_index < g_edit_queue.size())
 	{
-		g_edit.error = 1;
-		return false;
+		const uint32_t id = g_edit_queue[g_edit_queue_index++];
+		std::lock_guard lock(g_mutex);
+		auto it = std::find_if(g_candidates.begin(), g_candidates.end(),
+			[id](const candidate &c) { return c.id == id; });
+		if (it == g_candidates.end() || !it->fresh ||
+			(it->stride != 48 && it->stride != 64) ||
+			it->bytes.size() < static_cast<size_t>(it->stride) * it->slots)
+			continue;
+
+		uint32_t slot = 0;
+		float peak = 0.0f;
+		for (uint32_t i = 0; i < it->slots; ++i)
+			if (it->peak_delta[i] > peak)
+			{
+				peak = it->peak_delta[i];
+				slot = i;
+			}
+		g_edit.target_had_motion = peak > k_motion_epsilon;
+		g_edit.candidate_id = it->id;
+		g_edit.slot = slot;
+		g_edit.slots_modified = it->slots;
+		g_edit.stride = it->stride;
+		g_edit.resource = it->resource;
+		g_edit.offset = it->offset;
+		g_edit.round = static_cast<uint32_t>(g_edit_queue_index);
+		g_edit.restore_attempted = false;
+		g_edit.restore_succeeded = false;
+		g_edit.original = it->bytes;
+		g_edit.injected = it->bytes;
+		const size_t translation_index = it->stride == 64 ?
+			(it->alternate_layout ? 3 : 12) : (it->alternate_layout ? 9 : 3);
+		const size_t translation_step = (it->stride == 64) == it->alternate_layout ? 4 : 1;
+		bool valid = true;
+		for (uint32_t i = 0; i < it->slots; ++i)
+		{
+			uint8_t *element = g_edit.injected.data() + static_cast<size_t>(i) * it->stride;
+			const float direction = (i & 1) == 0 ? 1.0f : -1.0f;
+			for (size_t axis = 0; axis < 3; ++axis)
+			{
+				const size_t component = translation_index + axis * translation_step;
+				float translated = read_float(element, component) +
+					direction * k_edit_translation * static_cast<float>(axis + 1);
+				if (!std::isfinite(translated) || std::fabs(translated) >= 1.0e6f)
+				{
+					valid = false;
+					break;
+				}
+				std::memcpy(element + component * sizeof(float), &translated, sizeof(translated));
+			}
+			if (!valid)
+				break;
+		}
+		if (!valid)
+			continue;
+		g_edit.active = true;
+		g_edit_active.store(true, std::memory_order_release);
+		g_automation_deadline = now + std::chrono::milliseconds(1500);
+		g_automation_stage = 10;
+		return true;
 	}
-	std::memcpy(next.injected.data() + translation_index * sizeof(float), &translated, sizeof(translated));
-	g_edit = next;
-	g_edit_active.store(true, std::memory_order_release);
-	g_automation_deadline = now + std::chrono::seconds(2);
-	g_automation_stage = 10;
-	return true;
+	return false;
 }
 
 void write_edit_probe()
@@ -745,6 +828,32 @@ void write_edit_probe()
 	}
 }
 
+DWORD WINAPI edit_thread_proc(void *)
+{
+	while (!g_edit_thread_stop.load(std::memory_order_acquire))
+	{
+		if (g_edit_active.load(std::memory_order_acquire))
+		{
+			write_edit_probe();
+			Sleep(1);
+		}
+		else
+		{
+			Sleep(10);
+		}
+	}
+	return 0;
+}
+
+bool ensure_edit_thread()
+{
+	if (g_edit_thread != nullptr)
+		return true;
+	g_edit_thread_stop.store(false, std::memory_order_release);
+	g_edit_thread = CreateThread(nullptr, 0, edit_thread_proc, nullptr, 0, nullptr);
+	return g_edit_thread != nullptr;
+}
+
 void end_edit_pulse()
 {
 	g_edit_active.store(false, std::memory_order_release);
@@ -758,68 +867,21 @@ void end_edit_pulse()
 
 size_t copy_buffer(uint64_t handle, uint64_t offset, uint64_t wanted, std::vector<uint8_t> &out)
 {
-	for (int attempt = 0; attempt != 2; ++attempt)
-	{
-		device *owner = nullptr;
-		{
-			std::lock_guard lock(g_mutex);
-			auto it = g_buffers.find(handle);
-			if (it == g_buffers.end() || offset >= it->second.size)
-				return 0;
+	std::lock_guard lock(g_mutex);
+	auto it = g_buffers.find(handle);
+	if (it == g_buffers.end() || it->second.map_ptr == nullptr ||
+		offset < it->second.map_offset || offset >= it->second.size)
+		return 0;
 
-			buffer_info &info = it->second;
-			const uint64_t count = std::min(wanted, info.size - offset);
-			if (info.map_ptr != nullptr && offset >= info.map_offset)
-			{
-				const uint64_t relative = offset - info.map_offset;
-				if (relative <= info.map_size && count <= info.map_size - relative)
-				{
-					out.resize(static_cast<size_t>(count));
-					std::memcpy(out.data(), static_cast<const uint8_t *>(info.map_ptr) + relative,
-						static_cast<size_t>(count));
-					return out.size();
-				}
-			}
-
-			if (attempt != 0 || info.map_failed ||
-				(!heap_is_cpu_visible(info.heap) && !info.ever_mapped_by_game))
-				return 0;
-			owner = info.owner;
-		}
-
-		void *pointer = nullptr;
-		g_self_map = true;
-		const bool mapped = owner != nullptr && owner->map_buffer_region(
-			resource { handle }, 0, UINT64_MAX, map_access::read_only, &pointer);
-		g_self_map = false;
-
-		bool release_extra_map = false;
-		{
-			std::lock_guard lock(g_mutex);
-			auto it = g_buffers.find(handle);
-			if (it == g_buffers.end())
-				release_extra_map = mapped && pointer != nullptr;
-			else if (!mapped || pointer == nullptr)
-				it->second.map_failed = true;
-			else if (it->second.map_ptr == nullptr)
-			{
-				it->second.map_ptr = pointer;
-				it->second.map_offset = 0;
-				it->second.map_size = it->second.size;
-				it->second.mapped_by_probe = true;
-			}
-			else
-				release_extra_map = true;
-		}
-
-		if (release_extra_map)
-		{
-			g_self_map = true;
-			owner->unmap_buffer_region(resource { handle });
-			g_self_map = false;
-		}
-	}
-	return 0;
+	const buffer_info &info = it->second;
+	const uint64_t relative = offset - info.map_offset;
+	if (relative >= info.map_size)
+		return 0;
+	const uint64_t count = std::min({ wanted, info.size - offset, info.map_size - relative });
+	out.resize(static_cast<size_t>(count));
+	std::memcpy(out.data(), static_cast<const uint8_t *>(info.map_ptr) + relative,
+		static_cast<size_t>(count));
+	return out.size();
 }
 
 void refresh_candidate(uint32_t id)
@@ -867,12 +929,11 @@ void refresh_candidate(uint32_t id)
 			++it->changed_slots;
 	}
 	it->bytes.swap(bytes);
-	if (it->id == g_edit.candidate_id && g_edit.slot < it->slots)
+	if (it->id == g_edit.candidate_id && it->bytes.size() == g_edit.injected.size())
 	{
-		const uint8_t *element = it->bytes.data() + static_cast<size_t>(g_edit.slot) * it->stride;
-		if (g_edit.active && std::memcmp(element, g_edit.injected.data(), it->stride) == 0)
+		if (g_edit.active && std::memcmp(it->bytes.data(), g_edit.injected.data(), it->bytes.size()) == 0)
 			++g_edit.present_readbacks;
-		else if (g_edit.restore_attempted && std::memcmp(element, g_edit.injected.data(), it->stride) != 0)
+		else if (g_edit.restore_attempted && std::memcmp(it->bytes.data(), g_edit.injected.data(), it->bytes.size()) != 0)
 			g_edit.overwrite_observed = true;
 	}
 	++it->samples;
@@ -948,18 +1009,21 @@ void scan_one_window()
 			}
 
 			buffer_info &info = it->second;
-			if (info.map_ptr == nullptr && !heap_is_cpu_visible(info.heap) && !info.ever_mapped_by_game)
+			if (info.map_ptr == nullptr || info.map_size < k_min_buffer_bytes)
 			{
 				++g_buffer_cursor;
 				continue;
 			}
 
+			const uint64_t mapped_end = std::min(info.size, info.map_offset + info.map_size);
+			if (info.scan_offset < info.map_offset || info.scan_offset >= mapped_end)
+				info.scan_offset = info.map_offset;
 			offset = info.scan_offset;
-			count = std::min(k_scan_bytes, info.size - offset);
+			count = std::min(k_scan_bytes, mapped_end - offset);
 			const uint64_t advance = k_scan_bytes - k_scan_overlap;
-			if (offset + count >= info.size || count <= k_scan_overlap)
+			if (offset + count >= mapped_end || count <= k_scan_overlap)
 			{
-				info.scan_offset = 0;
+				info.scan_offset = info.map_offset;
 				++g_buffer_cursor;
 			}
 			else
@@ -1030,7 +1094,8 @@ void draw_console(uint32_t draws)
 		<< (g_paused ? "  [PAUSED]\n" : "\n")
 		<< "F6 next candidate   F7 next 16 slots   F8 pause   F9 rescan\n"
 		<< "edit: " << (g_edit.active ? "ACTIVE" : g_edit.completed ? "complete" : g_edit.requested ? "armed" : "off")
-		<< "  target " << g_edit.candidate_id << ':' << g_edit.slot
+		<< "  round " << g_edit.round << '/' << g_edit.total_rounds
+		<< "  target " << g_edit.candidate_id << " (all " << g_edit.slots_modified << " slots)"
 		<< "  writes " << g_edit.write_successes << '/' << g_edit.write_attempts
 		<< "  readback " << g_edit.present_readbacks
 		<< "  restored " << (g_edit.restore_succeeded ? "yes" : "no") << "\n\n";
@@ -1091,6 +1156,8 @@ void on_destroy_device(device *device)
 	g_buffers.clear();
 	g_buffer_order.clear();
 	g_candidates.clear();
+	g_edit_queue.clear();
+	g_edit_queue_index = 0;
 	g_edit_active.store(false, std::memory_order_release);
 	g_edit.active = false;
 	g_device = nullptr;
@@ -1102,7 +1169,7 @@ void on_init_resource(device *device, const resource_desc &desc, const subresour
 	if (device != g_device || desc.type != resource_type::buffer || desc.buffer.size < k_min_buffer_bytes)
 		return;
 	std::lock_guard lock(g_mutex);
-	g_buffers[resource.handle] = buffer_info { device, desc.buffer.size, desc.heap };
+	g_buffers[resource.handle] = buffer_info { desc.buffer.size };
 	g_buffer_order.push_back(resource.handle);
 }
 
@@ -1110,13 +1177,11 @@ void on_destroy_resource(device *device, resource resource)
 {
 	if (device != g_device)
 		return;
-	bool mapped_by_probe = false;
 	{
 		std::lock_guard lock(g_mutex);
 		auto it = g_buffers.find(resource.handle);
 		if (it == g_buffers.end())
 			return;
-		mapped_by_probe = it->second.mapped_by_probe;
 		g_buffers.erase(it);
 		g_candidates.erase(std::remove_if(g_candidates.begin(), g_candidates.end(),
 			[resource](const candidate &c) { return c.resource == resource.handle; }), g_candidates.end());
@@ -1129,37 +1194,31 @@ void on_destroy_resource(device *device, resource resource)
 		if (g_selected >= g_candidates.size())
 			g_selected = 0;
 	}
-	if (mapped_by_probe)
-	{
-		g_self_map = true;
-		device->unmap_buffer_region(resource);
-		g_self_map = false;
-	}
 }
 
 void on_map_buffer(device *device, resource resource, uint64_t offset, uint64_t size,
 	map_access, void **data)
 {
-	if (g_self_map || device != g_device || data == nullptr || *data == nullptr)
+	if (device != g_device || data == nullptr || *data == nullptr)
 		return;
 	std::lock_guard lock(g_mutex);
 	auto it = g_buffers.find(resource.handle);
-	if (it == g_buffers.end() || it->second.mapped_by_probe || offset >= it->second.size)
+	if (it == g_buffers.end() || offset >= it->second.size)
 		return;
 	buffer_info &info = it->second;
 	info.map_ptr = *data;
 	info.map_offset = offset;
 	info.map_size = (size == 0 || size == UINT64_MAX) ? info.size - offset : std::min(size, info.size - offset);
-	info.ever_mapped_by_game = true;
+	info.scan_offset = offset;
 }
 
 void on_unmap_buffer(device *device, resource resource)
 {
-	if (g_self_map || device != g_device)
+	if (device != g_device)
 		return;
 	std::lock_guard lock(g_mutex);
 	auto it = g_buffers.find(resource.handle);
-	if (it != g_buffers.end() && !it->second.mapped_by_probe)
+	if (it != g_buffers.end())
 	{
 		it->second.map_ptr = nullptr;
 		it->second.map_offset = 0;
@@ -1169,7 +1228,6 @@ void on_unmap_buffer(device *device, resource resource)
 
 bool on_draw_indexed(command_list *, uint32_t, uint32_t, uint32_t, int32_t, uint32_t)
 {
-	write_edit_probe();
 	g_draws.fetch_add(1, std::memory_order_relaxed);
 	return false;
 }
@@ -1233,9 +1291,16 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 	}
 	else if (reason == DLL_PROCESS_DETACH)
 	{
+		g_edit_thread_stop.store(true, std::memory_order_release);
 		release_automation_keys();
 		if (reserved != nullptr)
 			return TRUE;
+		if (g_edit_thread != nullptr)
+		{
+			WaitForSingleObject(g_edit_thread, 1000);
+			CloseHandle(g_edit_thread);
+			g_edit_thread = nullptr;
+		}
 		reshade::unregister_event<addon_event::reshade_present>(on_reshade_present);
 		reshade::unregister_event<addon_event::present>(on_present);
 		reshade::unregister_event<addon_event::draw_indexed>(on_draw_indexed);

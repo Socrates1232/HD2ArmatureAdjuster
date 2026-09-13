@@ -39,7 +39,7 @@ Keys are read while the game is running:
 - `F8`: pause/resume discovery scanning (candidate sampling continues)
 - `F9`: clear candidates and rescan from the start
 
-The scanner reads at most one 64 KiB discovery window per presented frame, plus small snapshots of the selected and one rotating candidate. It never maps or writes GPU-only resources. Normal interactive operation is read-only.
+The scanner reads at most one 64 KiB discovery window per presented frame, plus small snapshots of the selected and one rotating candidate. It only observes ranges that the game currently has mapped; the add-on never maps or unmaps a D3D12 resource itself. Normal interactive operation is read-only.
 
 ## Automated live test
 
@@ -56,13 +56,13 @@ powershell -ExecutionPolicy Bypass -File tools/run_live_test.ps1 `
   -ShutdownAfterTest
 ```
 
-The runner validates and deploys the DLL, launches the game through Steam if necessary, reads only the latest 600 ReShade log lines, watches telemetry, and saves a compact report under `test-results/<timestamp>/summary.json`. With `-AutomateInput`, the loaded add-on focuses ReShade's exact game window, lets startup settle for 25 seconds, and makes one short `W` intro attempt. Movement begins only after the configured delay and normal indexed scene rendering are both visible, so startup loading cannot consume the walking test. It then walks forward for three seconds, adds right movement for two seconds, and taps `B` for the stretch animation. Held keys are released if the exact game window loses foreground focus.
+The runner validates and deploys the DLL, launches the game through Steam if necessary, reads only the latest 600 ReShade log lines, watches telemetry, and saves a compact report under `test-results/<timestamp>/summary.json`. With `-AutomateInput`, the loaded add-on minimizes its console, focuses ReShade's exact game window, lets startup settle for 25 seconds, and makes one short `W` intro attempt. Movement begins only after the configured delay and normal indexed scene rendering are both visible, so startup loading cannot consume the walking test. It then walks forward for three seconds, adds right movement for two seconds, and taps `B` for the stretch animation. Held keys are released if the exact game window loses foreground focus.
 
-With `-EditTest`, the add-on waits briefly for a moving 48- or 64-byte candidate, adds `0.35` to one translation component for two seconds, verifies every write by readback, captures the active state, restores the exact original element, and records whether the game later overwrites that allocation normally. The additional captures are `capture-edit-before.bmp`, `capture-edit-active.bmp`, and `capture-edit-restored.bmp`. This validates the memory channel; only a clear visual change validates render ownership.
+With `-EditTest`, the add-on first triggers the stretch animation, ranks the current 48- and 64-byte candidates, and tests each still-live candidate. Every slot receives an alternating XYZ translation of `+/-4`, `+/-8`, and `+/-12` for 1.5 seconds. A dedicated worker repeats and immediately verifies the writes while the game keeps the range mapped. The add-on captures each pulse as `capture-edit-cNNN-all.bmp`, restores the candidate's exact original bytes when it is still accessible, and finishes with `capture-edit-restored.bmp`. This deliberately conspicuous sweep validates candidate writability; only a clear visual change validates render ownership. Anonymous mapped ranges are transient, so a candidate that the game unmaps before restoration remains an edit-test failure even when the rest of the sweep succeeds.
 
 All captures come directly from ReShade's back buffer and are downscaled to 480 pixels wide. `-ShutdownAfterTest` terminates only the exact tested process after evidence collection; omit it to leave the game open.
 
-Run `tools/run_live_test.ps1 -RecoverOnly` after a crash. It checks live and half-terminated `helldivers2.exe` entries, attempts ordinary exact-PID cleanup, and verifies that the installed add-on is unlocked. If Windows retains an already-exited process after cleanup, the procedure refuses deployment and asks for a Windows restart instead of using unsafe thread termination.
+Run `tools/run_live_test.ps1 -RecoverOnly` after a crash. It checks live and half-terminated `helldivers2.exe` entries, attempts ordinary exact-PID cleanup, and verifies that the installed add-on is unlocked. If an already-exited process remains, `tools/recover_game_elevated.ps1` can repeat exact-PID cleanup through a UAC prompt. Both procedures refuse PID reuse and never manage Steam. If Windows still retains the process, restart Windows instead of terminating individual threads.
 
 Synthetic input may be ignored by the game or its anti-cheat. The runner waits for normal scene rendering and reports `failed-input` instead of claiming a walking pass when the opening movie remains active.
 

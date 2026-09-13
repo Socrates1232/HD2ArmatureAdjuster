@@ -16,7 +16,7 @@ This repository is at the anonymous discovery and bounded-edit proof-of-concept 
 - A conservative scanner for transform-shaped arrays using 64-byte matrices, 48-byte packed affine matrices, and 32-byte dual quaternions.
 - A standalone console that reports anonymous candidate slots and value changes.
 - A live-test runner with process-state checks, exact game-window input gating, low-resolution screenshots, shutdown handling, and recovery-only mode.
-- An opt-in edit probe that pulses one transform candidate, verifies readback, and restores the original bytes.
+- An opt-in edit sweep that applies conspicuous translations to all slots in each candidate, verifies immediate and present-time readback, captures the result, and restores the original bytes when the mapped range remains accessible.
 
 The add-on can expose changing transform-like values, but it cannot yet prove that a candidate is a character bone palette or associate a slot with vertices, a draw, a mesh, or a semantic bone name.
 
@@ -27,6 +27,8 @@ The add-on can expose changing transform-like values, but it cannot yet prove th
 - During a manual run, displayed values changed as the character moved and turned. A visible change such as `0 -> -180` is evidence that live transform-like data is being observed; the values are raw matrix/translation deltas and should not yet be interpreted as named-bone Euler angles.
 - Automated input can be sent only after the exact ReShade game window has focus. Comparing process IDs was insufficient because the add-on console and render window are both owned by `helldivers2.exe`.
 - The runner can capture useful low-resolution checkpoints and distinguish a live process from an exited-but-still-present process object.
+- The original scanner's attempt to map CPU-visible D3D12 buffers itself was removed. Discovery now reads only ranges currently mapped by the game.
+- The passive scanner completed a full automated run, including walking, turning, stretch input, a full edit sweep, evidence capture, and clean process shutdown without another device-hung crash.
 
 ## Test record
 
@@ -38,6 +40,8 @@ The add-on can expose changing transform-like values, but it cannot yet prove th
 | Recovery-only test | Detected the exited-but-present game process, attempted exact-PID cleanup, refused unsafe thread termination, and blocked deployment | Recovery behavior worked as designed; Windows restart was the safe fallback while the stale process remained |
 | Run `20260913-184754` | First edit-channel pass wrote and read back one 48-byte candidate, then restored it; target had no prior motion; shutdown briefly observed an exited process object which cleared immediately afterward | Memory channel verified, render ownership not established |
 | Run `20260913-185144` | Motion-backed candidate 7, slot 5, 48-byte layout; 178,616 successful writes and immediate readbacks; three present-time readbacks; restoration and later engine overwrite observed; movement visibly displaced the character; clean shutdown | Control/feedback loop and writable allocation verified; captures show no unambiguous skeletal deformation |
+| Run `20260913-192430` | Callback-timed drastic sweep completed 47/47 candidates and 367,495 verified writes; every slot received alternating XYZ translations of `+/-4`, `+/-8`, and `+/-12`; 14 candidate captures; clean shutdown | No capture showed credible skeletal deformation; writes made from the graphics callback still did not establish render ownership |
+| Run `20260913-204351` | Passive mapped-range scanner; movement and stretch completed; 41/41 hammer-thread rounds; 7,372 successful writes and immediate readbacks; 30 present-time readbacks; 35 captures; final restoration and clean shutdown; one transient unmap produced edit error 2 | Stability regression passed with no crash. The memory channel is live, but the run is conservatively classified `failed-edit` because one target became inaccessible before an exact restore. No visible character deformation was found |
 
 The stale process later cleared naturally. At the time of this update, no `helldivers2.exe` process is present.
 
@@ -99,8 +103,9 @@ A bone-hash dictionary can be used during development to validate recovered name
 
 - The scanner recognizes plausible numeric layouts, not skinning ownership. Intro and UI rendering can produce false positives, including repeated `[2, 0, 0]`-like values.
 - There is no descriptor/draw ownership tracking, vertex influence mapping, or semantic naming yet.
-- Anonymous buffer editing works, but a rendered character edit has not been proven. A moving transform-shaped candidate can still belong to camera, lighting, physics, or unrelated shader data.
-- The game crash cause is not proven. Repeated input injection was correlated with one crash, and console teardown was a plausible contributor, so both areas were simplified. Neither should be treated as the confirmed root cause.
+- Anonymous buffer editing works, but a rendered character edit has not been proven. Even a drastic all-slot sweep produced no credible deformation. A moving transform-shaped candidate can still belong to camera, lighting, physics, or unrelated shader data, or be overwritten before the consuming GPU work.
+- Windows recorded `DXGI_ERROR_DEVICE_HUNG` in D3DDRED2 data for the recent crashes, followed by an `ntdll` BEX64 error. The add-on's self-mapping of D3D12 buffers was the highest-risk operation and has been removed. The first full passive-scanner run was stable, which strongly implicates that path but does not prove a single root cause.
+- Passive observation can lose a candidate when the game unmaps or destroys its resource. The edit test treats loss before exact restoration as a failure instead of hiding it as a successful channel verification.
 - Individual thread termination is intentionally not used for zombie recovery because it can corrupt process and driver state.
 
 ## Runner and safety policy
@@ -114,11 +119,11 @@ A bone-hash dictionary can be used during development to validate recovered name
 
 ## Current deployment state
 
-- Repository baseline before this document: `db49ad4` (`Add crash recovery checks and state captures`).
+- Last published repository commit before this update: `c79024b` (`Add bounded runtime edit validation`).
 - No game process is currently present, and no automation request is pending.
-- The current edit-test build was deployed and live-tested successfully. Run `20260913-185144` used SHA-256 `2988A682DB46693EEB49D7BB6049A7ED00BC80E0868B136A97F08F900C160190`.
-- The tested process shut down cleanly, and a fresh process query found no remaining `helldivers2.exe`.
+- The passive edit-test build used SHA-256 `74B077E9B52CAB0B13F45445F4044220AB07C46058CDE6CF10D492509FACFA1E` in run `20260913-204351`.
+- The tested process shut down cleanly. A fresh process query found no remaining `helldivers2.exe`.
 
 ## Recommended next verification
 
-The next development milestone is a minimal offline marker patch plus runtime recognition of that marker. The marker is needed to distinguish a character palette consumed by a draw from merely writable, animated transform-shaped data. Repeat the same bounded pulse against the marked palette; a visible before/active/restored difference will validate the final render path before semantic naming or full vertex mapping begins.
+Before building the offline fingerprint and semantic mapping, the next verification should establish one visible deformation. The current anonymous scanner is insufficient. The smallest useful next step is draw-bound resource correlation: record the descriptors and buffer copies associated with character draw calls, narrow the candidate set to data actually consumed by those draws, and repeat the same before/active/restored pulse. Only after that positive render-path result should the offline marker encode a stable identity for the proven palette.
