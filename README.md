@@ -63,6 +63,8 @@ Possible report states:
 - `passed-no-motion-yet`: the runtime works, but the observation window did not catch candidate motion.
 - `failed-load`, `failed-runtime`, or `inconclusive-load`: inspect the adjacent `reshade-tail.log`.
 
+`runtime_active` requires a heartbeat no more than five seconds old. The report also records whether the game process is alive and whether ReShade's last add-on event was registration or unregistration, so a frozen or detached runtime is not reported as a pass.
+
 ## What a useful result looks like
 
 Prefer candidates with a high score, repeated `motion frames`, and multiple slots changing coherently when the character animates. Static transforms and unrelated transform arrays can also match, so this console is evidence for locating palettes, not final identification.

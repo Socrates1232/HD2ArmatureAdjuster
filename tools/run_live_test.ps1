@@ -121,6 +121,7 @@ $latestTelemetry = $null
 $strongestTelemetry = $null
 $maxSelectedChanges = -1
 $maxCandidates = 0
+$lastReportedFrame = -1
 $deadline = [DateTime]::UtcNow.AddSeconds($ObserveSeconds)
 while ([DateTime]::UtcNow -lt $deadline) {
     if (!(Get-Process -Id $running.Id -ErrorAction SilentlyContinue)) { break }
@@ -128,13 +129,18 @@ while ([DateTime]::UtcNow -lt $deadline) {
     if ($sample -and $sample.process_id -eq $running.Id -and $sample.session_id -ne $previousSession) {
         $latestTelemetry = $sample
         $maxCandidates = [Math]::Max($maxCandidates, [int]$sample.candidates)
-        if ([int]$sample.selected_changed_slots -gt $maxSelectedChanges) {
+        if ([int]$sample.selected_changed_slots -gt $maxSelectedChanges -or
+            ([int]$sample.selected_changed_slots -eq $maxSelectedChanges -and
+             (!$strongestTelemetry -or [int]$sample.candidates -gt [int]$strongestTelemetry.candidates))) {
             $maxSelectedChanges = [int]$sample.selected_changed_slots
             $strongestTelemetry = $sample
         }
-        Write-Host ("frame={0} buffers={1}/{2} candidates={3} moving={4} selected-change={5}" -f
-            $sample.frame, $sample.mapped_buffers, $sample.tracked_buffers, $sample.candidates,
-            $sample.moving_candidates, $sample.selected_changed_slots)
+        if ([int64]$sample.frame -ne $lastReportedFrame) {
+            $lastReportedFrame = [int64]$sample.frame
+            Write-Host ("frame={0} buffers={1}/{2} candidates={3} moving={4} selected-change={5}" -f
+                $sample.frame, $sample.mapped_buffers, $sample.tracked_buffers, $sample.candidates,
+                $sample.moving_candidates, $sample.selected_changed_slots)
+        }
     }
     Start-Sleep -Seconds 1
 }
@@ -143,10 +149,21 @@ $logLines = if (Test-Path -LiteralPath $reshadeLog) { @(Get-Content -LiteralPath
 $interestingLog = @($logLines | Where-Object {
     $_ -match 'HD2PaletteProbe|HD2 Palette Probe|requested API version|Failed to (load|register) add-on'
 })
-$registered = [bool]($interestingLog | Where-Object { $_ -match 'Registered add-on "HD2 Palette Probe"' })
+$registerPattern = '\|\s+Registered add-on "HD2 Palette Probe"'
+$unregisterPattern = '\|\s+Unregistered add-on "HD2 Palette Probe"'
+$registered = [bool]($interestingLog | Where-Object { $_ -match $registerPattern })
+$unregistered = [bool]($interestingLog | Where-Object { $_ -match $unregisterPattern })
+$lastAddonEvent = $interestingLog | Where-Object { $_ -match $registerPattern -or $_ -match $unregisterPattern } |
+    Select-Object -Last 1
+$registeredAtEnd = $registered -and $lastAddonEvent -match $registerPattern
 $loadError = [bool]($interestingLog | Where-Object { $_ -match 'ERROR.*(HD2PaletteProbe|requested API version|Failed to (load|register) add-on)' })
 $telemetrySeen = $null -ne $latestTelemetry
-$runtimeActive = $telemetrySeen -and $latestTelemetry.frame -gt 0 -and $latestTelemetry.tracked_buffers -gt 0
+$heartbeatAgeSeconds = if ($telemetrySeen) {
+    [Math]::Max(0.0, ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [double]$latestTelemetry.updated_unix_ms) / 1000.0)
+} else { $null }
+$heartbeatFresh = $telemetrySeen -and $heartbeatAgeSeconds -le 5.0
+$processAlive = [bool](Get-Process -Id $running.Id -ErrorAction SilentlyContinue)
+$runtimeActive = $heartbeatFresh -and $processAlive -and $latestTelemetry.frame -gt 0 -and $latestTelemetry.tracked_buffers -gt 0
 $motionDetected = $telemetrySeen -and ($latestTelemetry.moving_candidates -gt 0 -or $maxSelectedChanges -gt 0)
 $status = if ($loadError) { 'failed-load' } elseif (!$registered -and !$telemetrySeen) { 'inconclusive-load' } elseif (!$runtimeActive) { 'failed-runtime' } elseif ($motionDetected) { 'passed-with-motion' } else { 'passed-no-motion-yet' }
 
@@ -164,10 +181,15 @@ $summary = [ordered]@{
     required_reshade_api = 17
     addon_sha256 = $addonHash
     addon_registered = $registered
+    addon_unregistered = $unregistered
+    addon_registered_at_end = $registeredAtEnd
     addon_load_error = $loadError
     log_start_offset = $logOffset
     log_lines_examined = $logLines.Count
     telemetry_seen = $telemetrySeen
+    heartbeat_fresh = $heartbeatFresh
+    heartbeat_age_seconds = $heartbeatAgeSeconds
+    process_alive = $processAlive
     runtime_active = $runtimeActive
     motion_detected = $motionDetected
     max_candidates = $maxCandidates
