@@ -14,7 +14,8 @@ if(NOT EXISTS "${RESHADE_INCLUDE_DIR}/reshade.hpp")
 endif()
 
 add_library(HD2PaletteProbe SHARED src/addon.cpp)
-target_sources(HD2PaletteProbe PRIVATE src/matrix_scan.hpp src/fingerprint_data.hpp src/wc_read.hpp)
+target_sources(HD2PaletteProbe PRIVATE src/matrix_scan.hpp src/fingerprint_data.hpp
+    src/ib_layout.hpp src/ib_profile_data.hpp src/profile_scan.hpp src/wc_read.hpp)
 target_compile_features(HD2PaletteProbe PRIVATE cxx_std_17)
 target_include_directories(HD2PaletteProbe PRIVATE
 	"${RESHADE_INCLUDE_DIR}")
@@ -40,4 +41,22 @@ if(BUILD_TESTING)
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     add_test(NAME addon_loads_and_registers
         COMMAND addon_load_test "$<TARGET_FILE:HD2PaletteProbe>")
+
+    add_executable(ib_layout_test tests/ib_layout_test.cpp src/ib_layout.hpp
+        src/ib_profile_data.hpp)
+    target_compile_features(ib_layout_test PRIVATE cxx_std_17)
+    target_include_directories(ib_layout_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if(MSVC)
+        target_compile_options(ib_layout_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME inverse_bind_layouts COMMAND ib_layout_test)
+
+    add_executable(profile_scan_test tests/profile_scan_test.cpp
+        src/ib_profile_data.hpp src/profile_scan.hpp)
+    target_compile_features(profile_scan_test PRIVATE cxx_std_17)
+    target_include_directories(profile_scan_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if(MSVC)
+        target_compile_options(profile_scan_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME converted_profile_scan COMMAND profile_scan_test)
 endif()

@@ -1,5 +1,7 @@
 # HD2 Armature Adjuster: Full Experimental Report
 
+> **Post-review correction:** this report records the first 69 runs, but its runtime experiments did not distinguish the loader-converted `t48` inverse-bind table from downstream animated 48-byte upload copies. No runtime write in this ledger proves control of the reference implementation's preferred target. Read [`REVIEW_RESPONSE_2026-09-14.md`](REVIEW_RESPONSE_2026-09-14.md) for the corrected model and next controlled tests.
+
 Report date: 2026-09-14
 
 Covered evidence: initial add-on work through live run `20260914-004901`

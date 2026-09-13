@@ -2,6 +2,7 @@
 param(
     [string]$GameRoot = 'F:\Steam\steamapps\common\Helldivers 2',
     [string]$AddonPath,
+    [string]$IbProfilePath,
     [ValidateRange(10, 900)]
     [int]$ObserveSeconds = 90,
     [ValidateRange(10, 300)]
@@ -22,6 +23,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
+if (!$IbProfilePath) { $IbProfilePath = Join-Path $projectRoot 'profiles\b01_slot7_ab.json' }
 $gameBin = Join-Path $GameRoot 'bin'
 $gameExe = Join-Path $gameBin 'helldivers2.exe'
 $reshadeDll = Join-Path $gameBin 'dxgi.dll'
@@ -61,17 +63,47 @@ function Get-PeMachine([string]$Path) {
 }
 
 function Find-AddonBuild {
-    $preferred = @(
-        (Join-Path $projectRoot 'build\bin\Release\HD2PaletteProbe.addon64'),
-        (Join-Path $projectRoot 'build\bin\HD2PaletteProbe.addon64')
-    )
-    foreach ($path in $preferred) {
-        if (Test-Path -LiteralPath $path) { return (Resolve-Path -LiteralPath $path).Path }
-    }
-    $found = Get-ChildItem -Path (Join-Path $projectRoot 'build*\bin\HD2PaletteProbe.addon64') -File -ErrorAction SilentlyContinue |
+    $found = Get-ChildItem -Path (Join-Path $projectRoot 'build*') -Directory -ErrorAction SilentlyContinue |
+        Get-ChildItem -Filter 'HD2PaletteProbe.addon64' -File -Recurse -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if ($found) { return $found.FullName }
     throw 'No built HD2PaletteProbe.addon64 was found. Build the Release target first or pass -AddonPath.'
+}
+
+function Get-ProfileTripletState([object]$Profile, [string]$DataRoot) {
+    if ($Profile.a.file -ne $Profile.b.file) { throw 'The A/B profile uses different patch filenames.' }
+    $mainPath = Join-Path $DataRoot $Profile.a.file
+    $paths = [ordered]@{
+        main = $mainPath
+        gpu = "$mainPath.gpu_resources"
+        stream = "$mainPath.stream"
+    }
+    $actual = [ordered]@{}
+    foreach ($kind in $paths.Keys) {
+        $path = $paths[$kind]
+        if (!(Test-Path -LiteralPath $path)) { throw "Profile input is missing: $path" }
+        $file = Get-Item -LiteralPath $path
+        $actual[$kind] = [ordered]@{
+            path = $path
+            bytes = $file.Length
+            sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    }
+    $matches = {
+        param($variant)
+        foreach ($kind in $paths.Keys) {
+            if ([int64]$actual[$kind].bytes -ne [int64]$variant.triplet.$kind.bytes -or
+                $actual[$kind].sha256 -ne [string]$variant.triplet.$kind.sha256) { return $false }
+        }
+        return $true
+    }
+    $state = if (& $matches $Profile.a) { 'A' } elseif (& $matches $Profile.b) { 'B' } else { 'neither' }
+    return [pscustomobject]@{ state = $state; files = $actual }
+}
+
+function Get-TelemetryValue([object]$Sample, [string]$Name, $Default) {
+    if ($Sample.PSObject.Properties[$Name]) { return $Sample.$Name }
+    return $Default
 }
 
 function Find-Steam {
@@ -196,6 +228,13 @@ if ($RecoverOnly) {
     Write-Host 'Recovery passed: no live or half-terminated game process remains, and the add-on DLL is unlocked.'
     exit 0
 }
+$IbProfilePath = (Resolve-Path -LiteralPath $IbProfilePath).Path
+$ibProfile = Get-Content -LiteralPath $IbProfilePath -Raw | ConvertFrom-Json
+if ([int]$ibProfile.schema -ne 1) { throw "Unsupported inverse-bind profile schema: $($ibProfile.schema)" }
+$installedProfile = Get-ProfileTripletState -Profile $ibProfile -DataRoot (Join-Path $GameRoot 'data')
+if ($installedProfile.state -eq 'neither') {
+    throw "The installed B-01 patch is neither exact profile A nor B. Refusing an ambiguous run. See $IbProfilePath"
+}
 if (!$AddonPath) { $AddonPath = Find-AddonBuild }
 $AddonPath = (Resolve-Path -LiteralPath $AddonPath).Path
 
@@ -204,7 +243,10 @@ if ((Get-PeMachine $AddonPath) -ne 0x8664) { throw 'The add-on is not an x64 PE 
 if ($AutomateInput -and $ObserveSeconds -lt $InputDelaySeconds + 8) {
     throw '-ObserveSeconds must allow at least eight seconds after -InputDelaySeconds.'
 }
-if ($EditTest -and !$AutomateInput) { throw '-EditTest currently requires -AutomateInput.' }
+if ($EditTest) { throw '-EditTest is disabled in the read-only converted_ib_scan stage.' }
+if ($EnableInGameCapture -or $WindowCapture) {
+    throw 'Only -SteamCapture is allowed in this stage; the other capture paths are excluded from the crash-sensitive test.'
+}
 if (@($EnableInGameCapture, $SteamCapture, $WindowCapture).Where({ $_ }).Count -gt 1) {
     throw 'Choose only one screenshot method.'
 }
@@ -277,7 +319,7 @@ if (!$NoDeploy) {
 }
 
 if ($PreflightOnly) {
-    Write-Host "Preflight passed: ReShade $reshadeVersion, x64 add-on, SHA256 $addonHash"
+    Write-Host "Preflight passed: ReShade $reshadeVersion, x64 add-on, profile $($installedProfile.state), SHA256 $addonHash"
     exit 0
 }
 
@@ -331,6 +373,12 @@ $maxCandidates = 0
 $maxMovingCandidates = 0
 $maxRingTargets = 0
 $maxMovingRingTargets = 0
+$maxConvertedIbHits = 0
+$maxConvertedIbAHits = 0
+$maxConvertedIbBHits = 0
+$maxConvertedPartialCandidates = 0
+$maxConvertedBestPartialEntries = 0
+$experimentMode = $null
 $lastReportedFrame = -1
 $lastReportedAutomation = -1
 $lastReportAt = [DateTime]::MinValue
@@ -344,6 +392,7 @@ $editTargetHadMotion = $false
 $editWriteSuccesses = 0
 $editImmediateReadbacks = 0
 $editPresentReadbacks = 0
+$editRefillsObserved = 0
 $editStaleSkips = 0
 $editTargetsSelected = 0
 $editTargetsWritten = 0
@@ -378,6 +427,12 @@ while ([DateTime]::UtcNow -lt $deadline) {
         $maxMovingCandidates = [Math]::Max($maxMovingCandidates, [int]$sample.moving_candidates)
         $maxRingTargets = [Math]::Max($maxRingTargets, [int]$sample.ring_targets)
         $maxMovingRingTargets = [Math]::Max($maxMovingRingTargets, [int]$sample.moving_ring_targets)
+        $experimentMode = [string](Get-TelemetryValue $sample 'experiment_mode' '')
+        $maxConvertedIbHits = [Math]::Max($maxConvertedIbHits, [int](Get-TelemetryValue $sample 'converted_ib_hits' 0))
+        $maxConvertedIbAHits = [Math]::Max($maxConvertedIbAHits, [int](Get-TelemetryValue $sample 'converted_ib_a_hits' 0))
+        $maxConvertedIbBHits = [Math]::Max($maxConvertedIbBHits, [int](Get-TelemetryValue $sample 'converted_ib_b_hits' 0))
+        $maxConvertedPartialCandidates = [Math]::Max($maxConvertedPartialCandidates, [int64](Get-TelemetryValue $sample 'converted_ib_partial_candidates' 0))
+        $maxConvertedBestPartialEntries = [Math]::Max($maxConvertedBestPartialEntries, [int](Get-TelemetryValue $sample 'converted_ib_best_partial_entries' 0))
         $automationStage = [Math]::Max($automationStage, [int]$sample.automation_stage)
         $introAttempts = [Math]::Max($introAttempts, [int]$sample.automation_intro_attempts)
         $inputStarted = $inputStarted -or [bool]$sample.automation_input_started
@@ -387,6 +442,7 @@ while ([DateTime]::UtcNow -lt $deadline) {
         $editWriteSuccesses = [Math]::Max($editWriteSuccesses, [int64]$sample.edit_write_successes)
         $editImmediateReadbacks = [Math]::Max($editImmediateReadbacks, [int64]$sample.edit_immediate_readbacks)
         $editPresentReadbacks = [Math]::Max($editPresentReadbacks, [int64]$sample.edit_present_readbacks)
+        $editRefillsObserved = [Math]::Max($editRefillsObserved, [int64](Get-TelemetryValue $sample 'edit_refills_observed' 0))
         $editStaleSkips = [Math]::Max($editStaleSkips, [int64]$sample.edit_stale_skips)
         $editTargetsSelected = [Math]::Max($editTargetsSelected, [int]$sample.edit_targets_selected)
         $editTargetsWritten = [Math]::Max($editTargetsWritten, [int]$sample.edit_targets_written)
@@ -441,9 +497,9 @@ while ([DateTime]::UtcNow -lt $deadline) {
             $lastReportedFrame = [int64]$sample.frame
             $lastReportedAutomation = [int]$sample.automation_stage
             $lastReportAt = $now
-            Write-Host ("frame={0} buffers={1}/{2} candidates={3} moving={4} ring={5}/{6} automation={7} edit={8}/{9} writes={10}" -f
-                $sample.frame, $sample.mapped_buffers, $sample.tracked_buffers, $sample.candidates,
-                $sample.moving_candidates, $sample.moving_ring_targets, $sample.ring_targets, $sample.automation_stage,
+            Write-Host ("frame={0} mode={1} converted={2} A/B={3}/{4} partial={5} automation={6} edit={7}/{8} writes={9}" -f
+                $sample.frame, $experimentMode, $maxConvertedIbHits, $maxConvertedIbAHits,
+                $maxConvertedIbBHits, $maxConvertedBestPartialEntries, $sample.automation_stage,
                 $sample.edit_round, $sample.edit_total_rounds, $sample.edit_write_successes)
         }
     }
@@ -488,9 +544,10 @@ if ($currentProcess) { $currentProcess.Refresh() }
 $processAlive = $null -ne $currentProcess -and !$currentProcess.HasExited
 $runtimeActive = $heartbeatFresh -and $processAlive -and $latestTelemetry.frame -gt 0
 $motionDetected = $telemetrySeen -and ($maxMovingCandidates -gt 0 -or $maxSelectedChanges -gt 0)
+$convertedScanVerified = $experimentMode -eq 'converted_ib_scan' -and $maxConvertedIbHits -gt 0
 $editVerified = !$EditTest -or ($editCompleted -and $editWriteSuccesses -gt 0 -and
     $editImmediateReadbacks -gt 0 -and $editRestoreSucceeded -and $editError -eq 0)
-$status = if ($loadError) { 'failed-load' } elseif (!$registered -and !$telemetrySeen) { 'inconclusive-load' } elseif (!$runtimeActive) { 'failed-runtime' } elseif ($AutomateInput -and ($inputError -or !$inputCompleted)) { 'failed-input' } elseif ($EditTest -and !$editVerified) { 'failed-edit' } elseif ($EditTest) { 'passed-edit-channel' } elseif ($motionDetected) { 'passed-with-motion' } else { 'passed-no-motion-yet' }
+$status = if ($loadError) { 'failed-load' } elseif (!$registered -and !$telemetrySeen) { 'inconclusive-load' } elseif (!$runtimeActive) { 'failed-runtime' } elseif ($experimentMode -ne 'converted_ib_scan') { 'failed-experiment-mode' } elseif ($AutomateInput -and ($inputError -or !$inputCompleted)) { 'failed-input' } elseif ($EditTest -and !$editVerified) { 'failed-edit' } elseif (!$convertedScanVerified) { 'failed-no-converted-match' } else { 'passed-converted-scan' }
 
 New-Item -ItemType Directory -Force -Path $resultDir | Out-Null
 $interestingLog | Set-Content -LiteralPath (Join-Path $resultDir 'reshade-tail.log') -Encoding utf8
@@ -501,11 +558,12 @@ if ($SteamCapture) {
     $newScreenshots = @(Get-ChildItem -LiteralPath $steamScreenshotDirectory -File |
         Where-Object { !$steamScreenshotsBefore.ContainsKey($_.Name) } |
         Sort-Object LastWriteTime)
-    $steamCaptureNames = @(
-        'capture-edit-before-steam.jpg',
-        'capture-edit-active-steam.jpg',
-        'capture-edit-restored-steam.jpg'
-    )
+    $steamCaptureNames = if ($EditTest) {
+        @('capture-edit-before-steam.jpg', 'capture-edit-active-steam.jpg', 'capture-edit-restored-steam.jpg')
+    }
+    else {
+        @('capture-load-steam.jpg', 'capture-ready-steam.jpg', 'capture-walk-steam.jpg', 'capture-stretch-steam.jpg')
+    }
     for ($i = 0; $i -lt [Math]::Min($newScreenshots.Count, $steamCaptureNames.Count); ++$i) {
         Copy-Item -LiteralPath $newScreenshots[$i].FullName -Destination (Join-Path $resultDir $steamCaptureNames[$i])
         $captureFiles += $steamCaptureNames[$i]
@@ -569,6 +627,9 @@ $summary = [ordered]@{
     timestamp = (Get-Date).ToString('o')
     game_process_id = $running.Id
     game_root = $GameRoot
+    ib_profile_path = $IbProfilePath
+    installed_patch_state = $installedProfile.state
+    installed_patch_files = $installedProfile.files
     reshade_version = $reshadeVersion
     required_reshade_api = 17
     addon_sha256 = $addonHash
@@ -593,7 +654,7 @@ $summary = [ordered]@{
     edit_write_successes = $editWriteSuccesses
     edit_immediate_readbacks = $editImmediateReadbacks
     edit_present_readbacks = $editPresentReadbacks
-    edit_refills_observed = $editPresentReadbacks
+    edit_refills_observed = $editRefillsObserved
     edit_stale_skips = $editStaleSkips
     edit_targets_selected = $editTargetsSelected
     edit_targets_written = $editTargetsWritten
@@ -617,6 +678,13 @@ $summary = [ordered]@{
     max_moving_candidates = $maxMovingCandidates
     max_ring_targets = $maxRingTargets
     max_moving_ring_targets = $maxMovingRingTargets
+    experiment_mode = $experimentMode
+    converted_scan_verified = $convertedScanVerified
+    max_converted_ib_hits = $maxConvertedIbHits
+    max_converted_ib_a_hits = $maxConvertedIbAHits
+    max_converted_ib_b_hits = $maxConvertedIbBHits
+    max_converted_partial_candidates = $maxConvertedPartialCandidates
+    max_converted_best_partial_entries = $maxConvertedBestPartialEntries
     max_selected_changed_slots = [Math]::Max(0, $maxSelectedChanges)
     telemetry = $latestTelemetry
     strongest_telemetry = $strongestTelemetry

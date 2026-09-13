@@ -2,6 +2,8 @@
 
 #include "matrix_scan.hpp"
 #include "fingerprint_data.hpp"
+#include "ib_profile_data.hpp"
+#include "profile_scan.hpp"
 #include "wc_read.hpp"
 
 #include <Windows.h>
@@ -53,6 +55,30 @@ constexpr size_t k_ib_matrix_bytes = 64;
 constexpr size_t k_ib_fingerprint_bytes = armature_fingerprint::table_prefix_bytes;
 constexpr size_t k_ib_scan_chunk_bytes = 4 * 1024 * 1024;
 constexpr size_t k_max_ib_hits = 32;
+
+enum class experiment_mode
+{
+	file64_reference_scan,
+	converted_ib_scan,
+	animated_palette_scan,
+	converted_ib_edit,
+	animated_palette_edit
+};
+
+constexpr experiment_mode k_experiment_mode = experiment_mode::converted_ib_scan;
+
+const char *experiment_mode_name()
+{
+	switch (k_experiment_mode)
+	{
+	case experiment_mode::file64_reference_scan: return "file64_reference_scan";
+	case experiment_mode::converted_ib_scan: return "converted_ib_scan";
+	case experiment_mode::animated_palette_scan: return "animated_palette_scan";
+	case experiment_mode::converted_ib_edit: return "converted_ib_edit";
+	case experiment_mode::animated_palette_edit: return "animated_palette_edit";
+	}
+	return "UNKNOWN";
+}
 
 struct buffer_info
 {
@@ -127,6 +153,15 @@ struct scan_sample
 	std::vector<uint8_t> bytes;
 };
 
+struct converted_ib_hit
+{
+	uintptr_t address = 0;
+	armature_probe::profile_variant variant = armature_probe::profile_variant::a;
+	uintptr_t region_base = 0;
+	size_t region_size = 0;
+	DWORD protection = 0;
+};
+
 struct edit_probe_state
 {
 	bool requested = false;
@@ -143,6 +178,7 @@ struct edit_probe_state
 	uint64_t write_successes = 0;
 	uint64_t immediate_readbacks = 0;
 	uint64_t present_readbacks = 0;
+	uint64_t refills_observed = 0;
 	uint64_t stale_skips = 0;
 	uint32_t targets_selected = 0;
 	uint32_t targets_written = 0;
@@ -206,10 +242,12 @@ std::atomic<bool> g_edit_active { false };
 bool g_paused_before_edit = false;
 std::atomic<bool> g_scan_thread_stop { false };
 HANDLE g_scan_thread = nullptr;
-std::vector<uintptr_t> g_ib_hits;
+std::vector<converted_ib_hit> g_converted_ib_hits;
 std::atomic<uint32_t> g_ib_hunt_phase { 0 }; // 0 idle, 1 scanning, 2 found, 3 exhausted
 std::atomic<uint64_t> g_ib_hunt_bytes { 0 };
 std::atomic<uint32_t> g_ib_hunt_passes { 0 };
+std::atomic<uint64_t> g_converted_partial_candidates { 0 };
+std::atomic<uint32_t> g_converted_best_partial_entries { 0 };
 std::atomic<bool> g_ib_hunt_stop { false };
 HANDLE g_ib_hunt_thread = nullptr;
 std::chrono::steady_clock::time_point g_ib_hunt_deadline;
@@ -220,6 +258,9 @@ uint64_t g_live_frame = 0;
 uint32_t g_live_misses = 0;
 uint64_t g_focus_draws = 0;
 uint64_t g_live_locations = 0;
+std::atomic<uint64_t> g_marker_write_count { 0 };
+std::atomic<uint64_t> g_marker_refill_count { 0 };
+HMODULE g_addon_module = nullptr;
 
 void translation_of(const candidate &c, uint32_t slot, float &x, float &y, float &z);
 bool begin_edit_test(effect_runtime *runtime, std::chrono::steady_clock::time_point now);
@@ -268,18 +309,50 @@ bool fingerprint_at(const uint8_t *data, size_t available)
 
 DWORD WINAPI ib_hunt_thread_proc(void *)
 {
-	std::vector<uint8_t> scratch(k_ib_scan_chunk_bytes + k_ib_fingerprint_bytes);
+	constexpr size_t table_bytes = armature_ib_profile::t48_bytes;
+	std::vector<uint8_t> scratch(k_ib_scan_chunk_bytes + table_bytes);
 	SYSTEM_INFO system = {};
 	GetSystemInfo(&system);
 	const uintptr_t minimum = reinterpret_cast<uintptr_t>(system.lpMinimumApplicationAddress);
 	const uintptr_t maximum = reinterpret_cast<uintptr_t>(system.lpMaximumApplicationAddress);
 
-	for (uint32_t pass = 0; pass < 40 && !g_ib_hunt_stop.load(std::memory_order_acquire); ++pass)
+	for (uint32_t pass = 0; pass < 40 && !g_ib_hunt_stop.load(std::memory_order_acquire) &&
+		std::chrono::steady_clock::now() < g_ib_hunt_deadline; ++pass)
 	{
-		std::vector<uintptr_t> found;
+		std::vector<converted_ib_hit> found;
+		std::vector<armature_probe::address_range> excluded;
+		const uintptr_t scratch_begin = reinterpret_cast<uintptr_t>(scratch.data());
+		excluded.push_back({ scratch_begin, scratch_begin + scratch.size() });
+		if (g_addon_module != nullptr)
+		{
+			const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(g_addon_module);
+			if (dos->e_magic == IMAGE_DOS_SIGNATURE)
+			{
+				const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(
+					reinterpret_cast<const uint8_t *>(g_addon_module) + dos->e_lfanew);
+				if (nt->Signature == IMAGE_NT_SIGNATURE)
+				{
+					const uintptr_t image = reinterpret_cast<uintptr_t>(g_addon_module);
+					excluded.push_back({ image, image + nt->OptionalHeader.SizeOfImage });
+				}
+			}
+		}
+		{
+			std::lock_guard lock(g_mutex);
+			for (const auto &[unused, buffer] : g_buffers)
+				if (buffer.map_ptr != nullptr && buffer.map_size != 0)
+				{
+					const uintptr_t begin = reinterpret_cast<uintptr_t>(buffer.map_ptr);
+					excluded.push_back({ begin, begin + static_cast<size_t>(buffer.map_size) });
+				}
+		}
+
+		uint64_t partial_candidates = 0;
+		uint32_t best_partial_entries = 0;
 		uintptr_t cursor = minimum;
 		while (cursor < maximum && found.size() < k_max_ib_hits &&
-			!g_ib_hunt_stop.load(std::memory_order_acquire))
+			!g_ib_hunt_stop.load(std::memory_order_acquire) &&
+			std::chrono::steady_clock::now() < g_ib_hunt_deadline)
 		{
 			MEMORY_BASIC_INFORMATION info = {};
 			if (VirtualQuery(reinterpret_cast<const void *>(cursor), &info, sizeof(info)) == 0)
@@ -289,31 +362,34 @@ DWORD WINAPI ib_hunt_thread_proc(void *)
 			if (info.State == MEM_COMMIT && writable_data_page(info.Protect) && info.Type == MEM_PRIVATE)
 			{
 				for (size_t region_offset = 0; region_offset < region_size &&
-					found.size() < k_max_ib_hits; region_offset += k_ib_scan_chunk_bytes)
+					found.size() < k_max_ib_hits &&
+					std::chrono::steady_clock::now() < g_ib_hunt_deadline;
+					region_offset += k_ib_scan_chunk_bytes)
 				{
 					const size_t wanted = std::min(scratch.size(), region_size - region_offset);
 					SIZE_T got = 0;
 					ReadProcessMemory(GetCurrentProcess(),
 						reinterpret_cast<const void *>(base + region_offset), scratch.data(), wanted, &got);
 					g_ib_hunt_bytes.fetch_add(got, std::memory_order_relaxed);
-					if (got < k_ib_fingerprint_bytes)
+					if (got < table_bytes)
 						continue;
-					const size_t scan_bytes = std::min(k_ib_scan_chunk_bytes, static_cast<size_t>(got));
-					const size_t phase = (16 - ((base + region_offset) & 15)) & 15;
-					for (size_t offset = phase; offset + k_ib_fingerprint_bytes <= got &&
-						offset < scan_bytes && found.size() < k_max_ib_hits; offset += 16)
+					auto scan = armature_probe::find_exact_profiles(scratch.data(), got,
+						base + region_offset, armature_ib_profile::a_t48.data(),
+						armature_ib_profile::b_t48.data(), armature_ib_profile::count,
+						armature_ib_profile::slot, excluded, k_max_ib_hits - found.size());
+					partial_candidates += scan.partial_candidates;
+					best_partial_entries = std::max(best_partial_entries, scan.best_partial_entries);
+					const uintptr_t primary_end = base + region_offset +
+						std::min(k_ib_scan_chunk_bytes, static_cast<size_t>(got));
+					for (const armature_probe::profile_hit &hit : scan.hits)
 					{
-						const uintptr_t address = base + region_offset + offset;
-						const uintptr_t scratch_begin = reinterpret_cast<uintptr_t>(scratch.data());
-						const uintptr_t scratch_end = scratch_begin + scratch.size();
-						if ((address < scratch_end && address + k_ib_fingerprint_bytes > scratch_begin) ||
-							!fingerprint_at(scratch.data() + offset, got - offset))
+						if (hit.address >= primary_end)
 							continue;
-						const bool duplicate = std::any_of(found.begin(), found.end(), [address](uintptr_t known) {
-							return known == address;
+						const bool duplicate = std::any_of(found.begin(), found.end(), [&hit](const converted_ib_hit &known) {
+							return known.address == hit.address && known.variant == hit.variant;
 						});
 						if (!duplicate)
-							found.push_back(address);
+							found.push_back({ hit.address, hit.variant, base, region_size, info.Protect });
 					}
 				}
 			}
@@ -321,11 +397,13 @@ DWORD WINAPI ib_hunt_thread_proc(void *)
 				break;
 			cursor = base + region_size;
 		}
+		g_converted_partial_candidates.store(partial_candidates, std::memory_order_relaxed);
+		g_converted_best_partial_entries.store(best_partial_entries, std::memory_order_relaxed);
 		g_ib_hunt_passes.fetch_add(1, std::memory_order_relaxed);
 		if (!found.empty())
 		{
 			std::lock_guard lock(g_mutex);
-			g_ib_hits = std::move(found);
+			g_converted_ib_hits = std::move(found);
 			g_ib_hunt_phase.store(2, std::memory_order_release);
 			return 0;
 		}
@@ -342,15 +420,30 @@ bool ensure_ib_hunt_thread()
 		return true;
 	g_ib_hunt_bytes.store(0, std::memory_order_relaxed);
 	g_ib_hunt_passes.store(0, std::memory_order_relaxed);
+	g_converted_partial_candidates.store(0, std::memory_order_relaxed);
+	g_converted_best_partial_entries.store(0, std::memory_order_relaxed);
 	{
 		std::lock_guard lock(g_mutex);
-		g_ib_hits.clear();
+		g_converted_ib_hits.clear();
 		g_ring_targets.clear();
 		for (auto &[unused, info] : g_buffers)
 			info.scan_offset = info.map_offset;
 	}
 	g_ib_hunt_phase.store(1, std::memory_order_release);
 	g_ib_hunt_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+	g_ib_hunt_stop.store(false, std::memory_order_release);
+	if (g_ib_hunt_thread != nullptr)
+	{
+		WaitForSingleObject(g_ib_hunt_thread, 1000);
+		CloseHandle(g_ib_hunt_thread);
+		g_ib_hunt_thread = nullptr;
+	}
+	g_ib_hunt_thread = CreateThread(nullptr, 0, ib_hunt_thread_proc, nullptr, 0, nullptr);
+	if (g_ib_hunt_thread == nullptr)
+	{
+		g_ib_hunt_phase.store(3, std::memory_order_release);
+		return false;
+	}
 	return true;
 }
 
@@ -491,7 +584,8 @@ bool capture_frame(effect_runtime *runtime, const wchar_t *name)
 {
 	if (g_steam_capture_enabled)
 	{
-		if (std::wcsncmp(name, L"capture-edit-", 13) != 0)
+		const bool edit_capture = std::wcsncmp(name, L"capture-edit-", 13) == 0;
+		if (edit_capture != g_edit.requested)
 			return true;
 		if (g_steam_screenshot_key_down || !send_key(VK_F12, true))
 			return false;
@@ -799,7 +893,7 @@ void write_telemetry(uint32_t draws)
 
 	size_t buffer_count = 0, mapped_count = 0, candidate_count = 0, moving_count = 0;
 	size_t ring_count = 0, moving_ring_count = 0;
-	size_t ib_hit_count = 0;
+	size_t converted_count = 0, converted_a_count = 0, converted_b_count = 0;
 	uint32_t selected_id = 0, selected_slots = 0, selected_changed = 0;
 	uint64_t live_resource = 0, live_end = 0, focus_draws = 0, live_locations = 0,
 		residency_restores = 0;
@@ -811,7 +905,12 @@ void write_telemetry(uint32_t draws)
 		buffer_count = g_buffers.size();
 		candidate_count = g_candidates.size();
 		ring_count = g_ring_targets.size();
-		ib_hit_count = g_ring_targets.size();
+		converted_count = g_converted_ib_hits.size();
+		for (const converted_ib_hit &hit : g_converted_ib_hits)
+			if (hit.variant == armature_probe::profile_variant::a)
+				++converted_a_count;
+			else
+				++converted_b_count;
 		live_resource = g_live_resource;
 		live_end = g_live_end;
 		focus_draws = g_focus_draws;
@@ -851,8 +950,13 @@ void write_telemetry(uint32_t draws)
 
 	std::ostringstream json;
 	json << "{\n"
-		<< "  \"schema\": 2,\n"
+		<< "  \"schema\": 3,\n"
 		<< "  \"addon\": \"HD2 Palette Probe\",\n"
+		<< "  \"experiment_mode\": \"" << experiment_mode_name() << "\",\n"
+		<< "  \"profile_unit\": \"" << std::hex << armature_ib_profile::unit_id << std::dec << "\",\n"
+		<< "  \"profile_lod\": " << armature_ib_profile::lod << ",\n"
+		<< "  \"profile_slot\": " << armature_ib_profile::slot << ",\n"
+		<< "  \"profile_entries\": " << armature_ib_profile::count << ",\n"
 		<< "  \"api_version\": " << RESHADE_API_VERSION << ",\n"
 		<< "  \"process_id\": " << GetCurrentProcessId() << ",\n"
 		<< "  \"window_handle\": " << reinterpret_cast<uintptr_t>(g_game_window) << ",\n"
@@ -866,7 +970,15 @@ void write_telemetry(uint32_t draws)
 		<< "  \"ib_hunt_phase\": " << g_ib_hunt_phase.load(std::memory_order_relaxed) << ",\n"
 		<< "  \"ib_hunt_passes\": " << g_ib_hunt_passes.load(std::memory_order_relaxed) << ",\n"
 		<< "  \"ib_hunt_bytes\": " << g_ib_hunt_bytes.load(std::memory_order_relaxed) << ",\n"
-		<< "  \"ib_fingerprint_hits\": " << ib_hit_count << ",\n"
+		<< "  \"file64_reference_hits\": 0,\n"
+		<< "  \"converted_ib_hits\": " << converted_count << ",\n"
+		<< "  \"converted_ib_a_hits\": " << converted_a_count << ",\n"
+		<< "  \"converted_ib_b_hits\": " << converted_b_count << ",\n"
+		<< "  \"converted_ib_partial_candidates\": "
+		<< g_converted_partial_candidates.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"converted_ib_best_partial_entries\": "
+		<< g_converted_best_partial_entries.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"animated_palette_hits\": " << ring_count << ",\n"
 		<< "  \"live_palette_resource\": " << live_resource << ",\n"
 		<< "  \"live_palette_end\": " << live_end << ",\n"
 		<< "  \"focus_draws\": " << focus_draws << ",\n"
@@ -899,7 +1011,13 @@ void write_telemetry(uint32_t draws)
 		<< "  \"edit_write_successes\": " << edit.write_successes << ",\n"
 		<< "  \"edit_immediate_readbacks\": " << edit.immediate_readbacks << ",\n"
 		<< "  \"edit_present_readbacks\": " << edit.present_readbacks << ",\n"
-		<< "  \"edit_refills_observed\": " << edit.present_readbacks << ",\n"
+		<< "  \"edit_refills_observed\": " << edit.refills_observed << ",\n"
+		<< "  \"marker_write_count\": " << g_marker_write_count.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"marker_refill_count\": " << g_marker_refill_count.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"target_write_count\": " << edit.write_successes << ",\n"
+		<< "  \"cpu_match_count\": " << edit.immediate_readbacks << ",\n"
+		<< "  \"downstream_signature_match_count\": 0,\n"
+		<< "  \"visual_result\": \"not_evaluated\",\n"
 		<< "  \"edit_stale_skips\": " << edit.stale_skips << ",\n"
 		<< "  \"edit_targets_selected\": " << edit.targets_selected << ",\n"
 		<< "  \"edit_targets_written\": " << edit.targets_written << ",\n"
@@ -1094,6 +1212,8 @@ void make_displaced_runtime_transform(const uint8_t *original, uint8_t *injected
 
 bool begin_edit_test(effect_runtime *runtime, std::chrono::steady_clock::time_point now)
 {
+	if (k_experiment_mode != experiment_mode::animated_palette_edit)
+		return false;
 	if (g_ib_hunt_phase.load(std::memory_order_acquire) != 2)
 		return false;
 	if (!g_steam_capture_enabled && !capture_frame(runtime, L"capture-edit-before.bmp"))
@@ -1145,7 +1265,10 @@ bool begin_edit_test(effect_runtime *runtime, std::chrono::steady_clock::time_po
 		std::array<uint8_t, k_marker_stride> check = {};
 		armature_probe::copy_from_write_combined(check.data(), pointer, check.size());
 		if (std::memcmp(check.data(), probe.poisoned.data(), check.size()) == 0)
+		{
+			++g_marker_write_count;
 			g_residency_probes.push_back(probe);
+		}
 	}
 
 	g_edit.targets_selected = static_cast<uint32_t>(g_residency_probes.size());
@@ -1190,7 +1313,11 @@ void write_edit_probe()
 			++g_edit.stale_skips;
 			continue;
 		}
-		g_edit.overwrite_observed = g_edit.overwrite_observed || target.wrote;
+		if (target.wrote)
+		{
+			g_edit.overwrite_observed = true;
+			++g_edit.refills_observed;
+		}
 		target.original.assign(current.begin(), current.end());
 		make_displaced_runtime_transform(target.original.data(), target.injected.data());
 		std::memcpy(pointer, target.injected.data(), target.injected.size());
@@ -1856,6 +1983,7 @@ void probe_and_write_fresh_palettes()
 			continue;
 
 		++g_residency_restores;
+		++g_marker_refill_count;
 		g_edit.overwrite_observed = true;
 		g_edit.target_had_motion = true;
 		const uint64_t distance = static_cast<uint64_t>(k_marker_palette_slots -
@@ -1912,6 +2040,7 @@ void probe_and_write_fresh_palettes()
 		std::memcpy(probe.original.data(), tail.data(), k_marker_stride);
 		make_displaced_runtime_transform(probe.original.data(), probe.poisoned.data());
 		std::memcpy(probe_pointer, probe.poisoned.data(), probe.poisoned.size());
+		++g_marker_write_count;
 	}
 }
 
@@ -1934,6 +2063,11 @@ void handle_keys()
 	{
 		g_candidates.clear();
 		g_ring_targets.clear();
+		if (g_ib_hunt_phase.load(std::memory_order_acquire) != 1)
+		{
+			g_converted_ib_hits.clear();
+			g_ib_hunt_phase.store(0, std::memory_order_release);
+		}
 		g_selected = 0;
 		g_slot_page = 0;
 		g_candidate_cursor = 0;
@@ -1951,8 +2085,8 @@ void draw_console(uint32_t draws)
 
 	std::ostringstream out;
 	out << "\x1b[2J\x1b[H"
-		<< "HD2 Palette Probe 0.5  |  FINGERPRINTED INVERSE-BIND EDIT TEST  |  D3D12\n"
-		<< "The edit test writes one slot in an offline-fingerprinted inverse-bind table.\n\n";
+		<< "HD2 Palette Probe 0.6  |  " << experiment_mode_name() << "  |  D3D12\n"
+		<< "Read-only exact search for the converted upstream inverse-bind table.\n\n";
 
 	std::lock_guard lock(g_mutex);
 	size_t mapped = 0;
@@ -1967,16 +2101,18 @@ void draw_console(uint32_t draws)
 		<< (g_paused ? "  [PAUSED]\n" : "\n")
 		<< "IB hunt phase " << g_ib_hunt_phase.load(std::memory_order_relaxed)
 		<< "  passes " << g_ib_hunt_passes.load(std::memory_order_relaxed)
-		<< "  hits " << g_ib_hits.size()
+		<< "  converted hits " << g_converted_ib_hits.size()
 		<< "  scanned " << std::fixed << std::setprecision(1)
 		<< (static_cast<double>(g_ib_hunt_bytes.load(std::memory_order_relaxed)) / (1024.0 * 1024.0))
-		<< " MiB\n"
+		<< " MiB  partial " << g_converted_partial_candidates.load(std::memory_order_relaxed)
+		<< " (best " << g_converted_best_partial_entries.load(std::memory_order_relaxed)
+		<< '/' << armature_ib_profile::count << ")\n"
 		<< "F6 next candidate   F7 next 16 slots   F8 pause   F9 rescan\n"
 		<< "edit: " << (g_edit.active ? "ACTIVE" : g_edit.completed ? "complete" : g_edit.requested ? "armed" : "off")
 		<< "  live targets " << g_edit.targets_written << '/' << g_edit.targets_selected
 		<< " (" << g_edit.slots_modified << " slots)"
 		<< "  writes " << g_edit.write_successes << '/' << g_edit.write_attempts
-		<< "  refills " << g_edit.present_readbacks
+		<< "  refills " << g_edit.refills_observed
 		<< "  restored " << (g_edit.restore_succeeded ? "yes" : "no") << "\n\n";
 
 	if (g_candidates.empty())
@@ -2036,6 +2172,7 @@ void on_destroy_device(device *device)
 	g_buffer_order.clear();
 	g_candidates.clear();
 	g_ring_targets.clear();
+	g_converted_ib_hits.clear();
 	g_active_edit_targets.clear();
 	g_residency_probes.clear();
 	g_scan_queue.clear();
@@ -2159,8 +2296,17 @@ void on_present(command_queue *queue, swapchain *, const rect *, const rect *, u
 			scan_one_window();
 	}
 	const uint32_t hunt_phase = g_ib_hunt_phase.load(std::memory_order_acquire);
-	if (hunt_phase == 1 || hunt_phase == 2)
+	if (k_experiment_mode == experiment_mode::converted_ib_scan)
+	{
+		if (hunt_phase == 0)
+			ensure_ib_hunt_thread();
+	}
+	else if ((k_experiment_mode == experiment_mode::animated_palette_scan ||
+		k_experiment_mode == experiment_mode::animated_palette_edit) &&
+		(hunt_phase == 1 || hunt_phase == 2))
+	{
 		scan_one_marker_window();
+	}
 	draw_console(draws);
 	write_telemetry(draws);
 }
@@ -2170,13 +2316,14 @@ extern "C"
 {
 __declspec(dllexport) const char *NAME = "HD2 Palette Probe";
 __declspec(dllexport) const char *DESCRIPTION =
-	"D3D12 transform scanner with a fingerprinted, reversible inverse-bind edit probe.";
+	"Read-only exact scanner for a profiled converted inverse-bind table.";
 }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 {
 	if (reason == DLL_PROCESS_ATTACH)
 	{
+		g_addon_module = module;
 		DisableThreadLibraryCalls(module);
 		if (!reshade::register_addon(module))
 			return FALSE;

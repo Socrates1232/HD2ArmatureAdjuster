@@ -1,6 +1,7 @@
 /build*/
 /deps/
 /test-results/
+__pycache__/
 *.addon64
 *.dll
 *.exe
