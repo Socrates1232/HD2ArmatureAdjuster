@@ -288,6 +288,8 @@ void on_reshade_present(effect_runtime *runtime)
 	{
 		if (!focus_runtime_window(runtime))
 			return;
+		if (!capture_frame(runtime, L"capture-load.bmp"))
+			g_automation_error = 3;
 		if (g_skip_intro)
 		{
 			g_automation_deadline = now + std::chrono::seconds(25);
@@ -321,6 +323,8 @@ void on_reshade_present(effect_runtime *runtime)
 	{
 		if (!game_has_focus())
 			return;
+		if (!capture_frame(runtime, L"capture-ready.bmp"))
+			g_automation_error = 3;
 		if (!send_key('W', true))
 		{
 			fail_automation(1);
@@ -473,7 +477,9 @@ void write_telemetry(uint32_t draws)
 
 void open_console()
 {
-	if (g_console != INVALID_HANDLE_VALUE || !AllocConsole())
+	if (g_console != INVALID_HANDLE_VALUE)
+		return;
+	if (GetConsoleWindow() == nullptr && !AllocConsole())
 		return;
 
 	SetConsoleTitleW(L"HD2 Palette Probe");
@@ -975,7 +981,7 @@ __declspec(dllexport) const char *DESCRIPTION =
 	"Read-only D3D12 scanner that displays anonymous, animated transform slots in a standalone console.";
 }
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 {
 	if (reason == DLL_PROCESS_ATTACH)
 	{
@@ -995,6 +1001,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 	else if (reason == DLL_PROCESS_DETACH)
 	{
 		release_automation_keys();
+		if (reserved != nullptr)
+			return TRUE;
 		reshade::unregister_event<addon_event::reshade_present>(on_reshade_present);
 		reshade::unregister_event<addon_event::present>(on_present);
 		reshade::unregister_event<addon_event::draw_indexed>(on_draw_indexed);
@@ -1009,7 +1017,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 		{
 			CloseHandle(g_console);
 			g_console = INVALID_HANDLE_VALUE;
-			FreeConsole();
 		}
 	}
 	return TRUE;

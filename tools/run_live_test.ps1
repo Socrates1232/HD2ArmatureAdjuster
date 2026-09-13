@@ -10,6 +10,7 @@ param(
     [ValidateRange(0, 120)]
     [int]$InputDelaySeconds = 10,
     [switch]$ShutdownAfterTest,
+    [switch]$RecoverOnly,
     [switch]$PreflightOnly,
     [switch]$NoDeploy,
     [switch]$NoLaunch
@@ -25,7 +26,13 @@ $installedAddon = Join-Path $gameBin 'HD2PaletteProbe.addon64'
 $runtimeDirectory = Join-Path $env:LOCALAPPDATA 'HD2ArmatureAdjuster'
 $telemetryPath = Join-Path $runtimeDirectory 'telemetry.json'
 $automationPath = Join-Path $runtimeDirectory 'automation.request'
-$captureNames = @('capture-start.bmp', 'capture-walk.bmp', 'capture-stretch.bmp')
+$captureNames = @(
+    'capture-load.bmp',
+    'capture-start.bmp',
+    'capture-ready.bmp',
+    'capture-walk.bmp',
+    'capture-stretch.bmp'
+)
 $resultRoot = Join-Path $projectRoot 'test-results'
 $sessionName = Get-Date -Format 'yyyyMMdd-HHmmss'
 $resultDir = Join-Path $resultRoot $sessionName
@@ -80,12 +87,54 @@ function Read-Telemetry {
 }
 
 function Get-GameProcess {
-    foreach ($process in @(Get-Process -Name helldivers2 -ErrorAction SilentlyContinue |
-        Sort-Object StartTime -Descending)) {
-        $process.Refresh()
-        if (!$process.HasExited) { return $process }
+    $live = @()
+    foreach ($process in @(Get-Process -Name helldivers2 -ErrorAction SilentlyContinue)) {
+        try {
+            $process.Refresh()
+            if (!$process.HasExited) { $live += $process }
+        }
+        catch {}
     }
-    return $null
+    return $live | Sort-Object StartTime -Descending | Select-Object -First 1
+}
+
+function Get-ZombieGameProcesses {
+    $zombies = @()
+    foreach ($process in @(Get-Process -Name helldivers2 -ErrorAction SilentlyContinue)) {
+        try {
+            $process.Refresh()
+            if ($process.HasExited) { $zombies += $process }
+        }
+        catch {}
+    }
+    return $zombies
+}
+
+function Test-AddonUnlocked {
+    if (!(Test-Path -LiteralPath $installedAddon)) { return $true }
+    try {
+        $stream = [System.IO.File]::Open($installedAddon, 'Open', 'ReadWrite', 'None')
+        $stream.Dispose()
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Recover-ZombieGameProcesses {
+    $zombies = @(Get-ZombieGameProcesses)
+    foreach ($zombie in $zombies) {
+        Write-Host "Recovering half-terminated helldivers2.exe PID $($zombie.Id)..."
+        Stop-Process -Id $zombie.Id -Force -ErrorAction SilentlyContinue
+    }
+    if ($zombies.Count) { Start-Sleep -Seconds 2 }
+
+    $remaining = @(Get-ZombieGameProcesses)
+    if ($remaining.Count) {
+        $ids = ($remaining.Id -join ', ')
+        throw "Half-terminated helldivers2.exe PID(s) $ids remain after exact-PID cleanup. Windows still owns the process state; restart Windows before another deploy or launch."
+    }
 }
 
 function Confirm-GameProcess($Expected, [string]$Stage) {
@@ -99,6 +148,14 @@ function Confirm-GameProcess($Expected, [string]$Stage) {
 
 if (!(Test-Path -LiteralPath $gameExe)) { throw "Game executable not found: $gameExe" }
 if (!(Test-Path -LiteralPath $reshadeDll)) { throw "ReShade dxgi.dll not found: $reshadeDll" }
+Recover-ZombieGameProcesses
+if ($RecoverOnly) {
+    $live = Get-GameProcess
+    if ($live) { throw "helldivers2.exe PID $($live.Id) is still running; recovery-only mode will not terminate a live game." }
+    if (!(Test-AddonUnlocked)) { throw "No live game remains, but $installedAddon is still locked. Restart Windows to release it." }
+    Write-Host 'Recovery passed: no live or half-terminated game process remains, and the add-on DLL is unlocked.'
+    exit 0
+}
 if (!$AddonPath) { $AddonPath = Find-AddonBuild }
 $AddonPath = (Resolve-Path -LiteralPath $AddonPath).Path
 
@@ -109,6 +166,9 @@ if ($AutomateInput -and $ObserveSeconds -lt $InputDelaySeconds + 8) {
 }
 $addonHash = (Get-FileHash -LiteralPath $AddonPath -Algorithm SHA256).Hash
 $running = Get-GameProcess
+if (!$running -and !(Test-AddonUnlocked)) {
+    throw "No live helldivers2.exe process was found, but the installed add-on is still locked: $installedAddon"
+}
 
 if (!$NoDeploy) {
     $installedHash = if (Test-Path -LiteralPath $installedAddon) {
@@ -116,6 +176,7 @@ if (!$NoDeploy) {
     }
     if ($installedHash -ne $addonHash) {
         if ($running) { throw 'The game is running and the installed add-on differs. Close the game and rerun.' }
+        if (!(Test-AddonUnlocked)) { throw "The installed add-on is still locked: $installedAddon" }
         Copy-Item -LiteralPath $AddonPath -Destination $installedAddon -Force
     }
 }
@@ -277,8 +338,15 @@ if ($ShutdownAfterTest) {
         }
         $remaining = Get-Process -Id $running.Id -ErrorAction SilentlyContinue
         if ($remaining) { $remaining.Refresh() }
-        $shutdownSucceeded = $null -eq $remaining -or $remaining.HasExited
-        if (!$shutdownSucceeded) { $shutdownError = 'The tested process did not exit within ten seconds.' }
+        $shutdownSucceeded = $null -eq $remaining
+        if (!$shutdownSucceeded) {
+            $shutdownError = if ($remaining.HasExited) {
+                'The tested process is half-terminated and still present after shutdown.'
+            }
+            else {
+                'The tested process did not exit within ten seconds.'
+            }
+        }
     }
     catch {
         $shutdownError = $_.Exception.Message

@@ -57,7 +57,9 @@ powershell -ExecutionPolicy Bypass -File tools/run_live_test.ps1 `
 
 The runner validates and deploys the DLL, launches the game through Steam if necessary, reads only the latest 600 ReShade log lines, watches telemetry, and saves a compact report under `test-results/<timestamp>/summary.json`. With `-AutomateInput`, the loaded add-on focuses ReShade's exact game window, lets startup settle for 25 seconds, and makes one short `W` intro attempt. Movement begins only after the configured delay and normal indexed scene rendering are both visible, so startup loading cannot consume the walking test. It then walks forward for three seconds, adds right movement for two seconds, and taps `B` for the stretch animation. Held keys are released if the exact game window loses foreground focus.
 
-The add-on also captures `capture-start.bmp`, `capture-walk.bmp`, and `capture-stretch.bmp` directly from ReShade's back buffer. They are downscaled to 480 pixels wide and copied next to the JSON report. `-ShutdownAfterTest` terminates only the exact tested process after evidence collection; omit it to leave the game open.
+The add-on captures `capture-load.bmp`, `capture-start.bmp`, `capture-ready.bmp`, `capture-walk.bmp`, and `capture-stretch.bmp` directly from ReShade's back buffer. Casual state captures are downscaled to 480 pixels wide and copied next to the JSON report; high-resolution capture is intentionally left off until a test needs visual detail. `-ShutdownAfterTest` terminates only the exact tested process after evidence collection; omit it to leave the game open.
+
+Run `tools/run_live_test.ps1 -RecoverOnly` after a crash. It checks live and half-terminated `helldivers2.exe` entries, attempts ordinary exact-PID cleanup, and verifies that the installed add-on is unlocked. If Windows retains an already-exited process after cleanup, the procedure refuses deployment and asks for a Windows restart instead of using unsafe thread termination.
 
 Synthetic input may be ignored by the game or its anti-cheat. The runner waits for normal scene rendering and reports `failed-input` instead of claiming a walking pass when the opening movie remains active.
 
