@@ -79,6 +79,7 @@ uint64_t g_frame = 0;
 uint64_t g_scanned_bytes = 0;
 bool g_paused = false;
 HANDLE g_console = INVALID_HANDLE_VALUE;
+HWND g_game_window = nullptr;
 std::chrono::steady_clock::time_point g_last_display;
 std::chrono::steady_clock::time_point g_last_telemetry;
 std::atomic<uint32_t> g_draws { 0 };
@@ -91,14 +92,13 @@ uint64_t g_session_id = 0;
 uint32_t g_automation_stage = 0;
 uint32_t g_automation_delay_ms = 20000;
 uint32_t g_capture_count = 0;
+uint32_t g_intro_attempts = 0;
 uint32_t g_automation_error = 0;
 bool g_skip_intro = false;
 bool g_automation_input_started = false;
 bool g_automation_completed = false;
-bool g_escape_held = false;
 bool g_w_held = false;
 bool g_d_held = false;
-std::chrono::steady_clock::time_point g_automation_start;
 std::chrono::steady_clock::time_point g_automation_deadline;
 
 bool heap_is_cpu_visible(memory_heap heap)
@@ -140,17 +140,15 @@ uint64_t unix_time_ms()
 
 bool game_has_focus()
 {
-	DWORD process_id = 0;
-	GetWindowThreadProcessId(GetForegroundWindow(), &process_id);
-	return process_id == GetCurrentProcessId();
+	return g_game_window != nullptr && GetForegroundWindow() == g_game_window;
 }
 
 bool focus_runtime_window(effect_runtime *runtime)
 {
+	g_game_window = static_cast<HWND>(runtime->get_hwnd());
 	if (game_has_focus())
 		return true;
-	HWND window = static_cast<HWND>(runtime->get_hwnd());
-	return window != nullptr && SetForegroundWindow(window) && game_has_focus();
+	return g_game_window != nullptr && SetForegroundWindow(g_game_window) && game_has_focus();
 }
 
 bool send_key(WORD virtual_key, bool down)
@@ -164,13 +162,10 @@ bool send_key(WORD virtual_key, bool down)
 
 void release_automation_keys()
 {
-	if (g_escape_held)
-		send_key(VK_ESCAPE, false);
 	if (g_w_held)
 		send_key('W', false);
 	if (g_d_held)
 		send_key('D', false);
-	g_escape_held = false;
 	g_w_held = false;
 	g_d_held = false;
 }
@@ -266,6 +261,15 @@ void fail_automation(uint32_t error)
 	g_automation_stage = 9;
 }
 
+void begin_scene_delay(effect_runtime *runtime, std::chrono::steady_clock::time_point now)
+{
+	release_automation_keys();
+	if (!capture_frame(runtime, L"capture-start.bmp"))
+		g_automation_error = 3;
+	g_automation_deadline = now + std::chrono::milliseconds(g_automation_delay_ms);
+	g_automation_stage = 3;
+}
+
 void on_reshade_present(effect_runtime *runtime)
 {
 	if (runtime->get_device() != g_device)
@@ -274,7 +278,7 @@ void on_reshade_present(effect_runtime *runtime)
 	if (g_automation_stage == 0 && read_automation_request())
 		g_automation_stage = 1;
 
-	if ((g_escape_held || g_w_held || g_d_held) && !game_has_focus())
+	if ((g_w_held || g_d_held) && !game_has_focus())
 	{
 		fail_automation(2);
 		return;
@@ -286,39 +290,30 @@ void on_reshade_present(effect_runtime *runtime)
 			return;
 		if (g_skip_intro)
 		{
-			g_automation_deadline = now + std::chrono::seconds(10);
+			g_automation_deadline = now + std::chrono::seconds(25);
 			g_automation_stage = 2;
 		}
 		else
-		{
-			if (!capture_frame(runtime, L"capture-start.bmp"))
-				g_automation_error = 3;
-			g_automation_start = now;
-			g_automation_deadline = now + std::chrono::milliseconds(g_automation_delay_ms);
-			g_automation_stage = 3;
-		}
+			begin_scene_delay(runtime, now);
 	}
 	else if (g_automation_stage == 2 && now >= g_automation_deadline)
 	{
-		if (!g_escape_held)
+		if (!g_w_held)
 		{
-			if (!game_has_focus() || !send_key(VK_ESCAPE, true))
+			if (!focus_runtime_window(runtime) || !send_key('W', true))
 			{
 				fail_automation(1);
 				return;
 			}
-			g_escape_held = true;
-			g_automation_deadline = now + std::chrono::seconds(4);
+			g_w_held = true;
+			g_automation_deadline = now + std::chrono::milliseconds(150);
 		}
 		else
 		{
-			send_key(VK_ESCAPE, false);
-			g_escape_held = false;
-			if (!capture_frame(runtime, L"capture-start.bmp"))
-				g_automation_error = 3;
-			g_automation_start = now;
-			g_automation_deadline = now + std::chrono::milliseconds(g_automation_delay_ms);
-			g_automation_stage = 3;
+			send_key('W', false);
+			g_w_held = false;
+			++g_intro_attempts;
+			begin_scene_delay(runtime, now);
 		}
 	}
 	else if (g_automation_stage == 3 && now >= g_automation_deadline &&
@@ -444,6 +439,7 @@ void write_telemetry(uint32_t draws)
 		<< "  \"selected_changed_slots\": " << selected_changed << ",\n"
 		<< "  \"paused\": " << (paused ? "true" : "false") << ",\n"
 		<< "  \"automation_stage\": " << g_automation_stage << ",\n"
+		<< "  \"automation_intro_attempts\": " << g_intro_attempts << ",\n"
 		<< "  \"automation_input_started\": " << (g_automation_input_started ? "true" : "false") << ",\n"
 		<< "  \"automation_completed\": " << (g_automation_completed ? "true" : "false") << ",\n"
 		<< "  \"automation_error\": " << g_automation_error << ",\n"

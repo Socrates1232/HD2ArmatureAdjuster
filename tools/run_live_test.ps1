@@ -88,6 +88,15 @@ function Get-GameProcess {
     return $null
 }
 
+function Confirm-GameProcess($Expected, [string]$Stage) {
+    $current = Get-GameProcess
+    if (!$current) { throw "helldivers2.exe stopped before $Stage." }
+    if ($current.Id -ne $Expected.Id -or $current.StartTime -ne $Expected.StartTime) {
+        throw "helldivers2.exe changed before $Stage; refusing to use stale process state."
+    }
+    return $current
+}
+
 if (!(Test-Path -LiteralPath $gameExe)) { throw "Game executable not found: $gameExe" }
 if (!(Test-Path -LiteralPath $reshadeDll)) { throw "ReShade dxgi.dll not found: $reshadeDll" }
 if (!$AddonPath) { $AddonPath = Find-AddonBuild }
@@ -122,6 +131,10 @@ $launchedByRunner = $false
 
 if (!$running) {
     if ($NoLaunch) { throw 'Helldivers 2 is not running and -NoLaunch was specified.' }
+    $running = Get-GameProcess
+}
+
+if (!$running) {
     $steam = Find-Steam
     Write-Host "Launching Helldivers 2 through Steam..."
     Start-Process -FilePath $steam -ArgumentList '-applaunch', '553850'
@@ -138,6 +151,7 @@ else {
 }
 
 if ($AutomateInput) {
+    $running = Confirm-GameProcess $running 'the input request'
     New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
     Remove-Item -LiteralPath $automationPath -Force -ErrorAction SilentlyContinue
     foreach ($name in $captureNames) {
@@ -161,6 +175,7 @@ $inputStarted = $false
 $inputCompleted = $false
 $inputError = $null
 $automationStage = 0
+$introAttempts = 0
 $deadline = [DateTime]::UtcNow.AddSeconds($ObserveSeconds)
 while ([DateTime]::UtcNow -lt $deadline) {
     $currentProcess = Get-Process -Id $running.Id -ErrorAction SilentlyContinue
@@ -174,6 +189,7 @@ while ([DateTime]::UtcNow -lt $deadline) {
         $maxCandidates = [Math]::Max($maxCandidates, [int]$sample.candidates)
         $maxMovingCandidates = [Math]::Max($maxMovingCandidates, [int]$sample.moving_candidates)
         $automationStage = [Math]::Max($automationStage, [int]$sample.automation_stage)
+        $introAttempts = [Math]::Max($introAttempts, [int]$sample.automation_intro_attempts)
         $inputStarted = $inputStarted -or [bool]$sample.automation_input_started
         $inputCompleted = $inputCompleted -or [bool]$sample.automation_completed
         if ([int]$sample.automation_error -ne 0) {
@@ -296,6 +312,7 @@ $summary = [ordered]@{
     input_completed = $inputCompleted
     input_error = $inputError
     automation_stage = $automationStage
+    intro_attempts = $introAttempts
     capture_files = $captureFiles
     shutdown_requested = [bool]$ShutdownAfterTest
     shutdown_succeeded = $shutdownSucceeded
