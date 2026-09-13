@@ -41,6 +41,28 @@ Keys are read while the game is running:
 
 The scanner reads at most one 64 KiB discovery window per presented frame, plus small snapshots of the selected and one rotating candidate. It never maps or writes GPU-only resources and never writes into a game buffer.
 
+## Automated live test
+
+The add-on writes a one-second heartbeat to `%LOCALAPPDATA%\HD2ArmatureAdjuster\telemetry.json`. It contains counters and anonymous candidate statistics only.
+
+After building, close the game and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/run_live_test.ps1 `
+  -GameRoot "F:\Steam\steamapps\common\Helldivers 2" `
+  -ObserveSeconds 90
+```
+
+The runner validates and deploys the DLL, launches the game through Steam if necessary, reads only the latest 600 ReShade log lines, watches telemetry, and saves a compact report under `test-results/<timestamp>/summary.json`. It never closes the game or sends gameplay input. During the observation window, enter a scene and move or turn the character.
+
+Use `-PreflightOnly` to validate the paths, ReShade installation, DLL architecture, hash, and deployment without launching the game.
+
+Possible report states:
+
+- `passed-with-motion`: loading, callbacks, scanning, and moving candidates were observed.
+- `passed-no-motion-yet`: the runtime works, but the observation window did not catch candidate motion.
+- `failed-load`, `failed-runtime`, or `inconclusive-load`: inspect the adjacent `reshade-tail.log`.
+
 ## What a useful result looks like
 
 Prefer candidates with a high score, repeated `motion frames`, and multiple slots changing coherently when the character animates. Static transforms and unrelated transform arrays can also match, so this console is evidence for locating palettes, not final identification.

@@ -79,12 +79,106 @@ uint64_t g_scanned_bytes = 0;
 bool g_paused = false;
 HANDLE g_console = INVALID_HANDLE_VALUE;
 std::chrono::steady_clock::time_point g_last_display;
+std::chrono::steady_clock::time_point g_last_telemetry;
 std::atomic<uint32_t> g_draws { 0 };
 thread_local bool g_self_map = false;
+std::wstring g_telemetry_path;
+uint64_t g_session_id = 0;
 
 bool heap_is_cpu_visible(memory_heap heap)
 {
 	return heap == memory_heap::cpu_to_gpu || heap == memory_heap::cpu_only;
+}
+
+void initialize_telemetry()
+{
+	wchar_t base[32768] = {};
+	constexpr DWORD capacity = static_cast<DWORD>(sizeof(base) / sizeof(base[0]));
+	DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", base, capacity);
+	if (length == 0 || length >= capacity)
+		length = GetTempPathW(capacity, base);
+	if (length == 0 || length >= capacity)
+		return;
+	std::wstring directory(base, length);
+	if (!directory.empty() && directory.back() != L'\\')
+		directory.push_back(L'\\');
+	directory += L"HD2ArmatureAdjuster";
+	CreateDirectoryW(directory.c_str(), nullptr);
+	g_telemetry_path = directory + L"\\telemetry.json";
+	g_session_id = (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^ GetTickCount64();
+}
+
+uint64_t unix_time_ms()
+{
+	FILETIME file_time = {};
+	GetSystemTimeAsFileTime(&file_time);
+	ULARGE_INTEGER ticks = {};
+	ticks.LowPart = file_time.dwLowDateTime;
+	ticks.HighPart = file_time.dwHighDateTime;
+	return (ticks.QuadPart - 116444736000000000ull) / 10000ull;
+}
+
+void write_telemetry(uint32_t draws)
+{
+	const auto now = std::chrono::steady_clock::now();
+	if (g_telemetry_path.empty() || now - g_last_telemetry < std::chrono::seconds(1))
+		return;
+	g_last_telemetry = now;
+
+	size_t buffer_count = 0, mapped_count = 0, candidate_count = 0, moving_count = 0;
+	uint32_t selected_id = 0, selected_slots = 0, selected_changed = 0;
+	bool paused = false;
+	{
+		std::lock_guard lock(g_mutex);
+		buffer_count = g_buffers.size();
+		candidate_count = g_candidates.size();
+		paused = g_paused;
+		for (const auto &[unused, info] : g_buffers)
+			mapped_count += info.map_ptr != nullptr;
+		for (const candidate &c : g_candidates)
+			moving_count += c.last_change_frame != 0 && g_frame - c.last_change_frame <= 120;
+		if (!g_candidates.empty())
+		{
+			const candidate &selected = g_candidates[std::min(g_selected, g_candidates.size() - 1)];
+			selected_id = selected.id;
+			selected_slots = selected.detected_slots;
+			selected_changed = selected.changed_slots;
+		}
+	}
+
+	std::ostringstream json;
+	json << "{\n"
+		<< "  \"schema\": 1,\n"
+		<< "  \"addon\": \"HD2 Palette Probe\",\n"
+		<< "  \"api_version\": " << RESHADE_API_VERSION << ",\n"
+		<< "  \"process_id\": " << GetCurrentProcessId() << ",\n"
+		<< "  \"session_id\": " << g_session_id << ",\n"
+		<< "  \"updated_unix_ms\": " << unix_time_ms() << ",\n"
+		<< "  \"frame\": " << g_frame << ",\n"
+		<< "  \"draws_last_frame\": " << draws << ",\n"
+		<< "  \"tracked_buffers\": " << buffer_count << ",\n"
+		<< "  \"mapped_buffers\": " << mapped_count << ",\n"
+		<< "  \"scanned_bytes\": " << g_scanned_bytes << ",\n"
+		<< "  \"candidates\": " << candidate_count << ",\n"
+		<< "  \"moving_candidates\": " << moving_count << ",\n"
+		<< "  \"selected_candidate\": " << selected_id << ",\n"
+		<< "  \"selected_slots\": " << selected_slots << ",\n"
+		<< "  \"selected_changed_slots\": " << selected_changed << ",\n"
+		<< "  \"paused\": " << (paused ? "true" : "false") << "\n"
+		<< "}\n";
+	const std::string bytes = json.str();
+	const std::wstring temporary = g_telemetry_path + L".tmp";
+	HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+		CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE)
+		return;
+	DWORD written = 0;
+	const bool complete = WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
+		written == static_cast<DWORD>(bytes.size());
+	CloseHandle(file);
+	if (complete)
+		MoveFileExW(temporary.c_str(), g_telemetry_path.c_str(),
+			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 }
 
 void open_console()
@@ -464,6 +558,7 @@ void on_init_device(device *device)
 	if (g_device == nullptr)
 	{
 		g_device = device;
+		initialize_telemetry();
 		open_console();
 	}
 }
@@ -578,6 +673,7 @@ void on_present(command_queue *queue, swapchain *, const rect *, const rect *, u
 	if (!g_paused)
 		scan_one_window();
 	draw_console(draws);
+	write_telemetry(draws);
 }
 }
 
