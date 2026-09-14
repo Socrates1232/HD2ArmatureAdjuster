@@ -95,3 +95,18 @@ Install the generated patch through the normal mod workflow. Install its
 `.hd2profile` under `bin\HD2ArmatureProfiles` and list it in
 `active_profiles.txt`. Multiple active packages are unioned by the add-on at
 load time.
+
+### Batch a modular patch tree
+
+```powershell
+python tools\patch_profile_tool.py profile-tree `
+  --root "C:\path\to\duplicated-mod" `
+  --out-dir "C:\path\to\duplicated-mod\HD2ArmatureProfiles"
+```
+
+This recursively profiles every patch main without changing any patch bytes.
+It writes all extractable profiles for audit, plus `active_profiles.txt` with
+only the profiles that contribute at least one new exact runtime table. The
+add-on then unions those active profiles. Two patches need only one active
+fingerprint when their unit ID, table size, and inverse-bind bytes are all
+identical; variants with different table bytes must both remain active.

@@ -182,7 +182,57 @@ def main() -> int:
         if not report["changes_only_target_translation_rows"]:
             raise AssertionError("editor report did not record the edit invariant")
 
-    print("profile extraction, patch inspection, verified translation, and regeneration passed")
+        tree = root / "tree"
+        for relative in ("option_a/0123456789abcdef.patch_3",
+                         "option_b/0123456789abcdef.patch_3"):
+            tree_patch = tree / relative
+            tree_patch.parent.mkdir(parents=True, exist_ok=True)
+            tree_patch.write_bytes(synthetic_bundle())
+        distinct_patch = tree / "option_c/fedcba9876543210.patch_4"
+        distinct_patch.parent.mkdir(parents=True)
+        distinct_data = bytearray(synthetic_bundle())
+        distinct_data[-64:] = matrix(0.75)
+        distinct_patch.write_bytes(distinct_data)
+        original_hashes = {
+            path.relative_to(tree).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in tree.rglob("*.patch_*")
+            if path.name.count(".") == 1
+        }
+        tree_output = tree / "HD2ArmatureProfiles"
+        profiled_tree = subprocess.run(
+            [
+                sys.executable,
+                str(editor),
+                "profile-tree",
+                "--root", str(tree),
+                "--out-dir", str(tree_output),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        if profiled_tree.returncode:
+            raise AssertionError(profiled_tree.stdout)
+        tree_manifest = json.loads((tree_output / "profile_tree_manifest.json").read_text(
+            encoding="utf-8"))
+        active = (tree_output / "active_profiles.txt").read_text(encoding="utf-8").splitlines()
+        if (tree_manifest["patches_discovered"] != 3 or
+                tree_manifest["profiles_generated"] != 3 or
+                tree_manifest["profiles_active"] != 2 or
+                tree_manifest["unique_runtime_tables"] != 2 or
+                tree_manifest["duplicate_source_records"] != 2 or
+                len(active) != 2):
+            raise AssertionError("tree profiler did not build the expected table union")
+        final_hashes = {
+            path.relative_to(tree).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in tree.rglob("*.patch_*")
+            if path.name.count(".") == 1
+        }
+        if original_hashes != final_hashes:
+            raise AssertionError("tree profiler modified a source patch")
+
+    print("profile extraction, patch inspection, verified translation, and tree union passed")
     return 0
 
 

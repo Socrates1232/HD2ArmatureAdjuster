@@ -14,7 +14,8 @@ import tempfile
 
 from build_ib_profile import (inverse_bind_tables, read_file, sha256,
                               translate_world_file64)
-from extract_runtime_profile import (UNIT_TYPE, bundle_entries, generate_profile,
+from extract_runtime_profile import (HEADER_SIZE, MAGIC, RECORD_HEADER_SIZE,
+                                     UNIT_TYPE, bundle_entries, generate_profile,
                                      write_atomic)
 
 
@@ -62,6 +63,119 @@ def inspect_patch(path: str) -> dict:
         "units": units,
         "skipped_units": skipped,
     }
+
+
+def profile_runtime_keys(path: str) -> list[tuple[int, int, bytes]]:
+    data = read_file(path)
+    if len(data) < HEADER_SIZE or data[:len(MAGIC)] != MAGIC:
+        raise ValueError("generated profile header is invalid")
+    record_count = struct.unpack_from("<I", data, 12)[0]
+    name_size = struct.unpack_from("<I", data, 16)[0]
+    cursor = HEADER_SIZE + name_size
+    keys = []
+    for _ in range(record_count):
+        if cursor + RECORD_HEADER_SIZE > len(data):
+            raise ValueError("generated profile record is truncated")
+        unit_id = struct.unpack_from("<Q", data, cursor)[0]
+        entries = struct.unpack_from("<I", data, cursor + 12)[0]
+        table_size = struct.unpack_from("<I", data, cursor + 20)[0]
+        cursor += RECORD_HEADER_SIZE
+        if cursor + table_size > len(data):
+            raise ValueError("generated profile table is truncated")
+        keys.append((unit_id, entries, data[cursor:cursor + table_size]))
+        cursor += table_size
+    if cursor != len(data):
+        raise ValueError("generated profile has trailing data")
+    return keys
+
+
+def profile_tree(root: str, output_directory: str, force: bool) -> dict:
+    root = os.path.abspath(root)
+    output_directory = os.path.abspath(output_directory)
+    if not os.path.isdir(root):
+        raise ValueError("--root is not a directory")
+
+    patches = []
+    for directory, child_directories, files in os.walk(root):
+        child_directories.sort(key=str.casefold)
+        files.sort(key=str.casefold)
+        if os.path.normcase(os.path.abspath(directory)) == os.path.normcase(output_directory):
+            child_directories[:] = []
+            continue
+        for name in files:
+            if PATCH_NAME.fullmatch(name):
+                patches.append(os.path.join(directory, name))
+    patches.sort(key=lambda path: os.path.relpath(path, root).replace("\\", "/").casefold())
+    if not patches:
+        raise ValueError("no patch main files were found under --root")
+
+    outputs = []
+    for patch in patches:
+        relative = os.path.relpath(patch, root).replace("\\", "/")
+        prefix = sha256(relative.casefold().encode("utf-8"))[:16]
+        profile_name = prefix + "__" + os.path.basename(patch) + ".hd2profile"
+        outputs.extend((os.path.join(output_directory, profile_name),
+                        os.path.join(output_directory, profile_name + ".json")))
+    active_path = os.path.join(output_directory, "active_profiles.txt")
+    manifest_path = os.path.join(output_directory, "profile_tree_manifest.json")
+    require_new_outputs(outputs + [active_path, manifest_path], force)
+    os.makedirs(output_directory, exist_ok=True)
+
+    covered = set()
+    active_profiles = []
+    generated = []
+    skipped = []
+    source_records = 0
+    for index, patch in enumerate(patches):
+        relative = os.path.relpath(patch, root).replace("\\", "/")
+        profile_path = outputs[index * 2]
+        try:
+            profile = generate_profile(patch, profile_path)
+        except (ValueError, struct.error) as error:
+            skipped.append({"patch": relative, "reason": str(error)})
+            continue
+        keys = profile_runtime_keys(profile_path)
+        new_keys = [key for key in keys if key not in covered]
+        active = bool(new_keys)
+        if active:
+            active_profiles.append(os.path.basename(profile_path))
+            covered.update(new_keys)
+        source_records += len(keys)
+        generated.append({
+            "patch": relative,
+            "patch_sha256": profile["triplet"]["main"]["sha256"],
+            "profile": os.path.basename(profile_path),
+            "records": len(keys),
+            "new_runtime_tables": len(new_keys),
+            "active": active,
+        })
+
+    unit_variants = {}
+    for unit_id, entries, table in covered:
+        unit_variants.setdefault(f"{unit_id:016x}", []).append({
+            "entries": entries,
+            "t48_sha256": sha256(table),
+        })
+    for variants in unit_variants.values():
+        variants.sort(key=lambda item: (item["entries"], item["t48_sha256"]))
+
+    result = {
+        "schema": 1,
+        "root": root,
+        "patches_discovered": len(patches),
+        "profiles_generated": len(generated),
+        "profiles_active": len(active_profiles),
+        "source_records": source_records,
+        "unique_runtime_tables": len(covered),
+        "duplicate_source_records": source_records - len(covered),
+        "distinct_units": len(unit_variants),
+        "unit_variants": unit_variants,
+        "profiles": generated,
+        "skipped_patches": skipped,
+    }
+    write_atomic(active_path, ("\n".join(active_profiles) + "\n").encode("utf-8"))
+    write_atomic(manifest_path, (json.dumps(result, indent=2) + "\n").encode("utf-8"))
+    return result
 
 
 def refuse_game_output(path: str) -> None:
@@ -239,6 +353,12 @@ def build_parser() -> argparse.ArgumentParser:
     profile_command.add_argument("--manifest")
     profile_command.add_argument("--unit", action="append", default=[], type=parse_unit_id)
 
+    tree_command = commands.add_parser(
+        "profile-tree", help="profile every patch under a directory and build an active union")
+    tree_command.add_argument("--root", required=True)
+    tree_command.add_argument("--out-dir", required=True)
+    tree_command.add_argument("--force", action="store_true")
+
     edit_command = commands.add_parser("translate", help="copy a patch, translate one IB slot, and profile it")
     edit_command.add_argument("--patch", required=True, help="source main patch")
     edit_command.add_argument("--out-patch", required=True,
@@ -269,6 +389,17 @@ def main() -> int:
             units = set(args.unit) if args.unit else None
             result = generate_profile(args.patch, args.out, units, args.manifest)
             print(json.dumps(result["profile"], indent=2))
+        elif args.command == "profile-tree":
+            result = profile_tree(args.root, args.out_dir, args.force)
+            print(json.dumps({
+                "output_directory": os.path.abspath(args.out_dir),
+                "patches_discovered": result["patches_discovered"],
+                "profiles_generated": result["profiles_generated"],
+                "profiles_active": result["profiles_active"],
+                "unique_runtime_tables": result["unique_runtime_tables"],
+                "distinct_units": result["distinct_units"],
+                "skipped_patches": len(result["skipped_patches"]),
+            }, indent=2))
         else:
             profile_path = args.profile_out or args.out_patch + ".hd2profile"
             report_path = args.report or args.out_patch + ".edit.json"
