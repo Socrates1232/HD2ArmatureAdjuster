@@ -87,6 +87,20 @@ def file64_to_t48(table: bytes) -> bytes:
     return bytes(output)
 
 
+def translate_world_file64(
+        matrix: bytes,
+        translation: tuple[float, float, float],
+) -> tuple[bytes, tuple[float, float, float]]:
+    if len(matrix) != 64:
+        raise ValueError("an inverse-bind matrix must be 64 bytes")
+    values = list(struct.unpack("<16f", matrix))
+    delta = tuple(sum(translation[row] * values[row * 4 + column]
+                      for row in range(3)) for column in range(3))
+    for column in range(3):
+        values[12 + column] += delta[column]
+    return struct.pack("<16f", *values), delta
+
+
 def triplet_hashes(main_path: str) -> dict:
     result = {}
     for name, path in (("main", main_path),

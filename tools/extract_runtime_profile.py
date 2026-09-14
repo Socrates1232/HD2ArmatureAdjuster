@@ -165,26 +165,18 @@ def write_atomic(path: str, data: bytes) -> None:
         raise
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--patch", required=True, help="finished .patch_N main file")
-    parser.add_argument("--unit", action="append", default=[], help="optional 16-digit unit ID; repeatable")
-    parser.add_argument("--out", required=True, help="output .hd2profile file")
-    parser.add_argument("--manifest", help="reviewable JSON output; default is <out>.json")
-    args = parser.parse_args()
-
-    requested = {int(value, 16) for value in args.unit} if args.unit else None
-    records, skipped = extract(args.patch, requested)
-    encoded = encode(args.patch, records)
-    write_atomic(args.out, encoded)
-
+def generate_profile(patch_path: str, output_path: str,
+                     requested_units: set[int] | None = None,
+                     manifest_path: str | None = None) -> dict:
+    records, skipped = extract(patch_path, requested_units)
+    encoded = encode(patch_path, records)
     manifest = {
         "schema": 1,
         "format": "HD2IBP1",
-        "patch": os.path.basename(args.patch),
-        "triplet": triplet_metadata(args.patch),
+        "patch": os.path.basename(patch_path),
+        "triplet": triplet_metadata(patch_path),
         "profile": {
-            "file": os.path.basename(args.out),
+            "file": os.path.basename(output_path),
             "bytes": len(encoded),
             "sha256": sha256(encoded),
             "records": len(records),
@@ -201,14 +193,29 @@ def main() -> int:
         } for record in records],
         "skipped_units": skipped,
     }
+    write_atomic(output_path, encoded)
+    write_atomic(manifest_path or output_path + ".json",
+                 (json.dumps(manifest, indent=2) + "\n").encode("utf-8"))
+    return manifest
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--patch", required=True, help="finished .patch_N main file")
+    parser.add_argument("--unit", action="append", default=[], help="optional 16-digit unit ID; repeatable")
+    parser.add_argument("--out", required=True, help="output .hd2profile file")
+    parser.add_argument("--manifest", help="reviewable JSON output; default is <out>.json")
+    args = parser.parse_args()
+
+    requested = {int(value, 16) for value in args.unit} if args.unit else None
     manifest_path = args.manifest or args.out + ".json"
-    write_atomic(manifest_path, (json.dumps(manifest, indent=2) + "\n").encode("utf-8"))
+    manifest = generate_profile(args.patch, args.out, requested, manifest_path)
     print(json.dumps({
         "profile": os.path.abspath(args.out),
         "manifest": os.path.abspath(manifest_path),
         "patch": manifest["patch"],
-        "records": len(records),
-        "units": len({record["unit_id"] for record in records}),
+        "records": manifest["profile"]["records"],
+        "units": len({record["unit_id"] for record in manifest["tables"]}),
     }, indent=2))
     return 0
 

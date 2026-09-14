@@ -6,6 +6,10 @@ The runtime add-on must not know a mod's patch bytes at compile time. The extrac
 
 This is deliberately a post-build hook: first finish the patch, then extract its profile. If the main patch changes afterward, regenerate the profile.
 
+`tools/patch_profile_tool.py profile` exposes the same generation function for
+new patching pipelines. Its `translate` command also provides a complete,
+verified edit-copy-profile operation; see [`PATCH_EDITING_TOOL.md`](PATCH_EDITING_TOOL.md).
+
 ## Pipeline contract
 
 For each main patch produced by the patching pipeline, invoke:

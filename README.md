@@ -4,6 +4,10 @@ This prototype locates and edits Helldivers 2 loader-converted inverse-bind tabl
 
 The validated mechanism is documented in [`CURRENT_STAGE_LOG_2026-09-14.md`](CURRENT_STAGE_LOG_2026-09-14.md). The external profile workflow and format are documented in [`PROFILE_PIPELINE.md`](PROFILE_PIPELINE.md), with live refactor evidence in [`DYNAMIC_PROFILE_VALIDATION_2026-09-14.md`](DYNAMIC_PROFILE_VALIDATION_2026-09-14.md).
 
+The offline [`patch_profile_tool.py`](tools/patch_profile_tool.py) can inspect a
+finished patch, create a verified translated copy, and generate its matching
+runtime profile in one command. See [`PATCH_EDITING_TOOL.md`](PATCH_EDITING_TOOL.md).
+
 ## Current architecture
 
 ```text
@@ -46,6 +50,18 @@ python tools/extract_runtime_profile.py `
 ```
 
 The command also writes `<output>.json`. Treat a nonzero exit as a patch-pipeline failure. Do not modify the patch after extraction; its SHA-256 is embedded in the profile.
+
+To apply a validated inverse-bind translation and profile the edited copy in one
+step:
+
+```powershell
+python tools/patch_profile_tool.py translate `
+  --patch "path\to\source\0123456789abcdef.patch_0" `
+  --out-patch "build\edited\0123456789abcdef.patch_0" `
+  --unit fa269172bd08695b `
+  --slot 7 `
+  --translate 0.0 0.15 0.0
+```
 
 ## Build
 
