@@ -75,13 +75,17 @@ python tools/patch_profile_tool.py shoulder-targets `
   --profile-dir "build\converted-mod\HD2ArmatureProfiles"
 ```
 
-This walks the unit scene-graph parents, expands `l_shoulder` and `r_shoulder`
-to all descendants, maps those nodes through every LOD's `RealIndices`, and
-qualifies every output slot with the exact table's FNV-1a fingerprint. It rejects
-an exact runtime table if the same slot has conflicting semantics in another LOD
-or replacement variant. The validated normal preset moves the left branch
-`+0.03 m` and the right branch `-0.03 m`, narrowing total shoulder width by
-approximately 6 cm.
+This walks the unit scene-graph parents, maps the `l_shoulder` and `r_shoulder`
+branches through every LOD's `RealIndices`, and qualifies every output slot with
+the exact table's FNV-1a fingerprint. It rejects an exact runtime table if the
+same slot has conflicting semantics in another LOD or replacement variant.
+
+The normal preset is a tapered shape adjustment: shoulder entries receive
+`0.03 m`, depth-one descendants `0.02 m`, depth-two descendants `0.01 m`, and
+depth-three or deeper descendants are left pristine. This reaches zero at the
+hand before the finger chains, avoiding the per-finger rotations observed when
+the old uniform offset was propagated through the whole animated branch. Use
+`--falloff-depth -1` only to reproduce that full-branch diagnostic.
 
 ## Build
 
@@ -181,6 +185,8 @@ sampling thread or change scan/rebind scheduling.
 
 This prototype now provides external-profile discovery, persistent edit intent,
 scene-change instance recovery, reversible writes, and offline hierarchy-aware
-shoulder branch expansion. The configured translation remains a bind/model-space
-pre-offset rather than a pose-aware shoulder-width control. A general naming
-database and interactive editor remain future work.
+shoulder branch expansion with configurable depth falloff. The configured
+translation remains a bind/model-space pre-offset rather than a pose-aware
+shoulder-width control. The tapered preset limits distal animation artifacts; it
+does not replace the future live-pose correction. A general naming database and
+interactive editor remain future work.

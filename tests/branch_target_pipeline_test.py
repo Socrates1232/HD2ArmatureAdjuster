@@ -55,9 +55,9 @@ def bone_block(real: list[int], seed: float) -> bytes:
 
 def synthetic_bundle(ambiguous: bool) -> bytes:
     parents = [(0, 0), (1, 0), (1, 1), (1, 2),
-               (1, 0), (1, 4), (1, 0)]
+               (1, 0), (1, 4), (1, 0), (1, 3)]
     hashes = [0x100, murmur64_high("l_shoulder"), 0x102, 0x103,
-              murmur64_high("r_shoulder"), 0x105, 0x106]
+              murmur64_high("r_shoulder"), 0x105, 0x106, 0x107]
     count = len(parents)
     scene = (struct.pack("<4I", count, 0, 0, 0) +
              b"".join(matrix(0) for _ in range(count)) +
@@ -65,8 +65,8 @@ def synthetic_bundle(ambiguous: bool) -> bytes:
              b"".join(struct.pack("<HH", *parent) for parent in parents) +
              struct.pack(f"<{count}I", *hashes))
 
-    lod0 = [0, 1, 2, 3, 4, 5, 6]
-    lod1 = [0, 6, 1, 2, 3, 4, 5]
+    lod0 = [0, 1, 2, 3, 7, 4, 5, 6]
+    lod1 = [0, 6, 1, 2, 3, 7, 4, 5]
     first = bone_block(lod0, 1.0)
     second = bone_block(lod1, 1.0 if ambiguous else 10.0)
     bone_info = struct.pack("<3I", 2, 12, 12 + len(first)) + first + second
@@ -122,14 +122,20 @@ def main() -> int:
         if len({row[1] for row in rows}) != 2:
             raise AssertionError("different LOD tables were not kept semantically distinct")
         if {tuple(row[3:]) for row in rows} != {
-                ("+0.03", "+0", "+0"), ("-0.03", "+0", "+0")}:
-            raise AssertionError("left/right translations were not assigned correctly")
+                ("+0.03", "+0", "+0"), ("+0.02", "+0", "+0"),
+                ("+0.01", "+0", "+0"), ("-0.03", "+0", "+0"),
+                ("-0.02", "+0", "+0")}:
+            raise AssertionError("branch falloff translations were not assigned correctly")
+        report = (root / "HD2ArmatureProfiles" / "shoulder_targets.json").read_text(
+            encoding="utf-8")
+        if '"falloff_depth": 3' not in report or report.count('"depth": 3') < 2:
+            raise AssertionError("distal descendant exclusion was not reported")
 
         conflict = pathlib.Path(temporary) / "conflict"
         conflict.mkdir()
         (conflict / "0123456789abcdef.patch_0").write_bytes(synthetic_bundle(True))
         rejected = run_tool(tool, conflict)
-        if rejected.returncode != 2 or "conflicting bone semantics" not in rejected.stdout:
+        if rejected.returncode != 2 or "conflicting branch semantics" not in rejected.stdout:
             raise AssertionError("ambiguous identical runtime tables were not rejected")
 
     print("table-qualified descendant extraction and ambiguity rejection passed")

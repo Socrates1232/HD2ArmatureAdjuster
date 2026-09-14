@@ -99,21 +99,24 @@ def armature_semantics(unit: bytes) -> tuple[list[tuple[int, int]], list[int], l
     return parents, hashes, palettes
 
 
-def branch_side(node: int, parents: list[tuple[int, int]],
-                left_root: int | None, right_root: int | None) -> str:
+def branch_membership(node: int, parents: list[tuple[int, int]],
+                      left_root: int | None,
+                      right_root: int | None) -> tuple[str, int | None]:
     seen = set()
     current = node
+    depth = 0
     while 0 <= current < len(parents) and current not in seen:
         if current == left_root:
-            return "left"
+            return "left", depth
         if current == right_root:
-            return "right"
+            return "right", depth
         seen.add(current)
         has_parent, parent = parents[current]
         if not has_parent or parent == current:
             break
         current = parent
-    return "other"
+        depth += 1
+    return "other", None
 
 
 def active_runtime_tables(profile_directory: str | None) -> set[tuple[int, int, int]] | None:
@@ -139,7 +142,8 @@ def active_runtime_tables(profile_directory: str | None) -> set[tuple[int, int, 
 def generate_branch_targets(root: str, output_path: str, report_path: str,
                             left_translation: tuple[float, float, float],
                             right_translation: tuple[float, float, float],
-                            profile_directory: str | None, force: bool) -> dict:
+                            profile_directory: str | None, falloff_depth: int,
+                            force: bool) -> dict:
     root = os.path.abspath(root)
     output_path = os.path.abspath(output_path)
     report_path = os.path.abspath(report_path)
@@ -204,13 +208,17 @@ def generate_branch_targets(root: str, output_path: str, report_path: str,
                 if len(palette["real"]) != table["bones"]:
                     raise ValueError(f"{relative}: unit {unit_id:016x} LOD {table['lod']} palette mismatch")
                 for slot, node in enumerate(palette["real"]):
-                    side = branch_side(node, parents, left_root, right_root)
+                    side, depth = branch_membership(node, parents, left_root, right_root)
                     key = (unit_id, table_key, slot)
                     item = observations.setdefault(key, {
-                        "sides": set(), "sources": [], "entries": table["bones"]})
+                        "sides": set(), "depths": set(), "sources": [],
+                        "entries": table["bones"]})
                     item["sides"].add(side)
+                    if depth is not None:
+                        item["depths"].add(depth)
                     item["sources"].append({"patch": relative, "lod": table["lod"],
-                                            "node": node, "side": side})
+                                            "node": node, "side": side,
+                                            "depth": depth})
 
     if active is not None:
         missing = active - tables_seen
@@ -219,26 +227,40 @@ def generate_branch_targets(root: str, output_path: str, report_path: str,
     else:
         active_tables_considered = len(tables_seen)
     targets = []
+    excluded = []
     conflicts = []
     for (unit_id, table_key, slot), item in sorted(observations.items()):
         branch = item["sides"] & {"left", "right"}
         if not branch:
             continue
-        if len(item["sides"]) != 1:
+        if len(item["sides"]) != 1 or len(item["depths"]) != 1:
             conflicts.append({
                 "unit_id": f"{unit_id:016x}", "table_key": f"{table_key:016x}",
-                "slot": slot, "sides": sorted(item["sides"]), "sources": item["sources"],
+                "slot": slot, "sides": sorted(item["sides"]),
+                "depths": sorted(item["depths"]), "sources": item["sources"],
             })
             continue
         side = next(iter(branch))
+        depth = next(iter(item["depths"]))
+        if falloff_depth >= 0 and depth >= falloff_depth:
+            excluded.append({
+                "unit_id": f"{unit_id:016x}", "table_key": f"{table_key:016x}",
+                "slot": slot, "side": side, "depth": depth,
+                "reason": "translation reaches zero at the configured falloff depth",
+                "sources": item["sources"],
+            })
+            continue
+        scale = 1.0 if falloff_depth < 0 else (falloff_depth - depth) / falloff_depth
+        base_translation = left_translation if side == "left" else right_translation
+        translation = [value * scale for value in base_translation]
         targets.append({
             "unit_id": f"{unit_id:016x}", "table_key": f"{table_key:016x}",
-            "slot": slot, "side": side,
-            "translation": list(left_translation if side == "left" else right_translation),
+            "slot": slot, "side": side, "depth": depth, "scale": scale,
+            "translation": translation,
             "sources": item["sources"],
         })
     if conflicts:
-        raise ValueError("a runtime table reuses a target slot with conflicting bone semantics; "
+        raise ValueError("a runtime table reuses a target slot with conflicting branch semantics; "
                          "see generated data before changing the profile format")
     if not targets:
         raise ValueError("no shoulder or descendant palette slots were found")
@@ -258,7 +280,9 @@ def generate_branch_targets(root: str, output_path: str, report_path: str,
         "patches_scanned": len(patches),
         "active_tables_considered": active_tables_considered,
         "armature_tables_observed": len(tables_seen),
+        "falloff_depth": falloff_depth,
         "targets": targets,
+        "excluded_targets": excluded,
         "targets_by_side": {
             "left": sum(item["side"] == "left" for item in targets),
             "right": sum(item["side"] == "right" for item in targets),
@@ -609,6 +633,10 @@ def build_parser() -> argparse.ArgumentParser:
                                 default=(0.03, 0.0, 0.0), metavar=("X", "Y", "Z"))
     branch_command.add_argument("--right-translate", type=float, nargs=3,
                                 default=(-0.03, 0.0, 0.0), metavar=("X", "Y", "Z"))
+    branch_command.add_argument(
+        "--falloff-depth", type=int, default=3,
+        help="translation reaches zero at this descendant depth (default: 3); "
+             "use -1 for the old uniform full-branch diagnostic")
     branch_command.add_argument("--force", action="store_true")
 
     edit_command = commands.add_parser("translate", help="copy a patch, translate one IB slot, and profile it")
@@ -660,10 +688,12 @@ def main() -> int:
                     not any(value != 0.0 for value in left) or
                     not any(value != 0.0 for value in right)):
                 raise ValueError("branch translations must be finite, nonzero, and within +/-10 metres")
+            if args.falloff_depth == 0 or args.falloff_depth < -1:
+                raise ValueError("--falloff-depth must be -1 or a positive integer")
             output = args.out or os.path.join(args.profile_dir, "shoulder_targets.txt")
             report = args.report or os.path.join(args.profile_dir, "shoulder_targets.json")
             result = generate_branch_targets(args.root, output, report, left, right,
-                                             args.profile_dir, args.force)
+                                             args.profile_dir, args.falloff_depth, args.force)
             print(json.dumps({
                 "output": os.path.abspath(output),
                 "report": os.path.abspath(report),
