@@ -516,6 +516,7 @@ $status = if ($loadError) { 'failed-load' }
 
 $interestingLog | Set-Content -LiteralPath (Join-Path $resultDir 'reshade-tail.log') -Encoding utf8
 $resourceMonitorArtifact = $null
+$controlEventArtifact = $null
 if ($telemetrySeen) {
     $latestTelemetry | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $resultDir 'telemetry.json') -Encoding utf8
     if ($latestTelemetry.resource_monitor_path -and
@@ -523,6 +524,12 @@ if ($telemetrySeen) {
         $resourceMonitorArtifact = 'resource-monitor.csv'
         Copy-Item -LiteralPath $latestTelemetry.resource_monitor_path `
             -Destination (Join-Path $resultDir $resourceMonitorArtifact)
+    }
+    if ($latestTelemetry.control_event_log_path -and
+        (Test-Path -LiteralPath $latestTelemetry.control_event_log_path)) {
+        $controlEventArtifact = 'control-events.csv'
+        Copy-Item -LiteralPath $latestTelemetry.control_event_log_path `
+            -Destination (Join-Path $resultDir $controlEventArtifact)
     }
 }
 if ($SteamCapture) {
@@ -588,6 +595,7 @@ $summary = [ordered]@{
     process_alive = $processAlive
     runtime_active = $runtimeActive
     resource_monitor_file = $resourceMonitorArtifact
+    control_event_log_file = $controlEventArtifact
     experiment_mode = $experimentMode
     expected_experiment_mode = $expectedMode
     max_converted_ib_hits = $maxHits

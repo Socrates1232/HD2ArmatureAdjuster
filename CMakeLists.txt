@@ -93,6 +93,14 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME instance_lifecycle_registry COMMAND instance_lifecycle_test)
 
+    add_executable(shoulder_controller_test tests/shoulder_controller_test.cpp src/shoulder_controller.hpp)
+    target_include_directories(shoulder_controller_test PRIVATE src)
+    target_compile_features(shoulder_controller_test PRIVATE cxx_std_17)
+    if(MSVC)
+        target_compile_options(shoulder_controller_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME shoulder_controller_scan_ownership COMMAND shoulder_controller_test)
+
     add_test(NAME runtime_profile_pipeline
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/profile_pipeline_test.py")
     add_test(NAME shoulder_branch_pipeline
