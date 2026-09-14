@@ -144,6 +144,13 @@ struct live_plan
 	explicit operator bool() const { return failure == pose_error::none; }
 };
 
+inline bool table_has_affected_slots(const rig_package &rig, const rig_table &table)
+{
+	return std::any_of(table.slots.begin(), table.slots.end(), [&rig](const rig_slot &slot) {
+		return slot.target_bone < rig.bones.size() && rig.bones[slot.target_bone].affected;
+	});
+}
+
 inline live_plan build_live_translation_plan(const rig_package &rig, const rig_table &table,
 	const pose_sample &pose, const std::vector<uint8_t> &pristine)
 {
@@ -153,9 +160,24 @@ inline live_plan build_live_translation_plan(const rig_package &rig, const rig_t
 		result.failure = pose.failure;
 		return result;
 	}
+	std::vector<bool> required(rig.bones.size(), false);
+	for (const rig_slot &slot : table.slots)
+	{
+		if (slot.target_bone >= rig.bones.size() || !rig.bones[slot.target_bone].affected)
+			continue;
+		for (int32_t bone = static_cast<int32_t>(slot.target_bone); bone >= 0;)
+		{
+			if (required[static_cast<size_t>(bone)])
+				break;
+			required[static_cast<size_t>(bone)] = true;
+			bone = rig.bones[static_cast<size_t>(bone)].parent;
+		}
+	}
 	std::vector<vector3> displacement(rig.bones.size());
 	for (size_t index = 0; index < rig.bones.size(); ++index)
 	{
+		if (!required[index])
+			continue;
 		const rig_bone &bone = rig.bones[index];
 		if (bone.parent < 0)
 			continue;

@@ -93,6 +93,8 @@ public:
 		_profiles = std::move(profiles);
 		for (const table_association &item : association.tables)
 		{
+			if (!table_has_affected_slots(_rig, _rig.tables[item.rig_table_index]))
+				continue;
 			binding state;
 			state.rig_table_index = item.rig_table_index;
 			state.profile_index = item.profile_index;

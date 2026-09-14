@@ -116,3 +116,11 @@ custom_worker_wall_us_max    350181
 ```
 
 The capture correction therefore recovered qualifying pose samples without restoring presentation-thread matching, but the run did not reach plan construction or publication. The current live gate is required-pose/plan coverage, not IB-table discovery or subject ambiguity. The final ReShade log tail showed runtime destruction and add-on unregistration without an exception entry; it does not by itself establish why the game process ended.
+
+## Runtime 1.6 correction
+
+The exported rig has three affected structural shoulder variants distributed across 18 of its 27 tables. No single table contains all three variants. Runtime 1.5 nevertheless evaluated every affected bone in the complete rig for every table, so a valid per-table pose was rejected whenever it could not provide the parent of an edited variant absent from that table.
+
+Runtime 1.6 restricts a table's required pose set to the ancestor paths of affected slots actually represented by that table. It also omits the nine table layouts with no affected slots from custom-runtime binding and capture. The discovery matcher, pose ownership checks, matrix conversion, and guarded publisher are unchanged. A regression test now proves that an edited branch absent from a table cannot prevent the represented branch from producing a plan.
+
+The next live gate is therefore specific: a qualifying pose sample must increment `custom_plans_built`, followed by `custom_publications` and `APPLIED`. If it does not, the next diagnostic should expose the exact per-table `pose_error` rather than changing discovery again.

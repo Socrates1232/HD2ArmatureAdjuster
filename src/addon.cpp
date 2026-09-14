@@ -33,7 +33,7 @@ using namespace reshade::api;
 
 namespace
 {
-constexpr char k_runtime_version[] = "1.5";
+constexpr char k_runtime_version[] = "1.6";
 constexpr size_t k_scan_chunk_bytes = 4 * 1024 * 1024;
 constexpr size_t k_custom_capture_bytes = 256 * 1024;
 constexpr size_t k_custom_scan_chunk_bytes = 16 * 1024;

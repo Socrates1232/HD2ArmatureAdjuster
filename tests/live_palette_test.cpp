@@ -185,6 +185,40 @@ int main()
 	check(!broken && broken.failure == pose_error::hierarchy_residual,
 		"a matrix-shaped stranger fails hierarchy ownership validation");
 
+	rig_package split_rig;
+	split_rig.bones.resize(5);
+	const std::array<int32_t, 5> split_parents { -1, 0, 1, 0, 3 };
+	for (size_t index = 0; index < split_rig.bones.size(); ++index)
+	{
+		split_rig.bones[index].parent = split_parents[index];
+		split_rig.bones[index].source_rest_local = identity();
+		split_rig.bones[index].target_rest_local = identity();
+	}
+	split_rig.bones[2].rest_delta = { 0.06, 0.0, 0.0 };
+	split_rig.bones[2].affected = true;
+	split_rig.bones[4].rest_delta = { -0.06, 0.0, 0.0 };
+	split_rig.bones[4].affected = true;
+	rig_table left_table;
+	left_table.entries = 3;
+	left_table.slots = { { 0, 0, 0 }, { 1, 1, 1 }, { 2, 2, 2 } };
+	pose_sample left_pose;
+	left_pose.native_world.assign(split_rig.bones.size(), identity());
+	left_pose.bone_available = { false, true, true, false, false };
+	left_pose.observed_skin_linear.assign(left_table.entries, linear_part(identity()));
+	left_pose.slot_available = { false, true, true };
+	const std::vector<uint8_t> left_pristine = pack(
+		{ identity(), identity(), identity() }, 0);
+	const live_plan left_plan = build_live_translation_plan(
+		split_rig, left_table, left_pose, left_pristine);
+	check(left_plan && left_plan.table.changed_slots == std::vector<size_t> { 2 },
+		"per-table planning ignores edited branches absent from the current table");
+	rig_table unaffected_table;
+	unaffected_table.entries = 2;
+	unaffected_table.slots = { { 0, 0, 0 }, { 1, 1, 1 } };
+	check(table_has_affected_slots(split_rig, left_table) &&
+		!table_has_affected_slots(split_rig, unaffected_table),
+		"runtime bindings retain only table layouts with affected slots");
+
 	rig.bones[1].rest_delta = { 0.01, 0.0, 0.0 };
 	rig.bones[1].affected = true;
 	const live_plan missing_root = build_live_translation_plan(rig, table, pose, pristine);
