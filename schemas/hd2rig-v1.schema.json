@@ -1,0 +1,179 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": "HD2RIG1" },
+    "rig_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "source_reference_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "matrix_convention": { "const": "column_vectors_row_major_storage" },
+    "unit": { "const": "metre" },
+    "retarget_policy": { "const": "copy_effective_local_delta" },
+    "binding_mode": { "enum": ["reshape_existing", "target_bound"] },
+    "requested_capability": {
+      "enum": ["linear_rest_translation", "full_native_pose"]
+    },
+    "root_policy": { "const": "preserve_native" },
+    "bones": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4096,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "stable_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "display_name": { "type": "string", "maxLength": 256 },
+          "parent_id": {
+            "anyOf": [
+              { "type": "string", "minLength": 1, "maxLength": 256 },
+              { "type": "null" }
+            ]
+          },
+          "source_rest_local": {
+            "type": "array", "minItems": 16, "maxItems": 16,
+            "items": { "type": "number" }
+          },
+          "target_rest_local": {
+            "type": "array", "minItems": 16, "maxItems": 16,
+            "items": { "type": "number" }
+          },
+          "delta_basis": {
+            "type": "array", "minItems": 16, "maxItems": 16,
+            "items": { "type": "number" }
+          },
+          "role": { "type": "string", "maxLength": 128 }
+        },
+        "required": [
+          "stable_id", "display_name", "parent_id", "source_rest_local",
+          "target_rest_local", "delta_basis"
+        ]
+      }
+    },
+    "tables": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4096,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "unit_id": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+          "table_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "entries": { "type": "integer", "minimum": 1 },
+          "lod_mask": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+          "profile_dependencies": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "filename": { "type": "string", "pattern": "^[^/\\\\]+\\.hd2profile$" },
+                "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+              },
+              "required": ["filename", "sha256"]
+            }
+          },
+          "pose_space_adapter_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "slots": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "slot": { "type": "integer", "minimum": 0 },
+                "source_bone_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "target_bone_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "desired_bind": {
+                  "type": "array", "minItems": 16, "maxItems": 16,
+                  "items": { "type": "number" }
+                }
+              },
+              "required": ["slot", "source_bone_id", "target_bone_id"]
+            }
+          }
+        },
+        "required": [
+          "unit_id", "table_sha256", "entries", "lod_mask", "profile_dependencies",
+          "pose_space_adapter_id", "slots"
+        ]
+      }
+    },
+    "space_adapters": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "mode": { "enum": ["identity", "calibrated_static", "provider_supplied"] },
+          "matrix": {
+            "type": "array", "minItems": 16, "maxItems": 16,
+            "items": { "type": "number" }
+          },
+          "provider_contract": { "type": "string", "minLength": 1, "maxLength": 256 }
+        },
+        "required": ["id", "mode"],
+        "allOf": [
+          {
+            "if": { "properties": { "mode": { "const": "calibrated_static" } } },
+            "then": { "required": ["matrix"] }
+          },
+          {
+            "if": { "properties": { "mode": { "const": "provider_supplied" } } },
+            "then": { "required": ["provider_contract"] }
+          }
+        ]
+      }
+    },
+    "capability_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "linear_path_eligible": { "type": "boolean" },
+        "reasons": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["linear_path_eligible", "reasons"]
+    },
+    "authoring": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "basis_mode": { "enum": ["preserved", "position_normalized", "exact_full"] },
+        "normalization_confirmed": { "type": "boolean" },
+        "notes": { "type": "string" }
+      },
+      "required": ["basis_mode"]
+    },
+    "fixture_only": { "type": "boolean", "default": false }
+  },
+  "required": [
+    "schema", "rig_id", "source_reference_sha256", "matrix_convention", "unit",
+    "retarget_policy", "binding_mode", "requested_capability", "root_policy",
+    "bones", "tables", "space_adapters", "capability_report"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hd2aa:rig:1",
+  "title": "HD2AA proposed target-rig package, version 1",
+  "description": "Structural validation only. Semantic and live-input checks are required by the design.",
+  "allOf": [
+    {
+      "if": { "properties": { "binding_mode": { "const": "target_bound" } } },
+      "then": {
+        "properties": {
+          "tables": {
+            "items": {
+              "properties": {
+                "slots": {
+                  "items": { "required": ["desired_bind"] }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

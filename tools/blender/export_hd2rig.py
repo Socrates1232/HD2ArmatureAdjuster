@@ -34,7 +34,7 @@ def main() -> int:
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args(arguments)
     target = bpy.data.objects.get(args.target)
-    local, parents = collect_target(target)
+    local, parents = collect_target(target, args.source)
     rig = build_rig(args.source, local, parents, args.basis_mode, args.capability, args.notes)
     digest = write_rig(args.out, rig, args.force)
     print(f"HD2AA exported {len(rig['bones'])} bones, {len(rig['tables'])} tables, sha256={digest}")

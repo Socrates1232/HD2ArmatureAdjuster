@@ -347,6 +347,21 @@ def validate_rig_document(rig: dict, profiles: str, source_path: str | None,
         seen_tables.add(key)
         if key not in registry:
             raise ValueError(f"rig table {unit}/{table_sha} is absent from active profiles")
+        declared_dependencies = table.get("profile_dependencies")
+        if not isinstance(declared_dependencies, list) or not declared_dependencies:
+            raise ValueError("rig table has no profile dependencies")
+        declared_packages = set()
+        for dependency in declared_dependencies:
+            filename = dependency.get("filename")
+            digest = dependency.get("sha256")
+            if not isinstance(filename, str) or os.path.basename(filename) != filename or \
+                    not filename.endswith(".hd2profile") or not isinstance(digest, str) or \
+                    not HEX64.fullmatch(digest):
+                raise ValueError("rig table has an invalid profile dependency")
+            declared_packages.add((filename, digest))
+        active_packages = {(item["filename"], item["sha256"]) for item in registry[key]}
+        if declared_packages != active_packages:
+            raise ValueError(f"rig table {unit}/{table_sha} profile dependencies are stale")
         slots = table["slots"]
         slot_numbers = [slot["slot"] for slot in slots]
         if len(slot_numbers) != len(set(slot_numbers)):
@@ -422,6 +437,56 @@ def replay(rig: dict, capture: dict, profiles: str) -> dict:
     }
 
 
+def package_rig(rig_path: str, source_path: str, profiles: str,
+                output_directory: str, force: bool) -> dict:
+    rig = read_json(rig_path)
+    validation = validate_rig_document(rig, profiles, source_path)
+    output_directory = os.path.abspath(output_directory)
+    refuse_game_output(output_directory)
+    rig_name = os.path.basename(rig_path)
+    source_name = os.path.basename(source_path)
+    if not rig_name.endswith(".hd2rig.json") or not source_name.endswith(".hd2source.json"):
+        raise ValueError("rig/source filenames must end in .hd2rig.json/.hd2source.json")
+    os.makedirs(output_directory, exist_ok=True)
+
+    output_names = [rig_name, source_name, "package_manifest.json", "active_rig.txt"]
+    if not force:
+        for name in output_names:
+            destination = os.path.join(output_directory, name)
+            if os.path.exists(destination):
+                raise ValueError("package output already exists; use --force: " + destination)
+
+    def copy_exact(source: str, name: str) -> str:
+        destination = os.path.join(output_directory, name)
+        data = pathlib.Path(source).read_bytes()
+        temporary = destination + ".tmp"
+        with open(temporary, "wb") as stream:
+            stream.write(data)
+        os.replace(temporary, destination)
+        return sha256(data)
+
+    rig_sha = copy_exact(rig_path, rig_name)
+    source_sha = copy_exact(source_path, source_name)
+    active_profiles = {}
+    for table in rig["tables"]:
+        for dependency in table["profile_dependencies"]:
+            active_profiles[dependency["filename"]] = dependency["sha256"]
+    manifest = {
+        "schema": "HD2AAPACKAGE1",
+        "rig": {"filename": rig_name, "sha256": rig_sha, "rig_id": rig["rig_id"]},
+        "source_reference": {"filename": source_name, "sha256": source_sha},
+        "profiles": [{"filename": name, "sha256": active_profiles[name]}
+                     for name in sorted(active_profiles, key=str.casefold)],
+        "requested_capability": rig["requested_capability"],
+        "validation": validation,
+    }
+    write_json(os.path.join(output_directory, "package_manifest.json"), manifest, force)
+    active_path = os.path.join(output_directory, "active_rig.txt")
+    pathlib.Path(active_path).write_text(rig_name + "\n" + source_name + "\n",
+                                         encoding="utf-8", newline="\n")
+    return manifest
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -443,6 +508,12 @@ def build_parser() -> argparse.ArgumentParser:
     replay_command.add_argument("--profiles", required=True)
     replay_command.add_argument("--out", required=True)
     replay_command.add_argument("--force", action="store_true")
+    package = commands.add_parser("package")
+    package.add_argument("--rig", required=True)
+    package.add_argument("--source", required=True)
+    package.add_argument("--profiles", required=True)
+    package.add_argument("--out-dir", required=True)
+    package.add_argument("--force", action="store_true")
     return parser
 
 
@@ -461,11 +532,17 @@ def main() -> int:
             if args.report:
                 write_json(args.report, value, True)
             print(json.dumps(value, indent=2))
-        else:
+        elif args.command == "replay":
             value = replay(read_json(args.rig), read_json(args.capture), args.profiles)
             digest = write_json(args.out, value, args.force)
             print(json.dumps({"output": os.path.abspath(args.out), "sha256": digest,
                               "encoded_slots": value["encoded_slots"]}, indent=2))
+        else:
+            value = package_rig(args.rig, args.source, args.profiles,
+                                args.out_dir, args.force)
+            print(json.dumps({"output": os.path.abspath(args.out_dir),
+                              "rig_id": value["rig"]["rig_id"],
+                              "profiles": len(value["profiles"])}, indent=2))
         return 0
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
         print("error:", error, file=sys.stderr)

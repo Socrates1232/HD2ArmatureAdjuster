@@ -16,8 +16,8 @@ from rig_sidecar_pipeline_test import semantic_bundle
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from rig_profile_tool import (build_source_reference, canonical_bytes, read_json, replay,
-                              sha256, validate_rig_document)
+from rig_profile_tool import (build_source_reference, canonical_bytes, package_rig, read_json,
+                              replay, sha256, validate_rig_document)
 
 
 spec = importlib.util.spec_from_file_location(
@@ -77,6 +77,15 @@ def main() -> int:
         report = validate_rig_document(identity_rig, str(profiles), str(source_path))
         if report["status"] != "VALID" or report["bones"] != 8 or report["tables"] != 2:
             raise AssertionError("identity package validation returned the wrong coverage")
+        package_directory = pathlib.Path(temporary) / "HD2ArmatureRigs"
+        manifest = package_rig(str(rig_path), str(source_path), str(profiles),
+                               str(package_directory), False)
+        if manifest["schema"] != "HD2AAPACKAGE1" or \
+                (package_directory / "active_rig.txt").read_text(encoding="utf-8") != \
+                "target.hd2rig.json\nsource.hd2source.json\n":
+            raise AssertionError("install package was not assembled correctly")
+        reject(lambda: package_rig(str(rig_path), str(source_path), str(profiles),
+                                   str(package_directory), False), "already exists")
 
         left = next(bone for bone in source["bones"] if "left_shoulder" in bone["roles"])
         target = copy.deepcopy(local)
@@ -102,6 +111,18 @@ def main() -> int:
             if abs(result["bone_displacements"][stable_id][0] - 0.06) > 1e-6:
                 raise AssertionError("descendant displacement did not propagate uniformly")
 
+        scripted_path = pathlib.Path(temporary) / "scripted.hd2rig.json"
+        command = [sys.executable, str(ROOT / "tools" / "translate_rig_roles.py"),
+                   "--source", str(source_path), "--out", str(scripted_path),
+                   "--role", "left_shoulder", "0.06", "0", "0"]
+        completed = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, check=False)
+        if completed.returncode:
+            raise AssertionError(completed.stdout)
+        scripted = read_json(str(scripted_path))
+        if validate_rig_document(scripted, str(profiles), str(source_path))["status"] != "VALID":
+            raise AssertionError("scripted semantic-role porter output is invalid")
+
         broken_parent = dict(parents)
         broken_parent[left["stable_id"]] = None
         reject(lambda: porter.build_rig(str(source_path), local, broken_parent),
@@ -115,6 +136,10 @@ def main() -> int:
         stale["source_reference_sha256"] = "0" * 64
         reject(lambda: validate_rig_document(stale, str(profiles), str(source_path)),
                "source reference hash")
+        stale_profile = copy.deepcopy(identity_rig)
+        stale_profile["tables"][0]["profile_dependencies"][0]["sha256"] = "0" * 64
+        reject(lambda: validate_rig_document(stale_profile, str(profiles), str(source_path)),
+               "profile dependencies are stale")
         fixture = copy.deepcopy(identity_rig)
         fixture["fixture_only"] = True
         reject(lambda: validate_rig_document(fixture, str(profiles), None), "fixture_only")

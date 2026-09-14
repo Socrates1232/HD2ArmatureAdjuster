@@ -4,6 +4,9 @@ This prototype locates and edits Helldivers 2 loader-converted inverse-bind tabl
 
 The validated mechanism is documented in [`CURRENT_STAGE_LOG_2026-09-14.md`](CURRENT_STAGE_LOG_2026-09-14.md). The external profile workflow and format are documented in [`PROFILE_PIPELINE.md`](PROFILE_PIPELINE.md), with live refactor evidence in [`DYNAMIC_PROFILE_VALIDATION_2026-09-14.md`](DYNAMIC_PROFILE_VALIDATION_2026-09-14.md).
 
+The custom-armature porter, `HD2RIG1` workflow, and dynamic Stage-1 runtime are
+documented in [`CUSTOM_ARMATURE_STAGE1.md`](CUSTOM_ARMATURE_STAGE1.md).
+
 The offline [`patch_profile_tool.py`](tools/patch_profile_tool.py) can inspect a
 finished patch, create a verified translated copy, and generate its matching
 runtime profile in one command. See [`PATCH_EDITING_TOOL.md`](PATCH_EDITING_TOOL.md).

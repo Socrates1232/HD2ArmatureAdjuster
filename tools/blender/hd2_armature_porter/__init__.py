@@ -25,6 +25,7 @@ bl_info = {
 
 STABLE_ID = "hd2_stable_id"
 SOURCE_PATH = "hd2_source_reference"
+EXACT_NAME_MAPPING = "hd2_exact_name_mapping"
 
 
 def _matrix(values):
@@ -54,6 +55,7 @@ def create_source_armature(context, source_path):
     bpy.ops.object.mode_set(mode="EDIT")
     names = {}
     edit_by_id = {}
+    name_by_id = {}
     for record in source["bones"]:
         name = _unique_name(names, record.get("display_name") or record["stable_id"])
         names[name] = True
@@ -61,23 +63,48 @@ def create_source_armature(context, source_path):
         bone.matrix = _matrix(record["source_rest_global"])
         bone.length = 0.05
         edit_by_id[record["stable_id"]] = bone
+        name_by_id[record["stable_id"]] = name
     for record in source["bones"]:
         parent_id = record["parent_id"]
         if parent_id is not None:
             edit_by_id[record["stable_id"]].parent = edit_by_id[parent_id]
     bpy.ops.object.mode_set(mode="OBJECT")
-    for stable_id, edit_bone in edit_by_id.items():
-        armature.bones[edit_bone.name][STABLE_ID] = stable_id
+    for stable_id, name in name_by_id.items():
+        armature.bones[name][STABLE_ID] = stable_id
     obj[SOURCE_PATH] = os.path.abspath(source_path)
     obj["hd2_source_definition_id"] = source["source_definition_id"]
     return obj
 
 
-def collect_target(obj):
+def collect_target(obj, source_path=None):
     if obj is None or obj.type != "ARMATURE":
         raise ValueError("select a target armature")
+    if max(abs(float(obj.matrix_world[row][column]) - (1.0 if row == column else 0.0))
+           for row in range(4) for column in range(4)) > 1e-6:
+        raise ValueError("apply the target armature object's transforms before export")
     local = {}
     parents = {}
+    if obj.get(EXACT_NAME_MAPPING):
+        source = read_source(source_path or obj.get(SOURCE_PATH, ""))
+        by_name = {bone.name: bone for bone in obj.data.bones}
+        source_by_id = {bone["stable_id"]: bone for bone in source["bones"]}
+        for record in source["bones"]:
+            name = record.get("display_name") or record["stable_id"]
+            bone = by_name.get(name)
+            if bone is None:
+                raise ValueError("exact-name target is missing bone: " + name)
+            parent_id = record["parent_id"]
+            expected_parent = None if parent_id is None else \
+                source_by_id[parent_id].get("display_name", parent_id)
+            actual_parent = None if bone.parent is None else bone.parent.name
+            if actual_parent != expected_parent:
+                raise ValueError(f"{name}: target parent {actual_parent!r} differs from "
+                                 f"source parent {expected_parent!r}")
+            matrix = bone.matrix_local if bone.parent is None else \
+                bone.parent.matrix_local.inverted() @ bone.matrix_local
+            local[record["stable_id"]] = _flat(matrix)
+            parents[record["stable_id"]] = parent_id
+        return local, parents
     for bone in obj.data.bones:
         stable_id = bone.get(STABLE_ID)
         if not stable_id:
@@ -91,7 +118,8 @@ def collect_target(obj):
 
 
 def package_from_scene(settings):
-    local, parents = collect_target(settings.target_object)
+    local, parents = collect_target(settings.target_object,
+                                    bpy.path.abspath(settings.source_path))
     return build_rig(settings.source_path, local, parents, settings.basis_mode,
                      settings.capability, settings.notes)
 
@@ -161,12 +189,10 @@ class HD2AA_OT_map_exact_names(Operator):
         try:
             source = read_source(bpy.path.abspath(settings.source_path))
             by_name = {bone.name: bone for bone in target.data.bones}
-            mapped = 0
-            for record in source["bones"]:
-                bone = by_name.get(record.get("display_name", record["stable_id"]))
-                if bone is not None:
-                    bone[STABLE_ID] = record["stable_id"]
-                    mapped += 1
+            mapped = sum((record.get("display_name") or record["stable_id"]) in by_name
+                         for record in source["bones"])
+            target[EXACT_NAME_MAPPING] = True
+            target[SOURCE_PATH] = os.path.abspath(bpy.path.abspath(settings.source_path))
             self.report({"INFO"}, f"Mapped {mapped}/{len(source['bones'])} bones")
             return {"FINISHED"}
         except (AttributeError, OSError, ValueError, KeyError) as error:
