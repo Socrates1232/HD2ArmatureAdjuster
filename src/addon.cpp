@@ -33,8 +33,9 @@ using namespace reshade::api;
 
 namespace
 {
-constexpr char k_runtime_version[] = "1.3";
+constexpr char k_runtime_version[] = "1.4";
 constexpr size_t k_scan_chunk_bytes = 4 * 1024 * 1024;
+constexpr size_t k_custom_capture_bytes = 256 * 1024;
 constexpr size_t k_custom_scan_chunk_bytes = 16 * 1024;
 constexpr size_t k_custom_scan_overlap_bytes = 8 * 1024;
 constexpr size_t k_candidate_region_bytes = 64 * 1024;
@@ -61,6 +62,7 @@ struct buffer_info
 	uint64_t map_offset = 0;
 	uint64_t map_size = 0;
 	uint64_t scan_cursor = 0;
+	uint64_t capture_cursor = 0;
 	uint64_t scan_round = 0;
 	uint64_t scan_map_offset = UINT64_MAX;
 	uint64_t scan_map_size = 0;
@@ -158,9 +160,14 @@ custom_runtime_view g_custom_view;
 hd2aa::retarget::custom_intent_mailbox g_custom_intent;
 std::vector<uint8_t> g_custom_scan_buffer;
 std::vector<uint8_t> g_custom_pending_scan_buffer;
+std::vector<uint8_t> g_custom_active_scan_buffer;
 uint64_t g_custom_pending_resource = 0;
 uint64_t g_custom_pending_offset = 0;
 uint64_t g_custom_pending_intent_revision = 0;
+uint64_t g_custom_active_resource = 0;
+uint64_t g_custom_active_offset = 0;
+uint64_t g_custom_active_intent_revision = 0;
+size_t g_custom_active_cursor = 0;
 uint64_t g_custom_scan_resource = 0;
 std::atomic<bool> g_custom_capture_enabled { false };
 std::atomic<bool> g_custom_worker_stop { false };
@@ -1046,24 +1053,47 @@ void scan_custom_pose_input(uint64_t frame)
 {
 	if (!g_custom_runtime.configured() || !g_custom_runtime.desired())
 		return;
+	const uint64_t current_revision = g_custom_intent.load().revision;
+	if (!g_custom_active_scan_buffer.empty() &&
+		g_custom_active_intent_revision != current_revision)
 	{
-		std::vector<uint8_t> pending;
-		uint64_t resource = 0, offset = 0, intent_revision = 0;
+		g_custom_active_scan_buffer.clear();
+		g_custom_active_cursor = 0;
+	}
+	if (g_custom_active_scan_buffer.empty())
+	{
 		{
 			std::lock_guard lock(g_mutex);
-			pending.swap(g_custom_pending_scan_buffer);
-			resource = g_custom_pending_resource;
-			offset = g_custom_pending_offset;
-			intent_revision = g_custom_pending_intent_revision;
+			g_custom_active_scan_buffer.swap(g_custom_pending_scan_buffer);
+			g_custom_active_resource = g_custom_pending_resource;
+			g_custom_active_offset = g_custom_pending_offset;
+			g_custom_active_intent_revision = g_custom_pending_intent_revision;
+			g_custom_active_cursor = 0;
 		}
-		if (!pending.empty() && intent_revision == g_custom_intent.load().revision)
+		if (!g_custom_active_scan_buffer.empty() &&
+			g_custom_active_intent_revision != current_revision)
 		{
-			const auto started = std::chrono::steady_clock::now();
-			g_custom_runtime.observe_window(pending.data(), pending.size(),
-				resource, offset, frame);
-			record_custom_scan_performance(started);
-			return;
+			g_custom_active_scan_buffer.clear();
+			g_custom_active_cursor = 0;
 		}
+	}
+	if (!g_custom_active_scan_buffer.empty())
+	{
+		const size_t start = g_custom_active_cursor;
+		const size_t size = std::min(k_custom_scan_chunk_bytes + k_custom_scan_overlap_bytes,
+			g_custom_active_scan_buffer.size() - start);
+		const auto started = std::chrono::steady_clock::now();
+		g_custom_runtime.observe_window(g_custom_active_scan_buffer.data() + start, size,
+			g_custom_active_resource, g_custom_active_offset + start, frame);
+		g_custom_active_cursor = std::min(start + k_custom_scan_chunk_bytes,
+			g_custom_active_scan_buffer.size());
+		if (g_custom_active_cursor >= g_custom_active_scan_buffer.size())
+		{
+			g_custom_active_scan_buffer.clear();
+			g_custom_active_cursor = 0;
+		}
+		record_custom_scan_performance(started);
+		return;
 	}
 	struct mapped_window
 	{
@@ -1161,21 +1191,18 @@ void queue_custom_pose_input(uint64_t resource)
 			found->second.map_size < 4096)
 			return;
 		buffer_info &buffer = found->second;
-		uint64_t start = buffer.scan_cursor;
+		uint64_t start = buffer.capture_cursor;
 		if (start >= buffer.map_size)
 			start = 0;
 		size = static_cast<size_t>(std::min<uint64_t>(
-			k_custom_scan_chunk_bytes + k_custom_scan_overlap_bytes,
+			k_custom_capture_bytes + k_custom_scan_overlap_bytes,
 			buffer.map_size - start));
 		address = reinterpret_cast<uintptr_t>(buffer.map_ptr) + start;
 		absolute_offset = buffer.map_offset + start;
-		if (start + k_custom_scan_chunk_bytes >= buffer.map_size)
-		{
-			buffer.scan_cursor = 0;
-			++buffer.scan_round;
-		}
+		if (start + k_custom_capture_bytes >= buffer.map_size)
+			buffer.capture_cursor = 0;
 		else
-			buffer.scan_cursor = start + k_custom_scan_chunk_bytes;
+			buffer.capture_cursor = start + k_custom_capture_bytes;
 	}
 	if (size < 48)
 		return;
@@ -2668,7 +2695,10 @@ void on_destroy_device(device *device)
 	g_profiles.clear();
 	g_custom_scan_buffer.clear();
 	g_custom_pending_scan_buffer.clear();
+	g_custom_active_scan_buffer.clear();
 	g_custom_pending_intent_revision = 0;
+	g_custom_active_intent_revision = 0;
+	g_custom_active_cursor = 0;
 	g_custom_capture_enabled.store(false, std::memory_order_release);
 	g_active_targets.clear();
 	g_shoulder_targets.clear();
@@ -2720,6 +2750,7 @@ void on_map_buffer(device *device, resource resource, uint64_t offset, uint64_t 
 		if (found->second.scan_map_offset != offset || found->second.scan_map_size != map_size)
 		{
 			found->second.scan_cursor = 0;
+			found->second.capture_cursor = 0;
 			found->second.scan_map_offset = offset;
 			found->second.scan_map_size = map_size;
 		}

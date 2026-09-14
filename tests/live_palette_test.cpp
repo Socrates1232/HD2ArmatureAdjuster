@@ -140,30 +140,42 @@ int main()
 	check(runtime.toggle(), "F8-equivalent action persists requested ON");
 	runtime.observe_window(window.data(), window.size(), 55, 0, 10);
 	const uintptr_t table_address = 0x10000;
+	const uintptr_t second_table_address = 0x20000;
 	std::vector<uint8_t> memory = pristine;
+	std::vector<uint8_t> second_memory = pristine;
 	auto read = [&](uintptr_t address, void *out, size_t size) {
-		if (address < table_address || address - table_address > memory.size() ||
-			size > memory.size() - (address - table_address)) return false;
-		std::memcpy(out, memory.data() + address - table_address, size);
-		return true;
+		auto copy = [&](uintptr_t base, const std::vector<uint8_t> &source) {
+			if (address < base || address - base > source.size() ||
+				size > source.size() - (address - base)) return false;
+			std::memcpy(out, source.data() + address - base, size);
+			return true;
+		};
+		return copy(table_address, memory) || copy(second_table_address, second_memory);
 	};
 	auto write = [&](uintptr_t address, const void *data, size_t size) {
-		if (address < table_address || address - table_address > memory.size() ||
-			size > memory.size() - (address - table_address)) return false;
-		std::memcpy(memory.data() + address - table_address, data, size);
-		return true;
+		auto copy = [&](uintptr_t base, std::vector<uint8_t> &target) {
+			if (address < base || address - base > target.size() ||
+				size > target.size() - (address - base)) return false;
+			std::memcpy(target.data() + address - base, data, size);
+			return true;
+		};
+		return copy(table_address, memory) || copy(second_table_address, second_memory);
 	};
 	runtime.service({ { table_address, 0, 1 } }, 1, 10, read, write);
 	check(runtime.status() == custom_status::applied && memory == plan.table.bytes,
 		"runtime connects qualified live pose to the guarded IB publisher");
 	memory = pristine;
-	runtime.service({ { table_address, 0, 2 } }, 2, 11, read, write);
-	check(runtime.status() == custom_status::applied && memory == plan.table.bytes,
-		"scene refill at a retained address rebases and reapplies the requested rig");
+	second_memory = pristine;
+	runtime.service({ { table_address, 0, 2 }, { second_table_address, 0, 2 } },
+		2, 11, read, write);
+	check(runtime.status() == custom_status::applied && memory == plan.table.bytes &&
+		second_memory == plan.table.bytes,
+		"all exact instances receive one guarded plan without false subject ambiguity");
 	check(!runtime.toggle(), "second F8-equivalent action persists requested OFF");
 	runtime.service({}, 2, 12, read, write);
-	check(runtime.status() == custom_status::disabled && memory == pristine,
-		"runtime restores pristine bytes when requested OFF");
+	check(runtime.status() == custom_status::disabled && memory == pristine &&
+		second_memory == pristine,
+		"runtime restores every owned exact instance when requested OFF");
 
 	auto broken_skin = skin;
 	broken_skin[3][3] += 1.0;

@@ -200,19 +200,20 @@ public:
 					candidates.push_back(candidate);
 			if (candidates.empty())
 			{
-				const auto owned = std::find_if(_instances.begin(), _instances.end(),
-					[&item](const instance &value) { return value.profile_index == item.profile_index; });
-				if (owned != _instances.end())
-					candidates.push_back({ owned->address, owned->profile_index, discovery_generation });
-			}
-			if (candidates.size() > 1)
-			{
-				_status = custom_status::subject_ambiguous;
-				_metrics.rejected_instances += candidates.size();
-				return;
+				for (const instance &owned : _instances)
+					if (owned.profile_index == item.profile_index)
+						candidates.push_back({ owned.address, owned.profile_index, discovery_generation });
 			}
 			if (candidates.empty())
 				continue;
+			std::sort(candidates.begin(), candidates.end(),
+				[](const discovered_bind_instance &left, const discovered_bind_instance &right) {
+					return left.address < right.address;
+				});
+			candidates.erase(std::unique(candidates.begin(), candidates.end(),
+				[](const discovered_bind_instance &left, const discovered_bind_instance &right) {
+					return left.address == right.address;
+				}), candidates.end());
 			any_instance = true;
 			if (!item.pose || frame > item.pose_frame + 3)
 				continue;
@@ -227,46 +228,52 @@ public:
 				continue;
 			}
 			++_metrics.plans_built;
-			instance *target = find_instance(candidates.front().address, item.profile_index);
-			if (target == nullptr)
+			bool binding_applied = false;
+			for (const discovered_bind_instance &candidate : candidates)
 			{
-				if (!retire_profile_instance(item.profile_index, read, write))
-					return;
-				instance created;
-				created.address = candidates.front().address;
-				created.profile_index = item.profile_index;
-				created.rig_table_index = item.rig_table_index;
-				created.publication_state.expected = _profiles[item.profile_index].pristine;
-				_instances.push_back(std::move(created));
-				target = &_instances.back();
-			}
-			publish_result published = publish_table(target->address,
-				target->publication_state, plan.table.bytes, plan.table.changed_slots,
-				item.source_sample_id, read, write);
-			if (published.status == publish_status::stale_expected)
-			{
-				std::vector<uint8_t> current(_profiles[item.profile_index].pristine.size());
-				if (read(target->address, current.data(), current.size()) &&
-					current == _profiles[item.profile_index].pristine)
+				instance *target = find_instance(candidate.address, item.profile_index);
+				if (target == nullptr)
 				{
-					target->publication_state.expected = current;
-					published = publish_table(target->address, target->publication_state,
-						plan.table.bytes, plan.table.changed_slots,
-						item.source_sample_id, read, write);
+					instance created;
+					created.address = candidate.address;
+					created.profile_index = item.profile_index;
+					created.rig_table_index = item.rig_table_index;
+					created.publication_state.expected = _profiles[item.profile_index].pristine;
+					_instances.push_back(std::move(created));
+					target = &_instances.back();
+				}
+				publish_result published = publish_table(target->address,
+					target->publication_state, plan.table.bytes, plan.table.changed_slots,
+					item.source_sample_id, read, write);
+				if (published.status == publish_status::stale_expected)
+				{
+					std::vector<uint8_t> current(_profiles[item.profile_index].pristine.size());
+					if (read(target->address, current.data(), current.size()) &&
+						current == _profiles[item.profile_index].pristine)
+					{
+						target->publication_state.expected = current;
+						published = publish_table(target->address, target->publication_state,
+							plan.table.bytes, plan.table.changed_slots,
+							item.source_sample_id, read, write);
+					}
+				}
+				if (published.status == publish_status::applied ||
+					published.status == publish_status::no_change)
+				{
+					target->last_frame = frame;
+					binding_applied = true;
+					if (published.status == publish_status::applied) ++_metrics.publications;
+				}
+				else if (published.status == publish_status::dirty_unknown)
+				{
+					_status = custom_status::dirty_unknown;
+					return;
 				}
 			}
-			if (published.status == publish_status::applied ||
-				published.status == publish_status::no_change)
+			if (binding_applied)
 			{
 				item.current_bind = plan.table.bytes;
-				target->last_frame = frame;
 				any_applied = true;
-				if (published.status == publish_status::applied) ++_metrics.publications;
-			}
-			else if (published.status == publish_status::dirty_unknown)
-			{
-				_status = custom_status::dirty_unknown;
-				return;
 			}
 		}
 		_status = any_applied ? custom_status::applied :

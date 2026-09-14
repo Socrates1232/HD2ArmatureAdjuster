@@ -35,6 +35,15 @@ def main() -> int:
 
     hunt_start = function_body(source, "bool ensure_hunt_thread()")
     assert "WaitForSingleObject(g_hunt_thread, 0)" in hunt_start
+
+    queue = function_body(source, "void queue_custom_pose_input(")
+    assert "k_custom_capture_bytes + k_custom_scan_overlap_bytes" in queue
+    assert "observe_window(" not in queue
+
+    scan = function_body(source, "void scan_custom_pose_input(")
+    assert "g_custom_active_scan_buffer" in scan
+    assert "k_custom_scan_chunk_bytes + k_custom_scan_overlap_bytes" in scan
+    assert "g_custom_active_cursor" in scan
     return 0
 
 
