@@ -101,6 +101,11 @@ and validated parents, per-LOD slot mapping, exact table identities, and complet
 shoulder branches without falloff. This command reads patches and writes only
 JSON sidecars. The current runtime does not consume them yet.
 
+The exact table-qualified 2x legacy preset confirmed in game is retained as
+[`profiles/lacrima_static_shoulder_targets_2x.txt`](profiles/lacrima_static_shoulder_targets_2x.txt).
+Its validation record is
+[`DOUBLE_SHOULDER_VALIDATION_2026-09-14.md`](DOUBLE_SHOULDER_VALIDATION_2026-09-14.md).
+
 The normal preset is a tapered shape adjustment: shoulder entries receive
 `0.03 m`, depth-one descendants `0.02 m`, depth-two descendants `0.01 m`, and
 depth-three or deeper descendants are left pristine. This reaches zero at the
