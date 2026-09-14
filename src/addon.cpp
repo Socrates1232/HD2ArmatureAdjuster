@@ -1,6 +1,7 @@
 #include <reshade.hpp>
 
 #include "ib_layout.hpp"
+#include "instance_lifecycle.hpp"
 #include "profile_scan.hpp"
 #include "runtime_profile.hpp"
 
@@ -29,9 +30,22 @@ using namespace reshade::api;
 namespace
 {
 constexpr size_t k_scan_chunk_bytes = 4 * 1024 * 1024;
+constexpr size_t k_candidate_region_bytes = 64 * 1024;
 constexpr size_t k_max_hits = 256;
+constexpr size_t k_max_instances = 1024;
 constexpr uint32_t k_max_profile_tables = 4096;
 constexpr float k_max_edit_translation = 10.0f;
+constexpr uint32_t k_stale_frames_before_retire = 3;
+
+enum class scan_reason : uint32_t
+{
+	initial,
+	manual,
+	enable,
+	priority_refresh,
+	resource_change,
+	stale_instance,
+};
 
 struct buffer_info
 {
@@ -45,6 +59,7 @@ struct loaded_table_profile
 	std::string patch_name;
 	std::string profile_file;
 	uint64_t unit_id = 0;
+	uint64_t table_key = 0;
 	uint32_t lod_mask = 0;
 	uint32_t entries = 0;
 	uint32_t first_lod = 0;
@@ -52,25 +67,19 @@ struct loaded_table_profile
 	std::vector<uint8_t> t48;
 };
 
-struct converted_hit
-{
-	uintptr_t address = 0;
-	size_t profile_index = 0;
-	uintptr_t region_base = 0;
-	size_t region_size = 0;
-	DWORD protection = 0;
-};
-
 struct active_target
 {
 	uintptr_t address = 0;
-	std::array<uint8_t, armature_profile::transform_stride> original {};
-	std::array<uint8_t, armature_profile::transform_stride> injected {};
+	size_t profile_index = 0;
+	std::vector<uint8_t> expected;
+	std::vector<uint32_t> slots;
+	uint32_t stale_frames = 0;
 };
 
 struct edit_request
 {
 	uint64_t unit_id = 0;
+	uint64_t table_key = 0; // zero keeps legacy unit-wide targeting
 	uint32_t slot = UINT32_MAX;
 	std::array<float, 3> world_translation {};
 };
@@ -101,7 +110,7 @@ HMODULE g_addon_module = nullptr;
 std::unordered_map<uint64_t, buffer_info> g_buffers;
 std::vector<loaded_table_profile> g_profiles;
 std::vector<std::string> g_profile_errors;
-std::vector<converted_hit> g_hits;
+std::vector<instance_lifecycle::instance> g_hits;
 std::vector<active_target> g_active_targets;
 std::wstring g_profile_directory;
 uint32_t g_profile_files = 0;
@@ -114,6 +123,14 @@ std::atomic<uint64_t> g_hunt_bytes { 0 };
 std::atomic<uint64_t> g_partial_candidates { 0 };
 std::atomic<uint32_t> g_best_partial_entries { 0 };
 std::atomic<bool> g_hunt_stop { false };
+std::atomic<bool> g_hunt_again { false };
+std::atomic<bool> g_hunt_full_next { true };
+std::atomic<uint32_t> g_hunt_reason_next { static_cast<uint32_t>(scan_reason::initial) };
+std::atomic<uint32_t> g_hunt_reason_current { static_cast<uint32_t>(scan_reason::initial) };
+std::atomic<bool> g_hunt_full_current { true };
+std::atomic<uint64_t> g_discovery_generation { 0 };
+std::atomic<uint32_t> g_last_scan_hits { 0 };
+std::atomic<uint32_t> g_last_scan_new_instances { 0 };
 HANDLE g_hunt_thread = nullptr;
 std::chrono::steady_clock::time_point g_hunt_deadline;
 std::chrono::steady_clock::time_point g_hunt_not_before;
@@ -151,14 +168,22 @@ edit_request g_requested_edit;
 edit_state g_edit;
 std::vector<edit_request> g_shoulder_targets;
 std::string g_shoulder_error;
-std::atomic<bool> g_shoulder_pending { false };
+std::atomic<bool> g_shoulder_desired { false };
 std::atomic<bool> g_shoulder_active { false };
 uint64_t g_shoulder_toggles = 0;
+uint64_t g_shoulder_intent_revision = 0;
+uint64_t g_shoulder_applied_generation = 0;
+uint64_t g_shoulder_instances_added = 0;
+uint64_t g_shoulder_instances_retired = 0;
+std::atomic<uint64_t> g_resource_generation { 0 };
+std::atomic<uint64_t> g_last_resource_tick { 0 };
+uint64_t g_observed_resource_generation = 0;
+std::chrono::steady_clock::time_point g_next_priority_scan;
+std::chrono::steady_clock::time_point g_next_full_scan;
 
 const char *experiment_mode_name()
 {
-	if (g_shoulder_pending.load(std::memory_order_relaxed) ||
-		g_shoulder_active.load(std::memory_order_relaxed))
+	if (g_shoulder_desired.load(std::memory_order_relaxed))
 		return "shoulder_narrow_toggle";
 	return g_edit_requested.load(std::memory_order_relaxed) ?
 		"converted_ib_edit" : "converted_ib_scan";
@@ -349,7 +374,8 @@ void load_profiles()
 				break;
 			}
 			g_profiles.push_back({ package.patch_name, utf8(name.c_str()), table.unit_id,
-				table.lod_mask, table.entries, table.first_lod, 1, std::move(table.t48) });
+				table.table_fnv1a, table.lod_mask, table.entries, table.first_lod, 1,
+				std::move(table.t48) });
 		}
 		++g_profile_files;
 	}
@@ -377,21 +403,44 @@ void load_shoulder_targets()
 		if (const size_t comment = line.find('#'); comment != std::string::npos)
 			line.erase(comment);
 		std::istringstream fields(line);
-		std::string unit_text, extra;
+		std::vector<std::string> tokens;
+		std::string token;
+		while (fields >> token)
+			tokens.push_back(token);
+		std::string unit_text, table_text;
 		edit_request target;
-		if (!(fields >> unit_text))
+		if (tokens.empty())
 			continue;
-		if (!(fields >> target.slot >> target.world_translation[0] >>
-			target.world_translation[1] >> target.world_translation[2]) || fields >> extra ||
-			unit_text.size() != 16)
+		if (tokens.size() != 5 && tokens.size() != 6)
 		{
 			g_shoulder_error = "invalid shoulder target on line " + std::to_string(line_number);
 			g_shoulder_targets.clear();
 			return;
 		}
+		unit_text = tokens[0];
+		const size_t slot_field = tokens.size() == 6 ? 2 : 1;
+		if (tokens.size() == 6)
+			table_text = tokens[1];
 		const auto parsed = std::from_chars(unit_text.data(), unit_text.data() + unit_text.size(),
 			target.unit_id, 16);
-		if (parsed.ec != std::errc() || parsed.ptr != unit_text.data() + unit_text.size() ||
+		const auto table_parsed = table_text.empty() ? std::from_chars_result {} :
+			std::from_chars(table_text.data(), table_text.data() + table_text.size(),
+				target.table_key, 16);
+		const auto slot_parsed = std::from_chars(tokens[slot_field].data(),
+			tokens[slot_field].data() + tokens[slot_field].size(), target.slot, 10);
+		bool numeric_ok = true;
+		for (size_t axis = 0; axis < 3; ++axis)
+		{
+			std::istringstream value(tokens[slot_field + 1 + axis]);
+			if (!(value >> target.world_translation[axis]) || value.peek() != EOF)
+				numeric_ok = false;
+		}
+		if (unit_text.size() != 16 || parsed.ec != std::errc() ||
+			parsed.ptr != unit_text.data() + unit_text.size() ||
+			(!table_text.empty() && (table_text.size() != 16 || table_parsed.ec != std::errc() ||
+				table_parsed.ptr != table_text.data() + table_text.size() || target.table_key == 0)) ||
+			slot_parsed.ec != std::errc() ||
+			slot_parsed.ptr != tokens[slot_field].data() + tokens[slot_field].size() || !numeric_ok ||
 			target.slot == UINT32_MAX ||
 			!std::all_of(target.world_translation.begin(), target.world_translation.end(),
 				[](float value) { return std::isfinite(value) && std::fabs(value) <= k_max_edit_translation; }) ||
@@ -404,11 +453,14 @@ void load_shoulder_targets()
 		}
 		const bool available = std::any_of(g_profiles.begin(), g_profiles.end(),
 			[&target](const loaded_table_profile &profile) {
-				return profile.unit_id == target.unit_id && target.slot < profile.entries;
+				return profile.unit_id == target.unit_id &&
+					(target.table_key == 0 || profile.table_key == target.table_key) &&
+					target.slot < profile.entries;
 			});
 		const bool duplicate = std::any_of(g_shoulder_targets.begin(), g_shoulder_targets.end(),
 			[&target](const edit_request &loaded) {
-				return loaded.unit_id == target.unit_id && loaded.slot == target.slot;
+				return loaded.unit_id == target.unit_id && loaded.table_key == target.table_key &&
+					loaded.slot == target.slot;
 			});
 		if (!available || duplicate)
 		{
@@ -432,75 +484,173 @@ bool writable_private_page(const MEMORY_BASIC_INFORMATION &info)
 	return access == PAGE_READWRITE || access == PAGE_WRITECOPY;
 }
 
+const char *scan_reason_name(scan_reason reason)
+{
+	switch (reason)
+	{
+	case scan_reason::initial: return "initial";
+	case scan_reason::manual: return "manual";
+	case scan_reason::enable: return "enable";
+	case scan_reason::priority_refresh: return "priority_refresh";
+	case scan_reason::resource_change: return "resource_change";
+	case scan_reason::stale_instance: return "stale_instance";
+	default: return "unknown";
+	}
+}
+
+void publish_hunt_results(const std::vector<instance_lifecycle::instance> &found_hits,
+	uint64_t partial, uint32_t best_partial)
+{
+	const uint64_t generation = g_discovery_generation.fetch_add(1,
+		std::memory_order_acq_rel) + 1;
+	size_t added = 0;
+	{
+		std::lock_guard lock(g_mutex);
+		added = instance_lifecycle::merge(g_hits, found_hits, generation, k_max_instances);
+	}
+	g_partial_candidates.store(partial, std::memory_order_relaxed);
+	g_best_partial_entries.store(best_partial, std::memory_order_relaxed);
+	g_hunt_passes.fetch_add(1, std::memory_order_relaxed);
+	g_last_scan_hits.store(static_cast<uint32_t>(found_hits.size()), std::memory_order_release);
+	g_last_scan_new_instances.store(static_cast<uint32_t>(added), std::memory_order_release);
+	if (g_hunt_again.exchange(false, std::memory_order_acq_rel))
+		g_hunt_phase.store(0, std::memory_order_release);
+	else
+		g_hunt_phase.store(found_hits.empty() ? 3u : 2u, std::memory_order_release);
+}
+
 DWORD WINAPI hunt_thread_proc(void *)
 {
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 	std::vector<loaded_table_profile> profiles;
+	std::vector<edit_request> shoulder_targets;
+	std::vector<instance_lifecycle::instance> known_regions;
+	const bool shoulder_only = g_shoulder_desired.load(std::memory_order_acquire);
+	const bool full_scan = g_hunt_full_current.load(std::memory_order_acquire);
 	{
 		std::lock_guard lock(g_mutex);
 		profiles = g_profiles;
+		if (shoulder_only)
+			shoulder_targets = g_shoulder_targets;
+		for (const instance_lifecycle::instance &hit : g_hits)
+		{
+			const bool duplicate = std::any_of(known_regions.begin(), known_regions.end(),
+				[&hit](const instance_lifecycle::instance &known) {
+					return known.region_base == hit.region_base && known.region_size == hit.region_size;
+				});
+			if (!duplicate)
+				known_regions.push_back(hit);
+		}
 	}
-	if (profiles.empty())
+	if (profiles.empty() || (!full_scan && known_regions.empty()))
 	{
-		g_hunt_phase.store(3, std::memory_order_release);
+		publish_hunt_results({}, 0, 0);
 		return 0;
 	}
+
 	std::vector<armature_probe::profile_view> views;
+	std::vector<size_t> profile_indices;
 	size_t largest_table = 0;
-	for (const loaded_table_profile &profile : profiles)
+	for (size_t index = 0; index < profiles.size(); ++index)
 	{
+		const loaded_table_profile &profile = profiles[index];
+		if (shoulder_only && std::none_of(shoulder_targets.begin(), shoulder_targets.end(),
+			[&profile](const edit_request &target) {
+				return target.unit_id == profile.unit_id &&
+					(target.table_key == 0 || target.table_key == profile.table_key) &&
+					target.slot < profile.entries;
+			}))
+			continue;
 		views.push_back({ profile.t48.data(), profile.entries });
+		profile_indices.push_back(index);
 		largest_table = std::max(largest_table, profile.t48.size());
 	}
-	std::vector<uint8_t> scratch(k_scan_chunk_bytes + largest_table);
-	SYSTEM_INFO system = {};
-	GetSystemInfo(&system);
-	const uintptr_t minimum = reinterpret_cast<uintptr_t>(system.lpMinimumApplicationAddress);
-	const uintptr_t maximum = reinterpret_cast<uintptr_t>(system.lpMaximumApplicationAddress);
-
-	for (uint32_t pass = 0; pass < 40 && !g_hunt_stop.load(std::memory_order_acquire) &&
-		std::chrono::steady_clock::now() < g_hunt_deadline; ++pass)
+	if (views.empty())
 	{
-		std::vector<converted_hit> found_hits;
-		std::vector<armature_probe::address_range> excluded;
-		const uintptr_t scratch_begin = reinterpret_cast<uintptr_t>(scratch.data());
-		excluded.push_back({ scratch_begin, scratch_begin + scratch.size() });
-		for (const loaded_table_profile &profile : profiles)
+		publish_hunt_results({}, 0, 0);
+		return 0;
+	}
+
+	std::vector<uint8_t> scratch(k_scan_chunk_bytes + largest_table);
+	std::vector<instance_lifecycle::instance> found_hits;
+	std::vector<armature_probe::address_range> excluded;
+	const uintptr_t scratch_begin = reinterpret_cast<uintptr_t>(scratch.data());
+	excluded.push_back({ scratch_begin, scratch_begin + scratch.size() });
+	for (const loaded_table_profile &profile : profiles)
+	{
+		const uintptr_t begin = reinterpret_cast<uintptr_t>(profile.t48.data());
+		excluded.push_back({ begin, begin + profile.t48.size() });
+	}
+	if (g_addon_module != nullptr)
+	{
+		const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(g_addon_module);
+		if (dos->e_magic == IMAGE_DOS_SIGNATURE)
+		{
+			const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(
+				reinterpret_cast<const uint8_t *>(g_addon_module) + dos->e_lfanew);
+			if (nt->Signature == IMAGE_NT_SIGNATURE)
+			{
+				const uintptr_t image = reinterpret_cast<uintptr_t>(g_addon_module);
+				excluded.push_back({ image, image + nt->OptionalHeader.SizeOfImage });
+			}
+		}
+	}
+	{
+		std::lock_guard lock(g_mutex);
+		for (const loaded_table_profile &profile : g_profiles)
 		{
 			const uintptr_t begin = reinterpret_cast<uintptr_t>(profile.t48.data());
 			excluded.push_back({ begin, begin + profile.t48.size() });
 		}
-		if (g_addon_module != nullptr)
-		{
-			const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(g_addon_module);
-			if (dos->e_magic == IMAGE_DOS_SIGNATURE)
+		for (const auto &[unused, buffer] : g_buffers)
+			if (buffer.map_ptr != nullptr && buffer.map_size != 0)
 			{
-				const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(
-					reinterpret_cast<const uint8_t *>(g_addon_module) + dos->e_lfanew);
-				if (nt->Signature == IMAGE_NT_SIGNATURE)
-				{
-					const uintptr_t image = reinterpret_cast<uintptr_t>(g_addon_module);
-					excluded.push_back({ image, image + nt->OptionalHeader.SizeOfImage });
-				}
+				const uintptr_t begin = reinterpret_cast<uintptr_t>(buffer.map_ptr);
+				excluded.push_back({ begin, begin + static_cast<size_t>(buffer.map_size) });
 			}
-		}
-		{
-			std::lock_guard lock(g_mutex);
-			for (const loaded_table_profile &profile : g_profiles)
-			{
-				const uintptr_t begin = reinterpret_cast<uintptr_t>(profile.t48.data());
-				excluded.push_back({ begin, begin + profile.t48.size() });
-			}
-			for (const auto &[unused, buffer] : g_buffers)
-				if (buffer.map_ptr != nullptr && buffer.map_size != 0)
-				{
-					const uintptr_t begin = reinterpret_cast<uintptr_t>(buffer.map_ptr);
-					excluded.push_back({ begin, begin + static_cast<size_t>(buffer.map_size) });
-				}
-		}
+	}
 
-		uint64_t partial = 0;
-		uint32_t best_partial = 0;
-		uintptr_t cursor = minimum;
+	uint64_t partial = 0;
+	uint32_t best_partial = 0;
+	auto scan_region = [&](uintptr_t base, size_t region_size, DWORD protection) {
+		for (size_t offset = 0; offset < region_size && found_hits.size() < k_max_hits &&
+			!g_hunt_stop.load(std::memory_order_acquire) &&
+			std::chrono::steady_clock::now() < g_hunt_deadline; offset += k_scan_chunk_bytes)
+		{
+			const size_t wanted = std::min(scratch.size(), region_size - offset);
+			SIZE_T got = 0;
+			ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void *>(base + offset),
+				scratch.data(), wanted, &got);
+			g_hunt_bytes.fetch_add(got, std::memory_order_relaxed);
+			if (got < armature_profile::transform_stride)
+				continue;
+			auto scan = armature_probe::find_exact_profiles(scratch.data(), got, base + offset,
+				views, excluded, k_max_hits - found_hits.size());
+			partial += scan.partial_candidates;
+			best_partial = std::max(best_partial, scan.best_partial_entries);
+			const uintptr_t primary_end = base + offset +
+				std::min(k_scan_chunk_bytes, static_cast<size_t>(got));
+			for (const armature_probe::profile_hit &hit : scan.hits)
+			{
+				if (hit.address >= primary_end)
+					continue;
+				const size_t profile_index = profile_indices[hit.profile_index];
+				const bool duplicate = std::any_of(found_hits.begin(), found_hits.end(),
+					[&hit, profile_index](const instance_lifecycle::instance &known) {
+						return known.address == hit.address && known.profile_index == profile_index;
+					});
+				if (!duplicate)
+					found_hits.push_back({ hit.address, profile_index, base, region_size, protection, 0 });
+			}
+		}
+	};
+
+	if (full_scan)
+	{
+		SYSTEM_INFO system = {};
+		GetSystemInfo(&system);
+		const uintptr_t maximum = reinterpret_cast<uintptr_t>(system.lpMaximumApplicationAddress);
+		uintptr_t cursor = reinterpret_cast<uintptr_t>(system.lpMinimumApplicationAddress);
 		while (cursor < maximum && found_hits.size() < k_max_hits &&
 			!g_hunt_stop.load(std::memory_order_acquire) &&
 			std::chrono::steady_clock::now() < g_hunt_deadline)
@@ -510,63 +660,34 @@ DWORD WINAPI hunt_thread_proc(void *)
 				break;
 			const uintptr_t base = reinterpret_cast<uintptr_t>(info.BaseAddress);
 			const size_t region_size = info.RegionSize;
-			if (writable_private_page(info))
-			{
-				for (size_t region_offset = 0; region_offset < region_size &&
-					found_hits.size() < k_max_hits &&
-					std::chrono::steady_clock::now() < g_hunt_deadline;
-					region_offset += k_scan_chunk_bytes)
-				{
-					const size_t wanted = std::min(scratch.size(), region_size - region_offset);
-					SIZE_T got = 0;
-					ReadProcessMemory(GetCurrentProcess(),
-						reinterpret_cast<const void *>(base + region_offset), scratch.data(), wanted, &got);
-					g_hunt_bytes.fetch_add(got, std::memory_order_relaxed);
-					if (got < armature_profile::transform_stride)
-						continue;
-					auto scan = armature_probe::find_exact_profiles(scratch.data(), got,
-						base + region_offset, views, excluded, k_max_hits - found_hits.size());
-					partial += scan.partial_candidates;
-					best_partial = std::max(best_partial, scan.best_partial_entries);
-					const uintptr_t primary_end = base + region_offset +
-						std::min(k_scan_chunk_bytes, static_cast<size_t>(got));
-					for (const armature_probe::profile_hit &hit : scan.hits)
-					{
-						if (hit.address >= primary_end)
-							continue;
-						const bool duplicate = std::any_of(found_hits.begin(), found_hits.end(),
-							[&hit](const converted_hit &known) {
-								return known.address == hit.address && known.profile_index == hit.profile_index;
-							});
-						if (!duplicate)
-							found_hits.push_back({ hit.address, hit.profile_index, base, region_size, info.Protect });
-					}
-				}
-			}
+			if (writable_private_page(info) && region_size == k_candidate_region_bytes)
+				scan_region(base, region_size, info.Protect);
 			if (region_size == 0 || base > maximum - region_size)
 				break;
 			cursor = base + region_size;
 		}
-		g_partial_candidates.store(partial, std::memory_order_relaxed);
-		g_best_partial_entries.store(best_partial, std::memory_order_relaxed);
-		g_hunt_passes.fetch_add(1, std::memory_order_relaxed);
-		if (!found_hits.empty())
-		{
-			std::lock_guard lock(g_mutex);
-			g_hits = std::move(found_hits);
-			g_hunt_phase.store(2, std::memory_order_release);
-			return 0;
-		}
-		Sleep(500);
 	}
-	g_hunt_phase.store(3, std::memory_order_release);
+	else
+	{
+		for (const instance_lifecycle::instance &known : known_regions)
+		{
+			MEMORY_BASIC_INFORMATION info = {};
+			if (VirtualQuery(reinterpret_cast<const void *>(known.region_base), &info, sizeof(info)) == 0 ||
+				reinterpret_cast<uintptr_t>(info.BaseAddress) != known.region_base ||
+				!writable_private_page(info))
+				continue;
+			scan_region(known.region_base,
+				std::min(known.region_size, static_cast<size_t>(info.RegionSize)), info.Protect);
+		}
+	}
+
+	publish_hunt_results(found_hits, partial, best_partial);
 	return 0;
 }
 
 bool ensure_hunt_thread()
 {
-	const uint32_t phase = g_hunt_phase.load(std::memory_order_acquire);
-	if (phase == 1 || phase == 2)
+	if (g_hunt_phase.load(std::memory_order_acquire) == 1)
 		return true;
 	{
 		std::lock_guard lock(g_mutex);
@@ -575,7 +696,6 @@ bool ensure_hunt_thread()
 			g_hunt_phase.store(3, std::memory_order_release);
 			return false;
 		}
-		g_hits.clear();
 	}
 	if (g_hunt_thread != nullptr)
 	{
@@ -589,6 +709,12 @@ bool ensure_hunt_thread()
 	g_best_partial_entries.store(0, std::memory_order_relaxed);
 	g_hunt_stop.store(false, std::memory_order_release);
 	g_hunt_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+	g_hunt_full_current.store(g_hunt_full_next.exchange(false, std::memory_order_acq_rel),
+		std::memory_order_release);
+	if (g_hunt_full_current.load(std::memory_order_acquire))
+		g_observed_resource_generation = g_resource_generation.load(std::memory_order_acquire);
+	g_hunt_reason_current.store(g_hunt_reason_next.load(std::memory_order_acquire),
+		std::memory_order_release);
 	g_hunt_phase.store(1, std::memory_order_release);
 	g_hunt_thread = CreateThread(nullptr, 0, hunt_thread_proc, nullptr, 0, nullptr);
 	if (g_hunt_thread == nullptr)
@@ -599,14 +725,23 @@ bool ensure_hunt_thread()
 	return true;
 }
 
-void request_rescan()
+void request_discovery(bool full_scan, scan_reason reason)
 {
+	if (full_scan)
+		g_hunt_full_next.store(true, std::memory_order_release);
+	g_hunt_reason_next.store(static_cast<uint32_t>(reason), std::memory_order_release);
 	if (g_hunt_phase.load(std::memory_order_acquire) == 1)
+	{
+		g_hunt_again.store(true, std::memory_order_release);
 		return;
-	std::lock_guard lock(g_mutex);
-	g_hits.clear();
+	}
 	g_hunt_phase.store(0, std::memory_order_release);
 	g_hunt_not_before = std::chrono::steady_clock::now();
+}
+
+void request_rescan()
+{
+	request_discovery(true, scan_reason::manual);
 }
 
 bool read_process_bytes(uintptr_t address, void *data, size_t size)
@@ -626,73 +761,129 @@ bool write_process_bytes(uintptr_t address, const void *data, size_t size)
 bool has_requested_target()
 {
 	std::lock_guard lock(g_mutex);
-	return std::any_of(g_hits.begin(), g_hits.end(), [](const converted_hit &hit) {
+	return std::any_of(g_hits.begin(), g_hits.end(), [](const instance_lifecycle::instance &hit) {
 		return hit.profile_index < g_profiles.size() &&
 			g_profiles[hit.profile_index].unit_id == g_requested_edit.unit_id &&
+			(g_requested_edit.table_key == 0 ||
+				g_profiles[hit.profile_index].table_key == g_requested_edit.table_key) &&
 			g_requested_edit.slot < g_profiles[hit.profile_index].entries;
 	});
 }
 
+bool make_expected_table(const loaded_table_profile &profile,
+	const std::vector<edit_request> &requests, std::vector<uint8_t> &expected,
+	std::vector<uint32_t> &slots)
+{
+	expected = profile.t48;
+	slots.clear();
+	for (const edit_request &request : requests)
+	{
+		if (request.unit_id != profile.unit_id ||
+			(request.table_key != 0 && request.table_key != profile.table_key) ||
+			request.slot >= profile.entries)
+			continue;
+		const size_t offset = static_cast<size_t>(request.slot) *
+			armature_profile::transform_stride;
+		armature_probe::translate_world_t48(profile.t48.data() + offset,
+			request.world_translation[0], request.world_translation[1],
+			request.world_translation[2], expected.data() + offset);
+		if (std::memcmp(profile.t48.data() + offset, expected.data() + offset,
+			armature_profile::transform_stride) != 0)
+			slots.push_back(request.slot);
+	}
+	std::sort(slots.begin(), slots.end());
+	slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+	return !slots.empty();
+}
+
+bool write_table_slots(const loaded_table_profile &profile, active_target &target,
+	const std::vector<uint8_t> &source, const std::vector<uint8_t> &destination,
+	bool rollback_on_failure = true)
+{
+	for (uint32_t slot : target.slots)
+	{
+		const size_t offset = static_cast<size_t>(slot) * armature_profile::transform_stride;
+		++g_edit.write_attempts;
+		if (!write_process_bytes(target.address + offset, destination.data() + offset,
+			armature_profile::transform_stride))
+			return false;
+		++g_edit.write_successes;
+	}
+	std::vector<uint8_t> current(profile.t48.size());
+	if (read_process_bytes(target.address, current.data(), current.size()) && current == destination)
+	{
+		g_edit.immediate_readbacks += target.slots.size();
+		return true;
+	}
+	if (rollback_on_failure)
+		for (uint32_t slot : target.slots)
+		{
+			const size_t offset = static_cast<size_t>(slot) * armature_profile::transform_stride;
+			write_process_bytes(target.address + offset, source.data() + offset,
+				armature_profile::transform_stride);
+		}
+	return false;
+}
+
+size_t active_target_count()
+{
+	std::lock_guard lock(g_mutex);
+	return g_active_targets.size();
+}
+
+size_t append_discovered_edits_locked(const std::vector<edit_request> &requests)
+{
+	size_t instances_added = 0;
+	for (const instance_lifecycle::instance &hit : g_hits)
+	{
+		if (hit.profile_index >= g_profiles.size())
+			continue;
+		const bool already_owned = std::any_of(g_active_targets.begin(), g_active_targets.end(),
+			[&hit](const active_target &target) {
+				return target.address == hit.address && target.profile_index == hit.profile_index;
+			});
+		if (already_owned)
+			continue;
+		const loaded_table_profile &profile = g_profiles[hit.profile_index];
+		active_target target;
+		target.address = hit.address;
+		target.profile_index = hit.profile_index;
+		if (!make_expected_table(profile, requests, target.expected, target.slots))
+			continue;
+		g_edit.targets_selected += static_cast<uint32_t>(target.slots.size());
+		std::vector<uint8_t> current(profile.t48.size());
+		if (!read_process_bytes(target.address, current.data(), current.size()))
+		{
+			g_edit.stale_skips += target.slots.size();
+			continue;
+		}
+		const instance_lifecycle::table_state state = instance_lifecycle::classify(
+			current.data(), profile.t48.data(), target.expected.data(), current.size());
+		if (state == instance_lifecycle::table_state::unknown)
+		{
+			g_edit.stale_skips += target.slots.size();
+			continue;
+		}
+		if (state == instance_lifecycle::table_state::pristine &&
+			!write_table_slots(profile, target, profile.t48, target.expected))
+			continue;
+		g_edit.targets_written += static_cast<uint32_t>(target.slots.size());
+		g_active_targets.push_back(std::move(target));
+		++instances_added;
+	}
+	return instances_added;
+}
+
 bool begin_edits(const std::vector<edit_request> &requests)
 {
-	if (g_hunt_phase.load(std::memory_order_acquire) != 2 || requests.empty())
-		return false;
-	if (g_edit_active.load(std::memory_order_acquire))
+	if (requests.empty() || g_edit_active.load(std::memory_order_acquire))
 		return false;
 	std::lock_guard lock(g_mutex);
 	g_active_targets.clear();
 	g_edit = {};
 	g_edit.requested = true;
 	g_edit.slot = requests.size() == 1 ? requests.front().slot : UINT32_MAX;
-	std::vector<uintptr_t> considered;
-
-	for (const edit_request &request : requests)
-	{
-		const size_t slot_offset = static_cast<size_t>(request.slot) *
-			armature_profile::transform_stride;
-		for (const converted_hit &hit : g_hits)
-		{
-			if (hit.profile_index >= g_profiles.size())
-				continue;
-			const loaded_table_profile &profile = g_profiles[hit.profile_index];
-			if (profile.unit_id != request.unit_id || request.slot >= profile.entries)
-				continue;
-			const uintptr_t address = hit.address + slot_offset;
-			if (std::find(considered.begin(), considered.end(), address) != considered.end())
-				continue;
-			considered.push_back(address);
-			++g_edit.targets_selected;
-			active_target target;
-			target.address = address;
-			std::memcpy(target.original.data(), profile.t48.data() + slot_offset,
-				target.original.size());
-			armature_probe::translate_world_t48(target.original.data(),
-				request.world_translation[0], request.world_translation[1],
-				request.world_translation[2], target.injected.data());
-			if (target.original == target.injected)
-			{
-				++g_edit.stale_skips;
-				continue;
-			}
-			std::array<uint8_t, armature_profile::transform_stride> current {};
-			if (!read_process_bytes(address, current.data(), current.size()) || current != target.original)
-			{
-				++g_edit.stale_skips;
-				continue;
-			}
-			++g_edit.write_attempts;
-			if (!write_process_bytes(address, target.injected.data(), target.injected.size()) ||
-				!read_process_bytes(address, current.data(), current.size()) || current != target.injected)
-			{
-				write_process_bytes(address, target.original.data(), target.original.size());
-				continue;
-			}
-			++g_edit.write_successes;
-			++g_edit.immediate_readbacks;
-			++g_edit.targets_written;
-			g_active_targets.push_back(target);
-		}
-	}
+	append_discovered_edits_locked(requests);
 
 	g_edit.active = !g_active_targets.empty();
 	if (!g_edit.active)
@@ -704,6 +895,16 @@ bool begin_edits(const std::vector<edit_request> &requests)
 	return true;
 }
 
+size_t extend_edits(const std::vector<edit_request> &requests)
+{
+	if (!g_edit_active.load(std::memory_order_acquire))
+		return 0;
+	std::lock_guard lock(g_mutex);
+	const size_t added = append_discovered_edits_locked(requests);
+	g_edit.active = !g_active_targets.empty();
+	return added;
+}
+
 bool begin_edit(std::chrono::steady_clock::time_point now)
 {
 	if (!begin_edits({ g_requested_edit }))
@@ -713,40 +914,64 @@ bool begin_edit(std::chrono::steady_clock::time_point now)
 	return true;
 }
 
-void maintain_edit()
+size_t maintain_edit()
 {
 	if (!g_edit_active.load(std::memory_order_acquire))
-		return;
+		return 0;
 	std::unique_lock lock(g_mutex, std::try_to_lock);
 	if (!lock.owns_lock() || !g_edit.active)
-		return;
-	for (active_target &target : g_active_targets)
+		return 0;
+	size_t retired = 0;
+	for (auto item = g_active_targets.begin(); item != g_active_targets.end();)
 	{
-		std::array<uint8_t, armature_profile::transform_stride> current {};
+		active_target &target = *item;
+		if (target.profile_index >= g_profiles.size())
+		{
+			item = g_active_targets.erase(item);
+			++retired;
+			continue;
+		}
+		const loaded_table_profile &profile = g_profiles[target.profile_index];
+		std::vector<uint8_t> current(profile.t48.size());
 		if (!read_process_bytes(target.address, current.data(), current.size()))
 		{
-			++g_edit.stale_skips;
-			continue;
+			g_edit.stale_skips += target.slots.size();
+			++target.stale_frames;
 		}
-		if (current == target.injected)
+		else
 		{
-			++g_edit.present_readbacks;
-			continue;
+			const instance_lifecycle::table_state state = instance_lifecycle::classify(
+				current.data(), profile.t48.data(), target.expected.data(), current.size());
+			if (state == instance_lifecycle::table_state::our_override)
+			{
+				target.stale_frames = 0;
+				g_edit.present_readbacks += target.slots.size();
+			}
+			else if (state == instance_lifecycle::table_state::pristine)
+			{
+				++g_edit.refills_observed;
+				if (write_table_slots(profile, target, profile.t48, target.expected))
+					target.stale_frames = 0;
+				else
+					++target.stale_frames;
+			}
+			else
+			{
+				g_edit.stale_skips += target.slots.size();
+				++target.stale_frames;
+			}
 		}
-		if (current != target.original)
+		if (target.stale_frames >= k_stale_frames_before_retire)
 		{
-			++g_edit.stale_skips;
-			continue;
+			item = g_active_targets.erase(item);
+			++retired;
 		}
-		++g_edit.refills_observed;
-		++g_edit.write_attempts;
-		if (write_process_bytes(target.address, target.injected.data(), target.injected.size()) &&
-			read_process_bytes(target.address, current.data(), current.size()) && current == target.injected)
-		{
-			++g_edit.write_successes;
-			++g_edit.immediate_readbacks;
-		}
+		else
+			++item;
 	}
+	g_edit.active = !g_active_targets.empty();
+	g_edit_active.store(g_edit.active, std::memory_order_release);
+	return retired;
 }
 
 void end_edit()
@@ -758,26 +983,34 @@ void end_edit()
 	bool restored = true;
 	for (active_target &target : g_active_targets)
 	{
-		std::array<uint8_t, armature_profile::transform_stride> current {};
+		if (target.profile_index >= g_profiles.size())
+		{
+			restored = false;
+			continue;
+		}
+		const loaded_table_profile &profile = g_profiles[target.profile_index];
+		std::vector<uint8_t> current(profile.t48.size());
 		g_edit.restore_attempted = true;
 		if (!read_process_bytes(target.address, current.data(), current.size()))
 		{
 			restored = false;
 			continue;
 		}
-		if (current == target.original)
+		const instance_lifecycle::table_state state = instance_lifecycle::classify(
+			current.data(), profile.t48.data(), target.expected.data(), current.size());
+		if (state == instance_lifecycle::table_state::pristine)
 		{
-			++g_edit.targets_restored;
+			g_edit.targets_restored += static_cast<uint32_t>(target.slots.size());
 			continue;
 		}
-		if (current != target.injected ||
-			!write_process_bytes(target.address, target.original.data(), target.original.size()) ||
-			!read_process_bytes(target.address, current.data(), current.size()) || current != target.original)
+		if (state != instance_lifecycle::table_state::our_override ||
+			!write_table_slots(profile, target, target.expected, profile.t48, false) ||
+			!read_process_bytes(target.address, current.data(), current.size()) || current != profile.t48)
 		{
 			restored = false;
 			continue;
 		}
-		++g_edit.targets_restored;
+		g_edit.targets_restored += static_cast<uint32_t>(target.slots.size());
 	}
 	g_edit.restore_succeeded = restored && g_edit.targets_written != 0 &&
 		g_edit.targets_restored == g_edit.targets_written;
@@ -789,16 +1022,15 @@ void end_edit()
 void toggle_shoulder_edit()
 {
 	++g_shoulder_toggles;
-	if (g_shoulder_pending.exchange(false, std::memory_order_acq_rel))
-	{
-		g_shoulder_error.clear();
-		return;
-	}
-	if (g_shoulder_active.load(std::memory_order_acquire))
+	++g_shoulder_intent_revision;
+	const bool enabled = !g_shoulder_desired.load(std::memory_order_acquire);
+	g_shoulder_desired.store(enabled, std::memory_order_release);
+	if (!enabled)
 	{
 		end_edit();
 		g_shoulder_active.store(false, std::memory_order_release);
 		g_edit.completed = true;
+		g_shoulder_error.clear();
 		return;
 	}
 	if (g_edit_active.load(std::memory_order_acquire))
@@ -807,33 +1039,86 @@ void toggle_shoulder_edit()
 		return;
 	}
 	if (g_shoulder_targets.empty())
+	{
+		g_shoulder_desired.store(false, std::memory_order_release);
 		return;
+	}
 	g_shoulder_error.clear();
-	g_shoulder_pending.store(true, std::memory_order_release);
-	if (g_hunt_phase.load(std::memory_order_acquire) == 3)
-		request_rescan();
+	if (begin_edits(g_shoulder_targets))
+	{
+		g_shoulder_active.store(true, std::memory_order_release);
+		g_shoulder_applied_generation = g_discovery_generation.load(std::memory_order_acquire);
+		g_shoulder_instances_added += active_target_count();
+	}
+	else
+		g_shoulder_applied_generation = g_discovery_generation.load(std::memory_order_acquire);
+	request_discovery(true, scan_reason::enable);
+	g_next_priority_scan = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+	g_next_full_scan = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 }
 
 void service_shoulder_edit()
 {
-	if (!g_shoulder_pending.load(std::memory_order_acquire))
+	if (!g_shoulder_desired.load(std::memory_order_acquire))
 		return;
-	const uint32_t phase = g_hunt_phase.load(std::memory_order_acquire);
-	if (phase == 0)
+	const uint64_t generation = g_discovery_generation.load(std::memory_order_acquire);
+	if (g_edit_active.load(std::memory_order_acquire) &&
+		!g_shoulder_active.load(std::memory_order_acquire))
 	{
-		ensure_hunt_thread();
+		g_shoulder_error = "another edit is already active";
 		return;
 	}
-	if (phase == 1)
-		return;
-	if (phase != 2 || !begin_edits(g_shoulder_targets))
+	if (g_shoulder_active.load(std::memory_order_acquire))
 	{
-		g_shoulder_error = "no mapped shoulder table is currently resident";
-		g_shoulder_pending.store(false, std::memory_order_release);
+		if (generation == g_shoulder_applied_generation)
+			return;
+		const size_t added = extend_edits(g_shoulder_targets);
+		g_shoulder_instances_added += added;
+		g_shoulder_applied_generation = generation;
+		if (added != 0)
+			g_shoulder_error.clear();
 		return;
 	}
-	g_shoulder_active.store(true, std::memory_order_release);
-	g_shoulder_pending.store(false, std::memory_order_release);
+	if (generation == g_shoulder_applied_generation)
+		return;
+	g_shoulder_applied_generation = generation;
+	if (begin_edits(g_shoulder_targets))
+	{
+		g_shoulder_active.store(true, std::memory_order_release);
+		g_shoulder_instances_added += active_target_count();
+		g_shoulder_error.clear();
+		return;
+	}
+	g_shoulder_error = "requested ON; waiting for a valid shoulder instance";
+}
+
+void schedule_shoulder_discovery(std::chrono::steady_clock::time_point now)
+{
+	if (!g_shoulder_desired.load(std::memory_order_acquire) ||
+		g_hunt_phase.load(std::memory_order_acquire) <= 1)
+		return;
+	const uint64_t resource_generation = g_resource_generation.load(std::memory_order_acquire);
+	const uint64_t last_resource_tick = g_last_resource_tick.load(std::memory_order_acquire);
+	if (resource_generation != g_observed_resource_generation &&
+		GetTickCount64() - last_resource_tick >= 1000)
+	{
+		g_observed_resource_generation = resource_generation;
+		g_next_full_scan = now + std::chrono::seconds(30);
+		g_next_priority_scan = now + std::chrono::seconds(2);
+		request_discovery(true, scan_reason::resource_change);
+		return;
+	}
+	if (now >= g_next_priority_scan)
+	{
+		g_next_priority_scan = now + std::chrono::seconds(2);
+		request_discovery(false, scan_reason::priority_refresh);
+		return;
+	}
+	if (now >= g_next_full_scan)
+	{
+		g_next_full_scan = now + std::chrono::seconds(30);
+		request_discovery(true, scan_reason::resource_change);
+	}
 }
 
 void initialize_runtime_files()
@@ -972,7 +1257,7 @@ bool read_automation_request()
 	g_skip_intro = skip_intro != 0;
 	g_steam_capture = steam_capture != 0;
 	g_edit_requested.store(edit_test != 0, std::memory_order_release);
-	g_requested_edit = { static_cast<uint64_t>(unit_id), slot, { x, y, z } };
+	g_requested_edit = { static_cast<uint64_t>(unit_id), 0, slot, { x, y, z } };
 	g_edit.requested = edit_test != 0;
 	return true;
 }
@@ -1076,9 +1361,15 @@ void run_automation(effect_runtime *runtime)
 			g_automation_error = 3;
 		if (g_edit.requested)
 		{
-			if (g_hunt_phase.load(std::memory_order_acquire) == 3)
+			if (has_requested_target())
+			{
+				g_automation_deadline = now;
+				g_automation_stage = 13;
+				return;
+			}
+			if (g_hunt_phase.load(std::memory_order_acquire) != 1)
 				request_rescan();
-			if (!ensure_hunt_thread())
+			if (g_hunt_phase.load(std::memory_order_acquire) != 1 && !ensure_hunt_thread())
 			{
 				fail_automation(4);
 				return;
@@ -1226,23 +1517,29 @@ void draw_console(uint32_t draws)
 	for (const auto &[unused, buffer] : g_buffers)
 		mapped += buffer.map_ptr != nullptr;
 	out << "\x1b[2J\x1b[H"
-		<< "HD2 Armature Profile Runtime 0.8  |  " << experiment_mode_name() << "  |  D3D12\n\n"
+		<< "HD2 Armature Profile Runtime 1.0  |  " << experiment_mode_name() << "  |  D3D12\n\n"
 		<< "frame " << g_frame << "  draws " << draws << "  buffers " << g_buffers.size()
 		<< " (mapped " << mapped << ")\n"
 		<< "profiles " << g_profile_files << " files / " << g_profiles.size()
 		<< " unique tables / " << g_profile_records << " records ("
 		<< g_profile_duplicates << " duplicates)  load errors " << g_profile_errors.size() << '\n'
 		<< "hunt phase " << g_hunt_phase.load(std::memory_order_relaxed)
+		<< "  " << (g_hunt_full_current.load(std::memory_order_relaxed) ? "full" : "priority")
+		<< '/' << scan_reason_name(static_cast<scan_reason>(
+			g_hunt_reason_current.load(std::memory_order_relaxed)))
 		<< "  passes " << g_hunt_passes.load(std::memory_order_relaxed)
-		<< "  hits " << g_hits.size()
+		<< "  registry " << g_hits.size()
+		<< "  last " << g_last_scan_hits.load(std::memory_order_relaxed)
+		<< " (+" << g_last_scan_new_instances.load(std::memory_order_relaxed) << ')'
 		<< "  scanned " << std::fixed << std::setprecision(1)
 		<< static_cast<double>(g_hunt_bytes.load(std::memory_order_relaxed)) / (1024.0 * 1024.0)
 		<< " MiB  partial " << g_partial_candidates.load(std::memory_order_relaxed)
 		<< " (best " << g_best_partial_entries.load(std::memory_order_relaxed) << ")\n"
 		<< "F8 shoulder narrowing "
-		<< (g_shoulder_active.load(std::memory_order_relaxed) ? "ACTIVE" :
-			g_shoulder_pending.load(std::memory_order_relaxed) ? "pending" : "off")
-		<< " (" << g_shoulder_targets.size() << " mapped slots)  |  F9 rescan\n"
+		<< (!g_shoulder_desired.load(std::memory_order_relaxed) ? "OFF" :
+			g_shoulder_active.load(std::memory_order_relaxed) ? "ACTIVE" : "WAITING")
+		<< " (" << g_shoulder_targets.size() << " mapped slots, "
+		<< g_active_targets.size() << " live tables)  |  F9 rescan\n"
 		<< "edit " << (g_edit.active ? "ACTIVE" : g_edit.completed ? "complete" :
 			g_edit.requested ? "armed" : "off") << "  slot ";
 	if (g_edit.slot == UINT32_MAX)
@@ -1256,12 +1553,13 @@ void draw_console(uint32_t draws)
 		<< "  restored " << (g_edit.restore_succeeded ? "yes" : "no") << "\n\n";
 	for (size_t index = 0; index < std::min<size_t>(g_hits.size(), 12); ++index)
 	{
-		const converted_hit &hit = g_hits[index];
+		const instance_lifecycle::instance &hit = g_hits[index];
 		if (hit.profile_index >= g_profiles.size())
 			continue;
 		const loaded_table_profile &profile = g_profiles[hit.profile_index];
 		out << '[' << index << "] 0x" << std::hex << hit.address
 			<< "  unit " << std::setw(16) << std::setfill('0') << profile.unit_id
+			<< "  table " << std::setw(16) << profile.table_key
 			<< "  lod-mask 0x" << std::setw(8) << profile.lod_mask << std::dec
 			<< "  slots " << profile.entries << "  " << profile.patch_name << '\n';
 	}
@@ -1283,22 +1581,24 @@ void write_telemetry(uint32_t draws)
 		std::string patch_name;
 		std::string profile_file;
 		uint64_t unit_id;
+		uint64_t table_key;
 		uint32_t lod_mask;
 		uint32_t entries;
 		uint32_t source_records;
 	};
-	std::vector<converted_hit> hits;
+	std::vector<instance_lifecycle::instance> hits;
 	std::vector<profile_summary> profiles;
 	std::vector<std::string> profile_errors;
 	edit_state edit;
-	size_t buffer_count = 0, mapped_count = 0;
+	size_t buffer_count = 0, mapped_count = 0, active_instances = 0,
+		shoulder_target_count = 0;
 	uint32_t profile_files = 0, profile_records = 0, profile_duplicates = 0;
 	{
 		std::lock_guard lock(g_mutex);
 		hits = g_hits;
 		for (const loaded_table_profile &profile : g_profiles)
 			profiles.push_back({ profile.patch_name, profile.profile_file, profile.unit_id,
-				profile.lod_mask, profile.entries, profile.source_records });
+				profile.table_key, profile.lod_mask, profile.entries, profile.source_records });
 		profile_errors = g_profile_errors;
 		edit = g_edit;
 		buffer_count = g_buffers.size();
@@ -1307,11 +1607,15 @@ void write_telemetry(uint32_t draws)
 		profile_files = g_profile_files;
 		profile_records = g_profile_records;
 		profile_duplicates = g_profile_duplicates;
+		active_instances = g_active_targets.size();
+		shoulder_target_count = g_shoulder_targets.size();
 	}
+	const bool shoulder_desired = g_shoulder_desired.load(std::memory_order_relaxed);
+	const bool shoulder_active = g_shoulder_active.load(std::memory_order_relaxed);
 
 	std::ostringstream json;
 	json << "{\n"
-		<< "  \"schema\": 5,\n"
+		<< "  \"schema\": 6,\n"
 		<< "  \"addon\": \"HD2 Armature Profile Runtime\",\n"
 		<< "  \"experiment_mode\": \"" << experiment_mode_name() << "\",\n"
 		<< "  \"api_version\": " << RESHADE_API_VERSION << ",\n"
@@ -1329,23 +1633,42 @@ void write_telemetry(uint32_t draws)
 		<< "  \"profile_duplicate_records\": " << profile_duplicates << ",\n"
 		<< "  \"profile_tables_loaded\": " << profiles.size() << ",\n"
 		<< "  \"profile_load_errors\": " << profile_errors.size() << ",\n"
-		<< "  \"shoulder_config_targets\": " << g_shoulder_targets.size() << ",\n"
+		<< "  \"shoulder_config_targets\": " << shoulder_target_count << ",\n"
+		<< "  \"shoulder_desired_enabled\": "
+		<< (shoulder_desired ? "true" : "false") << ",\n"
+		<< "  \"shoulder_applied\": " << (shoulder_active ? "true" : "false") << ",\n"
+		<< "  \"shoulder_waiting\": "
+		<< (shoulder_desired && !shoulder_active ? "true" : "false") << ",\n"
 		<< "  \"shoulder_toggle_pending\": "
-		<< (g_shoulder_pending.load(std::memory_order_relaxed) ? "true" : "false") << ",\n"
+		<< (shoulder_desired && !shoulder_active ? "true" : "false") << ",\n"
 		<< "  \"shoulder_narrow_active\": "
-		<< (g_shoulder_active.load(std::memory_order_relaxed) ? "true" : "false") << ",\n"
+		<< (shoulder_active ? "true" : "false") << ",\n"
 		<< "  \"shoulder_toggle_count\": " << g_shoulder_toggles << ",\n"
+		<< "  \"shoulder_intent_revision\": " << g_shoulder_intent_revision << ",\n"
+		<< "  \"shoulder_applied_generation\": " << g_shoulder_applied_generation << ",\n"
+		<< "  \"shoulder_live_instances\": " << active_instances << ",\n"
+		<< "  \"shoulder_instances_added\": " << g_shoulder_instances_added << ",\n"
+		<< "  \"shoulder_instances_retired\": " << g_shoulder_instances_retired << ",\n"
 		<< "  \"shoulder_error\": \"" << json_escape(g_shoulder_error) << "\",\n"
 		<< "  \"ib_hunt_phase\": " << g_hunt_phase.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"ib_hunt_scope\": \""
+		<< (g_hunt_full_current.load(std::memory_order_relaxed) ? "full" : "priority") << "\",\n"
+		<< "  \"ib_hunt_reason\": \"" << scan_reason_name(static_cast<scan_reason>(
+			g_hunt_reason_current.load(std::memory_order_relaxed))) << "\",\n"
 		<< "  \"ib_hunt_passes\": " << g_hunt_passes.load(std::memory_order_relaxed) << ",\n"
 		<< "  \"ib_hunt_bytes\": " << g_hunt_bytes.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"ib_discovery_generation\": "
+		<< g_discovery_generation.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"ib_last_scan_hits\": " << g_last_scan_hits.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"ib_last_scan_new_instances\": "
+		<< g_last_scan_new_instances.load(std::memory_order_relaxed) << ",\n"
 		<< "  \"converted_ib_hits\": " << hits.size() << ",\n"
 		<< "  \"converted_ib_partial_candidates\": " << g_partial_candidates.load(std::memory_order_relaxed) << ",\n"
 		<< "  \"converted_ib_best_partial_entries\": " << g_best_partial_entries.load(std::memory_order_relaxed) << ",\n"
 		<< "  \"converted_ib_tables\": [";
 	for (size_t index = 0; index < hits.size(); ++index)
 	{
-		const converted_hit &hit = hits[index];
+		const instance_lifecycle::instance &hit = hits[index];
 		if (index != 0)
 			json << ',';
 		json << "{\"address\":\"0x" << std::hex << hit.address
@@ -1356,12 +1679,14 @@ void write_telemetry(uint32_t draws)
 			json << ",\"profile_file\":\"" << json_escape(profile.profile_file)
 				<< "\",\"patch\":\"" << json_escape(profile.patch_name)
 				<< "\",\"unit\":\"" << std::hex << std::setw(16) << std::setfill('0')
-				<< profile.unit_id << "\",\"lod_mask\":\"0x" << std::setw(8)
+				<< profile.unit_id << "\",\"table_key\":\"" << std::setw(16)
+				<< profile.table_key << "\",\"lod_mask\":\"0x" << std::setw(8)
 				<< profile.lod_mask << "\",\"entries\":" << std::dec << profile.entries
 				<< ",\"source_records\":" << profile.source_records;
 		}
 		json << ",\"region_base\":\"0x" << std::hex << hit.region_base << "\",\"region_size\":"
-			<< std::dec << hit.region_size << ",\"protection\":" << hit.protection << '}';
+			<< std::dec << hit.region_size << ",\"protection\":" << hit.protection
+			<< ",\"last_seen_generation\":" << hit.last_seen_generation << '}';
 	}
 	json << "],\n"
 		<< "  \"automation_stage\": " << g_automation_stage << ",\n"
@@ -1426,7 +1751,12 @@ void on_init_device(device *device)
 	if (g_device != nullptr)
 		return;
 	g_device = device;
-	g_hunt_not_before = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+	const auto now = std::chrono::steady_clock::now();
+	g_hunt_not_before = now + std::chrono::seconds(25);
+	g_next_priority_scan = now + std::chrono::seconds(2);
+	g_next_full_scan = now + std::chrono::seconds(30);
+	g_hunt_full_next.store(true, std::memory_order_release);
+	g_hunt_reason_next.store(static_cast<uint32_t>(scan_reason::initial), std::memory_order_release);
 	initialize_runtime_files();
 	load_profiles();
 	load_shoulder_targets();
@@ -1445,8 +1775,9 @@ void on_destroy_device(device *device)
 	g_profiles.clear();
 	g_active_targets.clear();
 	g_shoulder_targets.clear();
-	g_shoulder_pending.store(false, std::memory_order_release);
+	g_shoulder_desired.store(false, std::memory_order_release);
 	g_shoulder_active.store(false, std::memory_order_release);
+	g_hunt_again.store(false, std::memory_order_release);
 	g_device = nullptr;
 }
 
@@ -1455,16 +1786,24 @@ void on_init_resource(device *device, const resource_desc &desc, const subresour
 {
 	if (device != g_device || desc.type != resource_type::buffer)
 		return;
-	std::lock_guard lock(g_mutex);
-	g_buffers[resource.handle] = { desc.buffer.size };
+	{
+		std::lock_guard lock(g_mutex);
+		g_buffers[resource.handle] = { desc.buffer.size };
+	}
+	g_resource_generation.fetch_add(1, std::memory_order_relaxed);
+	g_last_resource_tick.store(GetTickCount64(), std::memory_order_release);
 }
 
 void on_destroy_resource(device *device, resource resource)
 {
 	if (device != g_device)
 		return;
-	std::lock_guard lock(g_mutex);
-	g_buffers.erase(resource.handle);
+	{
+		std::lock_guard lock(g_mutex);
+		g_buffers.erase(resource.handle);
+	}
+	g_resource_generation.fetch_add(1, std::memory_order_relaxed);
+	g_last_resource_tick.store(GetTickCount64(), std::memory_order_release);
 }
 
 void on_map_buffer(device *device, resource resource, uint64_t offset, uint64_t size,
@@ -1510,20 +1849,21 @@ void on_present(command_queue *queue, swapchain *, const rect *, const rect *, u
 	if ((GetAsyncKeyState(VK_F8) & 1) && game_has_focus())
 		toggle_shoulder_edit();
 	if (GetAsyncKeyState(VK_F9) & 1)
-	{
-		if (g_shoulder_active.load(std::memory_order_acquire))
-		{
-			end_edit();
-			g_shoulder_active.store(false, std::memory_order_release);
-		}
-		g_shoulder_pending.store(false, std::memory_order_release);
-		request_rescan();
-	}
+		request_discovery(true, scan_reason::manual);
+	const auto now = std::chrono::steady_clock::now();
+	schedule_shoulder_discovery(now);
 	if (g_hunt_phase.load(std::memory_order_acquire) == 0 &&
-		std::chrono::steady_clock::now() >= g_hunt_not_before)
+		now >= g_hunt_not_before)
 		ensure_hunt_thread();
 	service_shoulder_edit();
-	maintain_edit();
+	const size_t retired = maintain_edit();
+	if (retired != 0 && g_shoulder_desired.load(std::memory_order_acquire))
+	{
+		g_shoulder_instances_retired += retired;
+		g_shoulder_active.store(g_edit_active.load(std::memory_order_acquire),
+			std::memory_order_release);
+		request_discovery(true, scan_reason::stale_instance);
+	}
 	draw_console(draws);
 	write_telemetry(draws);
 }

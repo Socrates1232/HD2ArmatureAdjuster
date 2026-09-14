@@ -14,8 +14,8 @@ if(NOT EXISTS "${RESHADE_INCLUDE_DIR}/reshade.hpp")
 endif()
 
 add_library(HD2PaletteProbe SHARED src/addon.cpp)
-target_sources(HD2PaletteProbe PRIVATE src/ib_layout.hpp src/profile_scan.hpp
-    src/runtime_profile.hpp)
+target_sources(HD2PaletteProbe PRIVATE src/ib_layout.hpp src/instance_lifecycle.hpp
+    src/profile_scan.hpp src/runtime_profile.hpp)
 target_compile_features(HD2PaletteProbe PRIVATE cxx_std_17)
 target_include_directories(HD2PaletteProbe PRIVATE
 	"${RESHADE_INCLUDE_DIR}")
@@ -67,6 +67,17 @@ if(BUILD_TESTING)
         target_compile_options(runtime_profile_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME runtime_profile_format COMMAND runtime_profile_test)
+
+    add_executable(instance_lifecycle_test tests/instance_lifecycle_test.cpp src/instance_lifecycle.hpp)
+    target_include_directories(instance_lifecycle_test PRIVATE src)
+    target_compile_features(instance_lifecycle_test PRIVATE cxx_std_17)
+    if(MSVC)
+        target_compile_options(instance_lifecycle_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME instance_lifecycle_registry COMMAND instance_lifecycle_test)
+
     add_test(NAME runtime_profile_pipeline
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/profile_pipeline_test.py")
+    add_test(NAME shoulder_branch_pipeline
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/branch_target_pipeline_test.py")
 endif()

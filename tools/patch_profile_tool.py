@@ -12,15 +12,16 @@ import struct
 import sys
 import tempfile
 
-from build_ib_profile import (inverse_bind_tables, read_file, sha256,
+from build_ib_profile import (file64_to_t48, inverse_bind_tables, read_file, sha256,
                               translate_world_file64)
 from extract_runtime_profile import (HEADER_SIZE, MAGIC, RECORD_HEADER_SIZE,
-                                     UNIT_TYPE, bundle_entries, generate_profile,
+                                     UNIT_TYPE, bundle_entries, fnv1a, generate_profile,
                                      write_atomic)
 
 
 PATCH_NAME = re.compile(r"^[0-9a-fA-F]{16}\.patch_[0-9]+$")
 UNIT_ID = re.compile(r"^[0-9a-fA-F]{16}$")
+MASK64 = 0xFFFFFFFFFFFFFFFF
 
 
 def parse_unit_id(value: str) -> int:
@@ -32,6 +33,242 @@ def parse_unit_id(value: str) -> int:
 def unit_entries(bundle: bytes) -> list[dict]:
     return [entry for entry in bundle_entries(bundle)
             if entry["type_id"] == UNIT_TYPE]
+
+
+def bone_hash(name: str) -> int:
+    data = name.encode("utf-8")
+    multiplier = 0xC6A4A7935BD1E995
+    value = (len(data) * multiplier) & MASK64
+    whole = len(data) // 8
+    for index in range(whole):
+        item = struct.unpack_from("<Q", data, index * 8)[0]
+        item = (item * multiplier) & MASK64
+        item ^= item >> 47
+        item = (item * multiplier) & MASK64
+        value ^= item
+        value = (value * multiplier) & MASK64
+    tail = data[whole * 8:]
+    for index in range(len(tail) - 1, -1, -1):
+        value ^= tail[index] << (8 * index)
+    if tail:
+        value = (value * multiplier) & MASK64
+    value ^= value >> 47
+    value = (value * multiplier) & MASK64
+    value ^= value >> 47
+    return value >> 32
+
+
+def armature_semantics(unit: bytes) -> tuple[list[tuple[int, int]], list[int], list[dict]]:
+    if len(unit) < 0x5C:
+        raise ValueError("unit header is truncated")
+    scene_offset = struct.unpack_from("<I", unit, 0x34)[0]
+    bone_offset = struct.unpack_from("<I", unit, 0x58)[0]
+    if scene_offset == 0 or scene_offset + 16 > len(unit):
+        raise ValueError("TransformInfo offset is absent or outside the unit")
+    node_count = struct.unpack_from("<I", unit, scene_offset)[0]
+    if node_count == 0 or node_count > 65535:
+        raise ValueError("scene-graph node count is invalid")
+    parent_offset = scene_offset + 16 + node_count * 128
+    hash_offset = parent_offset + node_count * 4
+    if hash_offset + node_count * 4 > len(unit):
+        raise ValueError("scene graph is truncated")
+    parents = [struct.unpack_from("<HH", unit, parent_offset + index * 4)
+               for index in range(node_count)]
+    hashes = [struct.unpack_from("<I", unit, hash_offset + index * 4)[0]
+              for index in range(node_count)]
+
+    if bone_offset == 0 or bone_offset + 4 > len(unit):
+        raise ValueError("BoneInfo offset is absent or outside the unit")
+    lod_count = struct.unpack_from("<I", unit, bone_offset)[0]
+    if lod_count == 0 or bone_offset + 4 + lod_count * 4 > len(unit):
+        raise ValueError("BoneInfo LOD list is invalid")
+    palettes = []
+    for lod in range(lod_count):
+        relative = struct.unpack_from("<I", unit, bone_offset + 4 + lod * 4)[0]
+        block = bone_offset + relative
+        if block + 16 > len(unit):
+            raise ValueError(f"LOD {lod} BoneInfo block is truncated")
+        entries, _, real_offset, _ = struct.unpack_from("<4I", unit, block)
+        start = block + real_offset
+        if start + entries * 4 > len(unit):
+            raise ValueError(f"LOD {lod} RealIndices table is truncated")
+        palettes.append({
+            "lod": lod,
+            "real": list(struct.unpack_from(f"<{entries}I", unit, start)) if entries else [],
+        })
+    return parents, hashes, palettes
+
+
+def branch_side(node: int, parents: list[tuple[int, int]],
+                left_root: int | None, right_root: int | None) -> str:
+    seen = set()
+    current = node
+    while 0 <= current < len(parents) and current not in seen:
+        if current == left_root:
+            return "left"
+        if current == right_root:
+            return "right"
+        seen.add(current)
+        has_parent, parent = parents[current]
+        if not has_parent or parent == current:
+            break
+        current = parent
+    return "other"
+
+
+def active_runtime_tables(profile_directory: str | None) -> set[tuple[int, int, int]] | None:
+    if profile_directory is None:
+        return None
+    active_path = os.path.join(profile_directory, "active_profiles.txt")
+    if not os.path.isfile(active_path):
+        raise ValueError("profile directory has no active_profiles.txt")
+    active = set()
+    with open(active_path, encoding="utf-8") as stream:
+        names = [line.strip() for line in stream if line.strip()]
+    if not names:
+        raise ValueError("active_profiles.txt contains no profiles")
+    for name in names:
+        if os.path.basename(name) != name or not name.endswith(".hd2profile"):
+            raise ValueError("active_profiles.txt contains an invalid filename")
+        for unit_id, entries, table in profile_runtime_keys(
+                os.path.join(profile_directory, name)):
+            active.add((unit_id, fnv1a(table), entries))
+    return active
+
+
+def generate_branch_targets(root: str, output_path: str, report_path: str,
+                            left_translation: tuple[float, float, float],
+                            right_translation: tuple[float, float, float],
+                            profile_directory: str | None, force: bool) -> dict:
+    root = os.path.abspath(root)
+    output_path = os.path.abspath(output_path)
+    report_path = os.path.abspath(report_path)
+    if not os.path.isdir(root):
+        raise ValueError("--root is not a directory")
+    refuse_game_output(output_path)
+    require_new_outputs([output_path, report_path], force)
+    active = active_runtime_tables(profile_directory)
+    patches = []
+    for directory, child_directories, files in os.walk(root):
+        child_directories.sort(key=str.casefold)
+        files.sort(key=str.casefold)
+        if profile_directory and os.path.normcase(os.path.abspath(directory)) == os.path.normcase(
+                os.path.abspath(profile_directory)):
+            child_directories[:] = []
+            continue
+        for name in files:
+            if PATCH_NAME.fullmatch(name):
+                patches.append(os.path.join(directory, name))
+    patches.sort(key=lambda path: os.path.relpath(path, root).replace("\\", "/").casefold())
+    if not patches:
+        raise ValueError("no patch main files were found under --root")
+
+    left_hash, right_hash = bone_hash("l_shoulder"), bone_hash("r_shoulder")
+    observations: dict[tuple[int, int, int], dict] = {}
+    table_bytes: dict[tuple[int, int, int], bytes] = {}
+    skipped = []
+    tables_seen = set()
+    for patch in patches:
+        relative = os.path.relpath(patch, root).replace("\\", "/")
+        bundle = read_file(patch)
+        for entry in unit_entries(bundle):
+            unit_id = entry["file_id"]
+            unit = bundle[entry["data_offset"]:entry["data_offset"] + entry["data_size"]]
+            try:
+                parents, hashes, palettes = armature_semantics(unit)
+                tables = inverse_bind_tables(unit)
+            except (ValueError, struct.error) as error:
+                skipped.append({"patch": relative, "unit_id": f"{unit_id:016x}",
+                                "reason": str(error)})
+                continue
+            left_nodes = [index for index, value in enumerate(hashes) if value == left_hash]
+            right_nodes = [index for index, value in enumerate(hashes) if value == right_hash]
+            if len(left_nodes) > 1 or len(right_nodes) > 1:
+                raise ValueError(f"{relative}: unit {unit_id:016x} has duplicate shoulder nodes")
+            if not left_nodes and not right_nodes:
+                continue
+            if len(tables) != len(palettes):
+                raise ValueError(f"{relative}: unit {unit_id:016x} has mismatched LOD metadata")
+            left_root = left_nodes[0] if left_nodes else None
+            right_root = right_nodes[0] if right_nodes else None
+            for table, palette in zip(tables, palettes):
+                t48 = file64_to_t48(table["file64"])
+                table_key = fnv1a(t48)
+                runtime_key = (unit_id, table_key, table["bones"])
+                if active is not None and runtime_key not in active:
+                    continue
+                previous = table_bytes.setdefault(runtime_key, t48)
+                if previous != t48:
+                    raise ValueError(f"FNV collision for unit {unit_id:016x} table {table_key:016x}")
+                tables_seen.add(runtime_key)
+                if len(palette["real"]) != table["bones"]:
+                    raise ValueError(f"{relative}: unit {unit_id:016x} LOD {table['lod']} palette mismatch")
+                for slot, node in enumerate(palette["real"]):
+                    side = branch_side(node, parents, left_root, right_root)
+                    key = (unit_id, table_key, slot)
+                    item = observations.setdefault(key, {
+                        "sides": set(), "sources": [], "entries": table["bones"]})
+                    item["sides"].add(side)
+                    item["sources"].append({"patch": relative, "lod": table["lod"],
+                                            "node": node, "side": side})
+
+    if active is not None:
+        missing = active - tables_seen
+        # Missing tables without shoulder roots are expected; only mappings observed above matter.
+        active_tables_considered = len(active) - len(missing)
+    else:
+        active_tables_considered = len(tables_seen)
+    targets = []
+    conflicts = []
+    for (unit_id, table_key, slot), item in sorted(observations.items()):
+        branch = item["sides"] & {"left", "right"}
+        if not branch:
+            continue
+        if len(item["sides"]) != 1:
+            conflicts.append({
+                "unit_id": f"{unit_id:016x}", "table_key": f"{table_key:016x}",
+                "slot": slot, "sides": sorted(item["sides"]), "sources": item["sources"],
+            })
+            continue
+        side = next(iter(branch))
+        targets.append({
+            "unit_id": f"{unit_id:016x}", "table_key": f"{table_key:016x}",
+            "slot": slot, "side": side,
+            "translation": list(left_translation if side == "left" else right_translation),
+            "sources": item["sources"],
+        })
+    if conflicts:
+        raise ValueError("a runtime table reuses a target slot with conflicting bone semantics; "
+                         "see generated data before changing the profile format")
+    if not targets:
+        raise ValueError("no shoulder or descendant palette slots were found")
+
+    lines = [
+        "# unit_id table_fingerprint slot translate_x translate_y translate_z",
+        "# Generated from scene-graph parent links and per-LOD RealIndices.",
+    ]
+    for target in targets:
+        values = " ".join(f"{value:+.9g}" for value in target["translation"])
+        lines.append(f"{target['unit_id']} {target['table_key']} {target['slot']} {values}")
+    result = {
+        "schema": 1,
+        "operation": "generate_table_qualified_shoulder_branches",
+        "root": root,
+        "profile_directory": os.path.abspath(profile_directory) if profile_directory else None,
+        "patches_scanned": len(patches),
+        "active_tables_considered": active_tables_considered,
+        "armature_tables_observed": len(tables_seen),
+        "targets": targets,
+        "targets_by_side": {
+            "left": sum(item["side"] == "left" for item in targets),
+            "right": sum(item["side"] == "right" for item in targets),
+        },
+        "skipped_units": skipped,
+        "conflicts": conflicts,
+    }
+    write_atomic(output_path, ("\n".join(lines) + "\n").encode("utf-8"))
+    write_atomic(report_path, (json.dumps(result, indent=2) + "\n").encode("utf-8"))
+    return result
 
 
 def inspect_patch(path: str) -> dict:
@@ -359,6 +596,21 @@ def build_parser() -> argparse.ArgumentParser:
     tree_command.add_argument("--out-dir", required=True)
     tree_command.add_argument("--force", action="store_true")
 
+    branch_command = commands.add_parser(
+        "shoulder-targets",
+        help="derive table-qualified shoulder and descendant slots from scene graphs")
+    branch_command.add_argument("--root", required=True, help="profiled mod-copy root")
+    branch_command.add_argument("--profile-dir", required=True,
+                                help="directory containing active_profiles.txt")
+    branch_command.add_argument("--out", help="default: <profile-dir>/shoulder_targets.txt")
+    branch_command.add_argument("--report",
+                                help="default: <profile-dir>/shoulder_targets.json")
+    branch_command.add_argument("--left-translate", type=float, nargs=3,
+                                default=(0.25, 0.0, 0.0), metavar=("X", "Y", "Z"))
+    branch_command.add_argument("--right-translate", type=float, nargs=3,
+                                default=(-0.25, 0.0, 0.0), metavar=("X", "Y", "Z"))
+    branch_command.add_argument("--force", action="store_true")
+
     edit_command = commands.add_parser("translate", help="copy a patch, translate one IB slot, and profile it")
     edit_command.add_argument("--patch", required=True, help="source main patch")
     edit_command.add_argument("--out-patch", required=True,
@@ -399,6 +651,26 @@ def main() -> int:
                 "unique_runtime_tables": result["unique_runtime_tables"],
                 "distinct_units": result["distinct_units"],
                 "skipped_patches": len(result["skipped_patches"]),
+            }, indent=2))
+        elif args.command == "shoulder-targets":
+            left = tuple(args.left_translate)
+            right = tuple(args.right_translate)
+            if (not all(math.isfinite(value) and abs(value) <= 10.0
+                        for value in left + right) or
+                    not any(value != 0.0 for value in left) or
+                    not any(value != 0.0 for value in right)):
+                raise ValueError("branch translations must be finite, nonzero, and within +/-10 metres")
+            output = args.out or os.path.join(args.profile_dir, "shoulder_targets.txt")
+            report = args.report or os.path.join(args.profile_dir, "shoulder_targets.json")
+            result = generate_branch_targets(args.root, output, report, left, right,
+                                             args.profile_dir, args.force)
+            print(json.dumps({
+                "output": os.path.abspath(output),
+                "report": os.path.abspath(report),
+                "patches_scanned": result["patches_scanned"],
+                "armature_tables_observed": result["armature_tables_observed"],
+                "targets": len(result["targets"]),
+                "targets_by_side": result["targets_by_side"],
             }, indent=2))
         else:
             profile_path = args.profile_out or args.out_patch + ".hd2profile"

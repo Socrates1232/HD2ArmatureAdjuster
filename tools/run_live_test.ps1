@@ -39,6 +39,8 @@ $reshadeLog = Join-Path $gameBin 'ReShade.log'
 $installedAddon = Join-Path $gameBin 'HD2PaletteProbe.addon64'
 $installedProfileDirectory = Join-Path $gameBin 'HD2ArmatureProfiles'
 $activeProfilesPath = Join-Path $installedProfileDirectory 'active_profiles.txt'
+$installedShoulderTargets = Join-Path $installedProfileDirectory 'shoulder_targets.txt'
+$installedShoulderReport = Join-Path $installedProfileDirectory 'shoulder_targets.json'
 $runtimeDirectory = Join-Path $env:LOCALAPPDATA 'HD2ArmatureAdjuster'
 $telemetryPath = Join-Path $runtimeDirectory 'telemetry.json'
 $automationPath = Join-Path $runtimeDirectory 'automation.request'
@@ -181,19 +183,45 @@ if ($RecoverOnly) {
 }
 
 $ProfileDirectory = (Resolve-Path -LiteralPath $ProfileDirectory).Path
-$profileFiles = @(Get-ChildItem -LiteralPath $ProfileDirectory -Filter '*.hd2profile' -File | Sort-Object Name)
+$sourceShoulderTargets = Join-Path $ProfileDirectory 'shoulder_targets.txt'
+$sourceShoulderReport = Join-Path $ProfileDirectory 'shoulder_targets.json'
+$sourceActiveProfiles = Join-Path $ProfileDirectory 'active_profiles.txt'
+if (Test-Path -LiteralPath $sourceActiveProfiles) {
+    $requestedProfiles = @(Get-Content -LiteralPath $sourceActiveProfiles | Where-Object { $_ })
+    if (!$requestedProfiles.Count) { throw 'Source active_profiles.txt contains no profiles.' }
+    if (@($requestedProfiles | Select-Object -Unique).Count -ne $requestedProfiles.Count) {
+        throw 'Source active_profiles.txt contains duplicate filenames.'
+    }
+    $profileFiles = @(foreach ($name in $requestedProfiles) {
+        if ([System.IO.Path]::GetFileName($name) -ne $name -or !$name.EndsWith('.hd2profile')) {
+            throw "Invalid filename in source active_profiles.txt: $name"
+        }
+        $path = Join-Path $ProfileDirectory $name
+        if (!(Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "Active runtime profile is missing: $path"
+        }
+        Get-Item -LiteralPath $path
+    })
+}
+else {
+    $profileFiles = @(Get-ChildItem -LiteralPath $ProfileDirectory -Filter '*.hd2profile' -File | Sort-Object Name)
+}
 if (!$profileFiles.Count) { throw "No .hd2profile files found: $ProfileDirectory" }
 $profileMetadata = @($profileFiles | ForEach-Object { Read-ProfileHeader $_.FullName })
 if (@($profileMetadata.file | Select-Object -Unique).Count -ne $profileMetadata.Count) {
     throw 'Runtime profile filenames must be unique.'
 }
+$profilePatchMatches = 0
+$profilePatchMismatches = @()
 foreach ($profile in $profileMetadata) {
     $installedPatch = Join-Path $gameData $profile.patch
     if (!(Test-Path -LiteralPath $installedPatch)) { throw "Profile patch is not installed: $installedPatch" }
     $actual = (Get-FileHash -LiteralPath $installedPatch -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actual -ne $profile.patch_sha256) {
-        throw "Installed patch does not match profile $($profile.file): $($profile.patch)"
-    }
+    if ($actual -eq $profile.patch_sha256) { $profilePatchMatches++ }
+    else { $profilePatchMismatches += $profile.file }
+}
+if ($profilePatchMismatches.Count) {
+    Write-Warning "$($profilePatchMismatches.Count) alternate-variant profile(s) do not match the installed patch archive; runtime exact-table validation remains mandatory."
 }
 
 if (!$AddonPath) { $AddonPath = Find-AddonBuild }
@@ -241,6 +269,12 @@ if (!$NoDeploy) {
         if (($installedActive -join "`n") -ne ($activeNames -join "`n")) {
             throw 'The game is running and active_profiles.txt differs. Close the game and rerun.'
         }
+        if ((Test-Path -LiteralPath $sourceShoulderTargets) -and
+            (!(Test-Path -LiteralPath $installedShoulderTargets) -or
+             (Get-FileHash -LiteralPath $sourceShoulderTargets -Algorithm SHA256).Hash -ne
+             (Get-FileHash -LiteralPath $installedShoulderTargets -Algorithm SHA256).Hash)) {
+            throw 'The game is running and installed shoulder_targets.txt differs. Close the game and rerun.'
+        }
     }
     else {
         New-Item -ItemType Directory -Force -Path $installedProfileDirectory | Out-Null
@@ -248,6 +282,12 @@ if (!$NoDeploy) {
             Copy-Item -LiteralPath $profile.path -Destination (Join-Path $installedProfileDirectory $profile.file) -Force
         }
         [System.IO.File]::WriteAllLines($activeProfilesPath, $activeNames, [System.Text.UTF8Encoding]::new($false))
+        if (Test-Path -LiteralPath $sourceShoulderTargets) {
+            Copy-Item -LiteralPath $sourceShoulderTargets -Destination $installedShoulderTargets -Force
+        }
+        if (Test-Path -LiteralPath $sourceShoulderReport) {
+            Copy-Item -LiteralPath $sourceShoulderReport -Destination $installedShoulderReport -Force
+        }
     }
 }
 else {
@@ -268,10 +308,16 @@ else {
     if (($installedActive -join "`n") -ne ($activeNames -join "`n")) {
         throw 'The installed active_profiles.txt differs while -NoDeploy is active.'
     }
+    if ((Test-Path -LiteralPath $sourceShoulderTargets) -and
+        (!(Test-Path -LiteralPath $installedShoulderTargets) -or
+         (Get-FileHash -LiteralPath $sourceShoulderTargets -Algorithm SHA256).Hash -ne
+         (Get-FileHash -LiteralPath $installedShoulderTargets -Algorithm SHA256).Hash)) {
+        throw 'The installed shoulder_targets.txt differs while -NoDeploy is active.'
+    }
 }
 
 if ($PreflightOnly) {
-    Write-Host "Preflight passed: ReShade $reshadeVersion, x64 add-on, $($profileMetadata.Count) profile file(s), SHA256 $addonHash"
+    Write-Host "Preflight passed: ReShade $reshadeVersion, x64 add-on, $($profileMetadata.Count) profile file(s), $profilePatchMatches exact patch provenance match(es), SHA256 $addonHash"
     exit 0
 }
 

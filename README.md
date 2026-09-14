@@ -18,12 +18,16 @@ extract_runtime_profile.py
         |
         +-- .hd2profile       exact converted IB tables + patch identity
         +-- .hd2profile.json  reviewable manifest
+        |
+        +-- shoulder-targets  scene graph + per-LOD RealIndices
+                    |
+                    +-- shoulder_targets.txt (unit + exact table + slot)
                     |
                     v
 HD2ArmatureProfiles beside the add-on
                     |
                     v
-ReShade add-on: exact locate -> guarded slot edit -> readback -> restore
+ReShade add-on: discover -> register live instance -> guarded edit -> recover/reapply
 ```
 
 Each profile represents one finished main patch bundle. It may contain several unit IDs and LOD tables. Identical tables shared by multiple LODs are stored once with an LOD mask. Multiple active profile files compose into one runtime registry; records with the same unit ID, entry count, and exact table bytes are merged during loading.
@@ -63,6 +67,21 @@ python tools/patch_profile_tool.py translate `
   --translate 0.0 0.15 0.0
 ```
 
+After `profile-tree`, generate the shoulder branches from the copied mod tree:
+
+```powershell
+python tools/patch_profile_tool.py shoulder-targets `
+  --root "build\converted-mod" `
+  --profile-dir "build\converted-mod\HD2ArmatureProfiles"
+```
+
+This walks the unit scene-graph parents, expands `l_shoulder` and `r_shoulder`
+to all descendants, maps those nodes through every LOD's `RealIndices`, and
+qualifies every output slot with the exact table's FNV-1a fingerprint. It rejects
+an exact runtime table if the same slot has conflicting semantics in another LOD
+or replacement variant. The default diagnostic displacement is an exaggerated
+`+0.25 m` for the left branch and `-0.25 m` for the right branch.
+
 ## Build
 
 The build uses the official ReShade 6.5.1 headers at add-on API 17. The pinned SDK revision is `f1332dfe8fb1c61a726d53af069cc2a2fcacae7f`.
@@ -89,22 +108,25 @@ With the game stopped:
 
 If `active_profiles.txt` is absent, the add-on loads every `.hd2profile` in the directory. An explicit list is recommended because it prevents stale profiles from silently becoming active.
 
-The add-on validates profile structure and checksums, then looks only for complete exact 48-byte-per-entry table matches. `F8` toggles the configured shoulder narrowing and restores the exact source bytes on the next press. `F9` restores an active shoulder edit and requests a rescan. The standalone console reports loaded files, tables, errors, unit IDs, LOD masks, entry counts, matched addresses, and shoulder toggle state.
+The add-on validates profile structure and checksums, then looks only for complete exact 48-byte-per-entry table matches. One `F8` press records a persistent requested-ON state. The runtime applies it to every valid live table instance, retires stale addresses, scans known productive regions every two seconds, schedules a full scan after resource churn, and performs a full fallback scan every 30 seconds. A new valid instance is edited automatically without another key press. The next `F8` press requests OFF and restores only tables whose complete bytes still equal this add-on's expected override. `F9` manually requests a full discovery pass without changing the F8 state.
 
 `shoulder_targets.txt` uses one target per line:
 
 ```text
-unit_id  slot  world_x  world_y  world_z
+unit_id  table_fingerprint  slot  world_x  world_y  world_z
 ```
 
-Blank lines and `#` comments are accepted. The supplied
-`profiles/lacrima_dump_shoulder_targets.txt` moves each mapped left shoulder
-`+0.08 m` on X and each right shoulder `-0.08 m` on X. These unit/slot mappings
-come from the offline scene-graph and palette census of the Lacrima patch set.
+Blank lines and `#` comments are accepted. Legacy five-field unit-wide rows are
+still accepted for controlled experiments, but generated table-qualified rows
+are required for safe multi-LOD deployment.
 
 ## Automated validation
 
-The runner validates that each profile's embedded main-patch basename and SHA-256 match the installed patch before deploying anything:
+The runner verifies each profile's embedded patch provenance before deployment.
+An exact archive-hash match is reported when present; alternate replacement
+variants are allowed because the runtime still requires a complete exact table
+match before any write. This is necessary when one profile union intentionally
+covers several replacements of the same patch basename:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/run_live_test.ps1 `
@@ -134,4 +156,9 @@ Telemetry is written to `%LOCALAPPDATA%\HD2ArmatureAdjuster\telemetry.json`; tes
 
 ## Scope
 
-This proves external-profile-driven inverse-bind discovery and reversible slot control. The F8 test adds one external, patch-derived semantic mapping for left and right shoulders. It does not yet provide a general naming database, hierarchy-aware edits, or an interactive editor.
+This prototype now provides external-profile discovery, persistent edit intent,
+scene-change instance recovery, reversible writes, and offline hierarchy-aware
+shoulder branch expansion. The configured translation remains a bind/model-space
+pre-offset; it is intentionally exaggerated for validation and is not yet a
+pose-aware shoulder-width control. A general naming database and interactive
+editor remain future work.
