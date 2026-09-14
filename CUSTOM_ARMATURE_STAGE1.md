@@ -9,7 +9,7 @@ Stage 1 now has two connected deliverables:
 
 The original patches and `.vrm` files are read-only inputs. The workflow neither fingerprints nor rewrites them.
 
-The offline implementation and the real 257-bone/27-table package have passed the repository test suite and the runtime's strict C++ package parser. The new runtime build has not yet been installed or exercised in HD2 because the game was running while it was built; the existing game directory was intentionally left untouched.
+The offline implementation and the real 257-bone/27-table package have passed the repository test suite and the runtime's strict C++ package parser. The first live deployment loaded the package successfully, but pressing F8 froze the game before the runtime recorded an accepted toggle or built a replacement plan. Stage 1 is therefore not live-validated. See [`CUSTOM_ARMATURE_LIVE_FAILURE_2026-09-14.md`](CUSTOM_ARMATURE_LIVE_FAILURE_2026-09-14.md).
 
 ## Supported Stage-1 edit class
 
@@ -248,7 +248,7 @@ The current offline gate covers:
 
 The test suite currently reports 16/16 passing. The real validation package contains 257 logical bones, 27 exact tables, and 1,625 slot mappings, and it loads successfully through the runtime's C++ `HD2RIG1` parser.
 
-The remaining gate is a controlled in-game run of this new binary and package. Until that run reaches `APPLIED`, visibly follows animation, restores on F8, and survives a scene transition, the runtime should be described as implemented and offline-verified—not live-validated.
+The remaining gate is a controlled in-game run after the F8 freeze is diagnosed. Until a run reaches `APPLIED`, visibly follows animation, restores on F8, and survives a scene transition, the runtime should be described as implemented and offline-verified—not live-validated.
 
 ## Implementation record
 
