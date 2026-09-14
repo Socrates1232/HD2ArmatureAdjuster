@@ -89,7 +89,7 @@ With the game stopped:
 
 If `active_profiles.txt` is absent, the add-on loads every `.hd2profile` in the directory. An explicit list is recommended because it prevents stale profiles from silently becoming active.
 
-The add-on validates profile structure and checksums, then looks only for complete exact 48-byte-per-entry table matches. `F8` toggles the configured shoulder narrowing and restores the exact source bytes on the next press. `F9` restores an active shoulder edit and requests a rescan. The standalone console reports loaded files, tables, errors, unit IDs, LOD masks, entry counts, matched addresses, and shoulder toggle state.
+The add-on validates profile structure and checksums, then looks only for complete exact 48-byte-per-entry table matches. `F8` starts a fresh shoulder-only scan and toggles the configured narrowing, restoring the exact source bytes on the next press. If an active table becomes unreadable or changes unexpectedly for three consecutive frames, the add-on safely abandons its old addresses and automatically reacquires the shoulder tables. `F9` restores an active shoulder edit and requests a general rescan. The standalone console reports loaded files, tables, errors, unit IDs, LOD masks, entry counts, matched addresses, shoulder state, and reacquisition count.
 
 `shoulder_targets.txt` uses one target per line:
 

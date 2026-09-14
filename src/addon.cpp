@@ -32,6 +32,7 @@ constexpr size_t k_scan_chunk_bytes = 4 * 1024 * 1024;
 constexpr size_t k_max_hits = 256;
 constexpr uint32_t k_max_profile_tables = 4096;
 constexpr float k_max_edit_translation = 10.0f;
+constexpr uint32_t k_stale_frames_before_reacquire = 3;
 
 struct buffer_info
 {
@@ -66,6 +67,7 @@ struct active_target
 	uintptr_t address = 0;
 	std::array<uint8_t, armature_profile::transform_stride> original {};
 	std::array<uint8_t, armature_profile::transform_stride> injected {};
+	uint32_t stale_frames = 0;
 };
 
 struct edit_request
@@ -153,7 +155,9 @@ std::vector<edit_request> g_shoulder_targets;
 std::string g_shoulder_error;
 std::atomic<bool> g_shoulder_pending { false };
 std::atomic<bool> g_shoulder_active { false };
+std::atomic<bool> g_shoulder_needs_fresh_scan { false };
 uint64_t g_shoulder_toggles = 0;
+uint64_t g_shoulder_reacquires = 0;
 
 const char *experiment_mode_name()
 {
@@ -435,9 +439,13 @@ bool writable_private_page(const MEMORY_BASIC_INFORMATION &info)
 DWORD WINAPI hunt_thread_proc(void *)
 {
 	std::vector<loaded_table_profile> profiles;
+	std::vector<edit_request> shoulder_targets;
+	const bool shoulder_only = g_shoulder_pending.load(std::memory_order_acquire);
 	{
 		std::lock_guard lock(g_mutex);
 		profiles = g_profiles;
+		if (shoulder_only)
+			shoulder_targets = g_shoulder_targets;
 	}
 	if (profiles.empty())
 	{
@@ -445,11 +453,24 @@ DWORD WINAPI hunt_thread_proc(void *)
 		return 0;
 	}
 	std::vector<armature_probe::profile_view> views;
+	std::vector<size_t> profile_indices;
 	size_t largest_table = 0;
-	for (const loaded_table_profile &profile : profiles)
+	for (size_t index = 0; index < profiles.size(); ++index)
 	{
+		const loaded_table_profile &profile = profiles[index];
+		if (shoulder_only && std::none_of(shoulder_targets.begin(), shoulder_targets.end(),
+			[&profile](const edit_request &target) {
+				return target.unit_id == profile.unit_id && target.slot < profile.entries;
+			}))
+			continue;
 		views.push_back({ profile.t48.data(), profile.entries });
+		profile_indices.push_back(index);
 		largest_table = std::max(largest_table, profile.t48.size());
+	}
+	if (views.empty())
+	{
+		g_hunt_phase.store(3, std::memory_order_release);
+		return 0;
 	}
 	std::vector<uint8_t> scratch(k_scan_chunk_bytes + largest_table);
 	SYSTEM_INFO system = {};
@@ -534,12 +555,13 @@ DWORD WINAPI hunt_thread_proc(void *)
 					{
 						if (hit.address >= primary_end)
 							continue;
+						const size_t profile_index = profile_indices[hit.profile_index];
 						const bool duplicate = std::any_of(found_hits.begin(), found_hits.end(),
-							[&hit](const converted_hit &known) {
-								return known.address == hit.address && known.profile_index == hit.profile_index;
+							[&hit, profile_index](const converted_hit &known) {
+								return known.address == hit.address && known.profile_index == profile_index;
 							});
 						if (!duplicate)
-							found_hits.push_back({ hit.address, hit.profile_index, base, region_size, info.Protect });
+							found_hits.push_back({ hit.address, profile_index, base, region_size, info.Protect });
 					}
 				}
 			}
@@ -713,29 +735,33 @@ bool begin_edit(std::chrono::steady_clock::time_point now)
 	return true;
 }
 
-void maintain_edit()
+bool maintain_edit()
 {
 	if (!g_edit_active.load(std::memory_order_acquire))
-		return;
+		return false;
 	std::unique_lock lock(g_mutex, std::try_to_lock);
 	if (!lock.owns_lock() || !g_edit.active)
-		return;
+		return false;
+	bool reacquire = false;
 	for (active_target &target : g_active_targets)
 	{
 		std::array<uint8_t, armature_profile::transform_stride> current {};
 		if (!read_process_bytes(target.address, current.data(), current.size()))
 		{
 			++g_edit.stale_skips;
+			reacquire |= ++target.stale_frames >= k_stale_frames_before_reacquire;
 			continue;
 		}
 		if (current == target.injected)
 		{
+			target.stale_frames = 0;
 			++g_edit.present_readbacks;
 			continue;
 		}
 		if (current != target.original)
 		{
 			++g_edit.stale_skips;
+			reacquire |= ++target.stale_frames >= k_stale_frames_before_reacquire;
 			continue;
 		}
 		++g_edit.refills_observed;
@@ -743,10 +769,17 @@ void maintain_edit()
 		if (write_process_bytes(target.address, target.injected.data(), target.injected.size()) &&
 			read_process_bytes(target.address, current.data(), current.size()) && current == target.injected)
 		{
+			target.stale_frames = 0;
 			++g_edit.write_successes;
 			++g_edit.immediate_readbacks;
 		}
+		else
+		{
+			++g_edit.stale_skips;
+			reacquire |= ++target.stale_frames >= k_stale_frames_before_reacquire;
+		}
 	}
+	return reacquire;
 }
 
 void end_edit()
@@ -791,6 +824,7 @@ void toggle_shoulder_edit()
 	++g_shoulder_toggles;
 	if (g_shoulder_pending.exchange(false, std::memory_order_acq_rel))
 	{
+		g_shoulder_needs_fresh_scan.store(false, std::memory_order_release);
 		g_shoulder_error.clear();
 		return;
 	}
@@ -810,8 +844,8 @@ void toggle_shoulder_edit()
 		return;
 	g_shoulder_error.clear();
 	g_shoulder_pending.store(true, std::memory_order_release);
-	if (g_hunt_phase.load(std::memory_order_acquire) == 3)
-		request_rescan();
+	g_shoulder_needs_fresh_scan.store(true, std::memory_order_release);
+	request_rescan();
 }
 
 void service_shoulder_edit()
@@ -821,19 +855,46 @@ void service_shoulder_edit()
 	const uint32_t phase = g_hunt_phase.load(std::memory_order_acquire);
 	if (phase == 0)
 	{
-		ensure_hunt_thread();
+		if (ensure_hunt_thread())
+			g_shoulder_needs_fresh_scan.store(false, std::memory_order_release);
 		return;
 	}
 	if (phase == 1)
 		return;
-	if (phase != 2 || !begin_edits(g_shoulder_targets))
+	if (g_shoulder_needs_fresh_scan.load(std::memory_order_acquire))
+	{
+		request_rescan();
+		return;
+	}
+	if (phase == 3)
 	{
 		g_shoulder_error = "no mapped shoulder table is currently resident";
 		g_shoulder_pending.store(false, std::memory_order_release);
 		return;
 	}
+	if (phase != 2)
+		return;
+	if (!begin_edits(g_shoulder_targets))
+	{
+		g_shoulder_error = "cached shoulder table changed; rescanning";
+		g_shoulder_needs_fresh_scan.store(true, std::memory_order_release);
+		request_rescan();
+		return;
+	}
+	g_shoulder_error.clear();
 	g_shoulder_active.store(true, std::memory_order_release);
 	g_shoulder_pending.store(false, std::memory_order_release);
+}
+
+void reacquire_shoulder_edit()
+{
+	end_edit();
+	++g_shoulder_reacquires;
+	g_shoulder_active.store(false, std::memory_order_release);
+	g_shoulder_pending.store(true, std::memory_order_release);
+	g_shoulder_needs_fresh_scan.store(true, std::memory_order_release);
+	g_shoulder_error = "shoulder table residency changed; reacquiring";
+	request_rescan();
 }
 
 void initialize_runtime_files()
@@ -1226,7 +1287,7 @@ void draw_console(uint32_t draws)
 	for (const auto &[unused, buffer] : g_buffers)
 		mapped += buffer.map_ptr != nullptr;
 	out << "\x1b[2J\x1b[H"
-		<< "HD2 Armature Profile Runtime 0.8  |  " << experiment_mode_name() << "  |  D3D12\n\n"
+		<< "HD2 Armature Profile Runtime 0.9  |  " << experiment_mode_name() << "  |  D3D12\n\n"
 		<< "frame " << g_frame << "  draws " << draws << "  buffers " << g_buffers.size()
 		<< " (mapped " << mapped << ")\n"
 		<< "profiles " << g_profile_files << " files / " << g_profiles.size()
@@ -1242,7 +1303,8 @@ void draw_console(uint32_t draws)
 		<< "F8 shoulder narrowing "
 		<< (g_shoulder_active.load(std::memory_order_relaxed) ? "ACTIVE" :
 			g_shoulder_pending.load(std::memory_order_relaxed) ? "pending" : "off")
-		<< " (" << g_shoulder_targets.size() << " mapped slots)  |  F9 rescan\n"
+		<< " (" << g_shoulder_targets.size() << " mapped slots, "
+		<< g_shoulder_reacquires << " reacquires)  |  F9 rescan\n"
 		<< "edit " << (g_edit.active ? "ACTIVE" : g_edit.completed ? "complete" :
 			g_edit.requested ? "armed" : "off") << "  slot ";
 	if (g_edit.slot == UINT32_MAX)
@@ -1311,7 +1373,7 @@ void write_telemetry(uint32_t draws)
 
 	std::ostringstream json;
 	json << "{\n"
-		<< "  \"schema\": 5,\n"
+		<< "  \"schema\": 6,\n"
 		<< "  \"addon\": \"HD2 Armature Profile Runtime\",\n"
 		<< "  \"experiment_mode\": \"" << experiment_mode_name() << "\",\n"
 		<< "  \"api_version\": " << RESHADE_API_VERSION << ",\n"
@@ -1334,7 +1396,10 @@ void write_telemetry(uint32_t draws)
 		<< (g_shoulder_pending.load(std::memory_order_relaxed) ? "true" : "false") << ",\n"
 		<< "  \"shoulder_narrow_active\": "
 		<< (g_shoulder_active.load(std::memory_order_relaxed) ? "true" : "false") << ",\n"
+		<< "  \"shoulder_rescan_required\": "
+		<< (g_shoulder_needs_fresh_scan.load(std::memory_order_relaxed) ? "true" : "false") << ",\n"
 		<< "  \"shoulder_toggle_count\": " << g_shoulder_toggles << ",\n"
+		<< "  \"shoulder_reacquire_count\": " << g_shoulder_reacquires << ",\n"
 		<< "  \"shoulder_error\": \"" << json_escape(g_shoulder_error) << "\",\n"
 		<< "  \"ib_hunt_phase\": " << g_hunt_phase.load(std::memory_order_relaxed) << ",\n"
 		<< "  \"ib_hunt_passes\": " << g_hunt_passes.load(std::memory_order_relaxed) << ",\n"
@@ -1447,6 +1512,8 @@ void on_destroy_device(device *device)
 	g_shoulder_targets.clear();
 	g_shoulder_pending.store(false, std::memory_order_release);
 	g_shoulder_active.store(false, std::memory_order_release);
+	g_shoulder_needs_fresh_scan.store(false, std::memory_order_release);
+	g_shoulder_reacquires = 0;
 	g_device = nullptr;
 }
 
@@ -1517,13 +1584,15 @@ void on_present(command_queue *queue, swapchain *, const rect *, const rect *, u
 			g_shoulder_active.store(false, std::memory_order_release);
 		}
 		g_shoulder_pending.store(false, std::memory_order_release);
+		g_shoulder_needs_fresh_scan.store(false, std::memory_order_release);
 		request_rescan();
 	}
 	if (g_hunt_phase.load(std::memory_order_acquire) == 0 &&
 		std::chrono::steady_clock::now() >= g_hunt_not_before)
 		ensure_hunt_thread();
 	service_shoulder_edit();
-	maintain_edit();
+	if (maintain_edit() && g_shoulder_active.load(std::memory_order_acquire))
+		reacquire_shoulder_edit();
 	draw_console(draws);
 	write_telemetry(draws);
 }
