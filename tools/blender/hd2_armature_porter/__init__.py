@@ -28,7 +28,7 @@ write_rig = _core.write_rig
 bl_info = {
     "name": "HD2 Armature Adapter",
     "author": "HD2ArmatureAdjuster contributors",
-    "version": (1, 3, 1),
+    "version": (1, 4, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > HD2AA",
     "description": "Port compatible custom rest armatures to HD2RIG1",
@@ -40,6 +40,7 @@ STABLE_ID = "hd2_stable_id"
 SOURCE_PATH = "hd2_source_reference"
 EXACT_NAME_MAPPING = "hd2_exact_name_mapping"
 PORT_BONES = "hd2_port_bones"
+BUNDLED_SOURCE = "source.hd2source.json"
 
 
 def _matrix(values):
@@ -61,6 +62,9 @@ def _unique_name(existing, desired):
 
 def resolve_source_path(settings):
     candidates = []
+    bundled = os.path.join(os.path.dirname(__file__), BUNDLED_SOURCE)
+    if os.path.isfile(bundled):
+        candidates.append(bundled)
     target = settings.target_object
     if target is not None and target.get(SOURCE_PATH):
         candidates.append(target.get(SOURCE_PATH))
@@ -297,7 +301,7 @@ class HD2AA_OT_import_source(Operator):
 
     def execute(self, context):
         try:
-            obj = create_source_armature(context, bpy.path.abspath(context.scene.hd2aa.source_path))
+            obj = create_source_armature(context, resolve_source_path(context.scene.hd2aa))
             context.scene.hd2aa.target_object = obj
             context.scene.hd2aa.status = "Source imported; duplicate it before editing"
             self.report({"INFO"}, f"Imported {len(obj.data.bones)} stable bones")
@@ -414,9 +418,13 @@ class HD2AA_PT_panel(Panel):
         marked = 0 if target is None else len(marked_bone_names(target))
         layout.label(text=f"Explicitly marked bones: {marked}")
         layout.separator()
-        layout.label(text="2. Binding contract (resolved once)")
-        layout.prop(settings, "source_path")
-        layout.label(text="Use *.hd2source.json, not *.patch_N", icon="INFO")
+        layout.label(text="2. Binding contract")
+        bundled = os.path.join(os.path.dirname(__file__), BUNDLED_SOURCE)
+        if os.path.isfile(bundled):
+            layout.label(text="Bundled source contract active", icon="CHECKMARK")
+        else:
+            layout.prop(settings, "source_path")
+            layout.label(text="Use *.hd2source.json, not *.patch_N", icon="INFO")
         layout.operator("hd2aa.map_exact_names", text="Check Automatic Mapping")
         layout.label(text="Only marked bones are ported; all others stay unchanged")
         row = layout.row(align=True)

@@ -78,13 +78,13 @@ Run the same export twice if reproducibility matters; byte-identical inputs prod
 
 ## 2. Author a target in Blender
 
-Install `hd2_armature_porter-1.3.1.zip` through Blender's **Preferences → Get Extensions → Install from Disk**. In the 3D View sidebar, open **HD2AA**.
+Install `hd2_armature_porter-1.4.0.zip` through Blender's **Preferences → Get Extensions → Install from Disk**. In the 3D View sidebar, open **HD2AA**. The release ZIP contains the source contract used to build it, so ordinary authoring does not require selecting that file.
 
 For an armature already modified from an exported HD2 avatar rig:
 
 1. Select the modified armature object and click **Use Selected Armature**.
 2. In Edit Mode, select only the bone roots whose local rest transforms you intentionally changed, then click **Add Selected to Port**. The button reads Blender's EditBone selection and adds it to the existing marks; **Clear Port Marks** resets the set. Moving a complete shoulder branch normally requires marking its shoulder root, not every unchanged descendant.
-3. If the armature already carries `hd2_source_reference`, the add-on resolves it automatically. Otherwise select the generated `*.hd2source.json` once. A `.patch_N` file is not a source contract.
+3. Confirm that the panel says **Bundled source contract active**. A development copy without a bundled contract falls back to the external `*.hd2source.json` selector.
 4. Optionally click **Check Automatic Mapping**. Only explicitly marked runtime bones are matched; every other source record remains unchanged. Non-skinning structural nodes such as `game_mesh` are excluded. When the union contract contains several structural variants of a marked bone, only variants compatible with the target bone's parent are selected.
 5. Leave **Basis mode** at `Preserved` and **Capability** at `Automatic`.
 6. Click **Validate Target** and require `linear_rest_translation` for the Stage-1 runtime. If validation selects `full_native_pose`, review the marked bones or deliberately use position normalization; do not deploy it to the Stage-1 runtime.
@@ -100,7 +100,7 @@ Apply the armature object's transforms before export. Shape changes belong in Ed
 
 The selected Blender armature contains bone names, hierarchy, and its current rest pose. It does not reliably contain the original unmodified rest pose, exact patch unit IDs, LOD-specific `RealIndices`, IB-table hashes, slot-to-bone mappings, or active profile hashes. Those values are necessary to calculate a delta instead of mistaking the target as the baseline, and to tell the runtime which exact table entries may be changed.
 
-Consequently, removing the contract would make the export ambiguous or force the runtime back to hardcoded slot assumptions. Version 1.1 keeps the contract but treats it as remembered metadata: imported/duplicated armatures carry its path, and a saved `.blend` with exactly one adjacent `*.hd2source.json` resolves it automatically. An independently imported avatar armature needs the contract selected once.
+Consequently, removing the contract would make the export ambiguous or force the runtime back to hardcoded slot assumptions. Release builds bundle a versioned contract and use it automatically. The contract must be regenerated and the porter rebuilt when the selected patch/profile set changes; a development build without the bundled asset retains the external selector.
 
 The headless equivalent is:
 

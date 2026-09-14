@@ -10,6 +10,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import zipfile
 
 from rig_sidecar_pipeline_test import semantic_bundle
 
@@ -88,6 +89,19 @@ def main() -> int:
         source = build_source_reference(str(root), str(profiles), roles)
         source_path = pathlib.Path(temporary) / "source.hd2source.json"
         source_path.write_bytes(canonical_bytes(source))
+        porter_zip = pathlib.Path(temporary) / "porter.zip"
+        command = [sys.executable, str(ROOT / "tools" / "build_blender_porter.py"),
+                   "--source", str(source_path), "--out", str(porter_zip)]
+        completed = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, check=False)
+        if completed.returncode:
+            raise AssertionError(completed.stdout)
+        with zipfile.ZipFile(porter_zip) as archive:
+            if "source.hd2source.json" not in archive.namelist():
+                raise AssertionError("Blender porter omitted its bundled source contract")
+            bundled = json.loads(archive.read("source.hd2source.json"))
+            if bundled["source_definition_id"] != source["source_definition_id"]:
+                raise AssertionError("Blender porter bundled the wrong source contract")
         second = build_source_reference(str(root), str(profiles), roles)
         if canonical_bytes(source) != canonical_bytes(second):
             raise AssertionError("source reference export is not deterministic")
