@@ -85,10 +85,22 @@ With the game stopped:
 2. Create `Helldivers 2\bin\HD2ArmatureProfiles`.
 3. Copy the desired `.hd2profile` files into that directory.
 4. Put their filenames, one per line, in `active_profiles.txt` in the same directory.
+5. For the shoulder test, copy a target map as `shoulder_targets.txt` in that directory.
 
 If `active_profiles.txt` is absent, the add-on loads every `.hd2profile` in the directory. An explicit list is recommended because it prevents stale profiles from silently becoming active.
 
-The add-on validates profile structure and checksums, then looks only for complete exact 48-byte-per-entry table matches. `F9` requests a rescan. The standalone console reports loaded files, tables, errors, unit IDs, LOD masks, entry counts, and matched addresses.
+The add-on validates profile structure and checksums, then looks only for complete exact 48-byte-per-entry table matches. `F8` toggles the configured shoulder narrowing and restores the exact source bytes on the next press. `F9` restores an active shoulder edit and requests a rescan. The standalone console reports loaded files, tables, errors, unit IDs, LOD masks, entry counts, matched addresses, and shoulder toggle state.
+
+`shoulder_targets.txt` uses one target per line:
+
+```text
+unit_id  slot  world_x  world_y  world_z
+```
+
+Blank lines and `#` comments are accepted. The supplied
+`profiles/lacrima_dump_shoulder_targets.txt` moves each mapped left shoulder
+`+0.08 m` on X and each right shoulder `-0.08 m` on X. These unit/slot mappings
+come from the offline scene-graph and palette census of the Lacrima patch set.
 
 ## Automated validation
 
@@ -122,4 +134,4 @@ Telemetry is written to `%LOCALAPPDATA%\HD2ArmatureAdjuster\telemetry.json`; tes
 
 ## Scope
 
-This proves external-profile-driven inverse-bind discovery and reversible slot control. It does not yet provide semantic bone names, vertex-to-slot ownership, an interactive editor, or an automatic choice of which unit/slot a user intends to change. Those require additional offline metadata and mapping stages.
+This proves external-profile-driven inverse-bind discovery and reversible slot control. The F8 test adds one external, patch-derived semantic mapping for left and right shoulders. It does not yet provide a general naming database, hierarchy-aware edits, or an interactive editor.

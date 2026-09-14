@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -148,9 +149,17 @@ std::atomic<bool> g_edit_requested { false };
 std::atomic<bool> g_edit_active { false };
 edit_request g_requested_edit;
 edit_state g_edit;
+std::vector<edit_request> g_shoulder_targets;
+std::string g_shoulder_error;
+std::atomic<bool> g_shoulder_pending { false };
+std::atomic<bool> g_shoulder_active { false };
+uint64_t g_shoulder_toggles = 0;
 
 const char *experiment_mode_name()
 {
+	if (g_shoulder_pending.load(std::memory_order_relaxed) ||
+		g_shoulder_active.load(std::memory_order_relaxed))
+		return "shoulder_narrow_toggle";
 	return g_edit_requested.load(std::memory_order_relaxed) ?
 		"converted_ib_edit" : "converted_ib_scan";
 }
@@ -344,6 +353,74 @@ void load_profiles()
 		}
 		++g_profile_files;
 	}
+}
+
+void load_shoulder_targets()
+{
+	g_shoulder_targets.clear();
+	g_shoulder_error.clear();
+	std::vector<uint8_t> bytes;
+	if (!read_file(g_profile_directory + L"\\shoulder_targets.txt", bytes))
+	{
+		g_shoulder_error = "shoulder_targets.txt is missing or empty";
+		return;
+	}
+
+	std::istringstream lines(std::string(bytes.begin(), bytes.end()));
+	std::string line;
+	uint32_t line_number = 0;
+	while (std::getline(lines, line))
+	{
+		++line_number;
+		if (!line.empty() && line.back() == '\r')
+			line.pop_back();
+		if (const size_t comment = line.find('#'); comment != std::string::npos)
+			line.erase(comment);
+		std::istringstream fields(line);
+		std::string unit_text, extra;
+		edit_request target;
+		if (!(fields >> unit_text))
+			continue;
+		if (!(fields >> target.slot >> target.world_translation[0] >>
+			target.world_translation[1] >> target.world_translation[2]) || fields >> extra ||
+			unit_text.size() != 16)
+		{
+			g_shoulder_error = "invalid shoulder target on line " + std::to_string(line_number);
+			g_shoulder_targets.clear();
+			return;
+		}
+		const auto parsed = std::from_chars(unit_text.data(), unit_text.data() + unit_text.size(),
+			target.unit_id, 16);
+		if (parsed.ec != std::errc() || parsed.ptr != unit_text.data() + unit_text.size() ||
+			target.slot == UINT32_MAX ||
+			!std::all_of(target.world_translation.begin(), target.world_translation.end(),
+				[](float value) { return std::isfinite(value) && std::fabs(value) <= k_max_edit_translation; }) ||
+			std::all_of(target.world_translation.begin(), target.world_translation.end(),
+				[](float value) { return value == 0.0f; }))
+		{
+			g_shoulder_error = "invalid shoulder target on line " + std::to_string(line_number);
+			g_shoulder_targets.clear();
+			return;
+		}
+		const bool available = std::any_of(g_profiles.begin(), g_profiles.end(),
+			[&target](const loaded_table_profile &profile) {
+				return profile.unit_id == target.unit_id && target.slot < profile.entries;
+			});
+		const bool duplicate = std::any_of(g_shoulder_targets.begin(), g_shoulder_targets.end(),
+			[&target](const edit_request &loaded) {
+				return loaded.unit_id == target.unit_id && loaded.slot == target.slot;
+			});
+		if (!available || duplicate)
+		{
+			g_shoulder_error = "unmatched or duplicate shoulder target on line " +
+				std::to_string(line_number);
+			g_shoulder_targets.clear();
+			return;
+		}
+		g_shoulder_targets.push_back(target);
+	}
+	if (g_shoulder_targets.empty())
+		g_shoulder_error = "shoulder_targets.txt contains no targets";
 }
 
 bool writable_private_page(const MEMORY_BASIC_INFORMATION &info)
@@ -556,59 +633,65 @@ bool has_requested_target()
 	});
 }
 
-bool begin_edit(std::chrono::steady_clock::time_point now)
+bool begin_edits(const std::vector<edit_request> &requests)
 {
-	if (g_hunt_phase.load(std::memory_order_acquire) != 2)
+	if (g_hunt_phase.load(std::memory_order_acquire) != 2 || requests.empty())
+		return false;
+	if (g_edit_active.load(std::memory_order_acquire))
 		return false;
 	std::lock_guard lock(g_mutex);
 	g_active_targets.clear();
 	g_edit = {};
 	g_edit.requested = true;
-	g_edit.slot = g_requested_edit.slot;
-	const size_t slot_offset = static_cast<size_t>(g_requested_edit.slot) *
-		armature_profile::transform_stride;
+	g_edit.slot = requests.size() == 1 ? requests.front().slot : UINT32_MAX;
 	std::vector<uintptr_t> considered;
 
-	for (const converted_hit &hit : g_hits)
+	for (const edit_request &request : requests)
 	{
-		if (hit.profile_index >= g_profiles.size())
-			continue;
-		const loaded_table_profile &profile = g_profiles[hit.profile_index];
-		if (profile.unit_id != g_requested_edit.unit_id || g_requested_edit.slot >= profile.entries)
-			continue;
-		const uintptr_t address = hit.address + slot_offset;
-		if (std::find(considered.begin(), considered.end(), address) != considered.end())
-			continue;
-		considered.push_back(address);
-		++g_edit.targets_selected;
-		active_target target;
-		target.address = address;
-		std::memcpy(target.original.data(), profile.t48.data() + slot_offset, target.original.size());
-		armature_probe::translate_world_t48(target.original.data(),
-			g_requested_edit.world_translation[0], g_requested_edit.world_translation[1],
-			g_requested_edit.world_translation[2], target.injected.data());
-		if (target.original == target.injected)
+		const size_t slot_offset = static_cast<size_t>(request.slot) *
+			armature_profile::transform_stride;
+		for (const converted_hit &hit : g_hits)
 		{
-			++g_edit.stale_skips;
-			continue;
+			if (hit.profile_index >= g_profiles.size())
+				continue;
+			const loaded_table_profile &profile = g_profiles[hit.profile_index];
+			if (profile.unit_id != request.unit_id || request.slot >= profile.entries)
+				continue;
+			const uintptr_t address = hit.address + slot_offset;
+			if (std::find(considered.begin(), considered.end(), address) != considered.end())
+				continue;
+			considered.push_back(address);
+			++g_edit.targets_selected;
+			active_target target;
+			target.address = address;
+			std::memcpy(target.original.data(), profile.t48.data() + slot_offset,
+				target.original.size());
+			armature_probe::translate_world_t48(target.original.data(),
+				request.world_translation[0], request.world_translation[1],
+				request.world_translation[2], target.injected.data());
+			if (target.original == target.injected)
+			{
+				++g_edit.stale_skips;
+				continue;
+			}
+			std::array<uint8_t, armature_profile::transform_stride> current {};
+			if (!read_process_bytes(address, current.data(), current.size()) || current != target.original)
+			{
+				++g_edit.stale_skips;
+				continue;
+			}
+			++g_edit.write_attempts;
+			if (!write_process_bytes(address, target.injected.data(), target.injected.size()) ||
+				!read_process_bytes(address, current.data(), current.size()) || current != target.injected)
+			{
+				write_process_bytes(address, target.original.data(), target.original.size());
+				continue;
+			}
+			++g_edit.write_successes;
+			++g_edit.immediate_readbacks;
+			++g_edit.targets_written;
+			g_active_targets.push_back(target);
 		}
-		std::array<uint8_t, armature_profile::transform_stride> current {};
-		if (!read_process_bytes(address, current.data(), current.size()) || current != target.original)
-		{
-			++g_edit.stale_skips;
-			continue;
-		}
-		++g_edit.write_attempts;
-		if (!write_process_bytes(address, target.injected.data(), target.injected.size()) ||
-			!read_process_bytes(address, current.data(), current.size()) || current != target.injected)
-		{
-			write_process_bytes(address, target.original.data(), target.original.size());
-			continue;
-		}
-		++g_edit.write_successes;
-		++g_edit.immediate_readbacks;
-		++g_edit.targets_written;
-		g_active_targets.push_back(target);
 	}
 
 	g_edit.active = !g_active_targets.empty();
@@ -618,6 +701,13 @@ bool begin_edit(std::chrono::steady_clock::time_point now)
 		return false;
 	}
 	g_edit_active.store(true, std::memory_order_release);
+	return true;
+}
+
+bool begin_edit(std::chrono::steady_clock::time_point now)
+{
+	if (!begin_edits({ g_requested_edit }))
+		return false;
 	g_automation_deadline = now + std::chrono::seconds(1);
 	g_automation_stage = 10;
 	return true;
@@ -694,6 +784,56 @@ void end_edit()
 	if (!g_edit.restore_succeeded)
 		g_edit.error = 3;
 	g_active_targets.clear();
+}
+
+void toggle_shoulder_edit()
+{
+	++g_shoulder_toggles;
+	if (g_shoulder_pending.exchange(false, std::memory_order_acq_rel))
+	{
+		g_shoulder_error.clear();
+		return;
+	}
+	if (g_shoulder_active.load(std::memory_order_acquire))
+	{
+		end_edit();
+		g_shoulder_active.store(false, std::memory_order_release);
+		g_edit.completed = true;
+		return;
+	}
+	if (g_edit_active.load(std::memory_order_acquire))
+	{
+		g_shoulder_error = "another edit is already active";
+		return;
+	}
+	if (g_shoulder_targets.empty())
+		return;
+	g_shoulder_error.clear();
+	g_shoulder_pending.store(true, std::memory_order_release);
+	if (g_hunt_phase.load(std::memory_order_acquire) == 3)
+		request_rescan();
+}
+
+void service_shoulder_edit()
+{
+	if (!g_shoulder_pending.load(std::memory_order_acquire))
+		return;
+	const uint32_t phase = g_hunt_phase.load(std::memory_order_acquire);
+	if (phase == 0)
+	{
+		ensure_hunt_thread();
+		return;
+	}
+	if (phase == 1)
+		return;
+	if (phase != 2 || !begin_edits(g_shoulder_targets))
+	{
+		g_shoulder_error = "no mapped shoulder table is currently resident";
+		g_shoulder_pending.store(false, std::memory_order_release);
+		return;
+	}
+	g_shoulder_active.store(true, std::memory_order_release);
+	g_shoulder_pending.store(false, std::memory_order_release);
 }
 
 void initialize_runtime_files()
@@ -1086,7 +1226,7 @@ void draw_console(uint32_t draws)
 	for (const auto &[unused, buffer] : g_buffers)
 		mapped += buffer.map_ptr != nullptr;
 	out << "\x1b[2J\x1b[H"
-		<< "HD2 Armature Profile Runtime 0.7  |  " << experiment_mode_name() << "  |  D3D12\n\n"
+		<< "HD2 Armature Profile Runtime 0.8  |  " << experiment_mode_name() << "  |  D3D12\n\n"
 		<< "frame " << g_frame << "  draws " << draws << "  buffers " << g_buffers.size()
 		<< " (mapped " << mapped << ")\n"
 		<< "profiles " << g_profile_files << " files / " << g_profiles.size()
@@ -1099,10 +1239,17 @@ void draw_console(uint32_t draws)
 		<< static_cast<double>(g_hunt_bytes.load(std::memory_order_relaxed)) / (1024.0 * 1024.0)
 		<< " MiB  partial " << g_partial_candidates.load(std::memory_order_relaxed)
 		<< " (best " << g_best_partial_entries.load(std::memory_order_relaxed) << ")\n"
-		<< "F9 rescan\n"
+		<< "F8 shoulder narrowing "
+		<< (g_shoulder_active.load(std::memory_order_relaxed) ? "ACTIVE" :
+			g_shoulder_pending.load(std::memory_order_relaxed) ? "pending" : "off")
+		<< " (" << g_shoulder_targets.size() << " mapped slots)  |  F9 rescan\n"
 		<< "edit " << (g_edit.active ? "ACTIVE" : g_edit.completed ? "complete" :
-			g_edit.requested ? "armed" : "off")
-		<< "  slot " << (g_edit.slot == UINT32_MAX ? 0 : g_edit.slot)
+			g_edit.requested ? "armed" : "off") << "  slot ";
+	if (g_edit.slot == UINT32_MAX)
+		out << "multi";
+	else
+		out << g_edit.slot;
+	out
 		<< "  targets " << g_edit.targets_written << '/' << g_edit.targets_selected
 		<< "  writes " << g_edit.write_successes << '/' << g_edit.write_attempts
 		<< "  refills " << g_edit.refills_observed
@@ -1120,6 +1267,8 @@ void draw_console(uint32_t draws)
 	}
 	for (const std::string &error : g_profile_errors)
 		out << "PROFILE ERROR: " << error << '\n';
+	if (!g_shoulder_error.empty())
+		out << "SHOULDER ERROR: " << g_shoulder_error << '\n';
 	console_write(out.str());
 }
 
@@ -1162,7 +1311,7 @@ void write_telemetry(uint32_t draws)
 
 	std::ostringstream json;
 	json << "{\n"
-		<< "  \"schema\": 4,\n"
+		<< "  \"schema\": 5,\n"
 		<< "  \"addon\": \"HD2 Armature Profile Runtime\",\n"
 		<< "  \"experiment_mode\": \"" << experiment_mode_name() << "\",\n"
 		<< "  \"api_version\": " << RESHADE_API_VERSION << ",\n"
@@ -1180,6 +1329,13 @@ void write_telemetry(uint32_t draws)
 		<< "  \"profile_duplicate_records\": " << profile_duplicates << ",\n"
 		<< "  \"profile_tables_loaded\": " << profiles.size() << ",\n"
 		<< "  \"profile_load_errors\": " << profile_errors.size() << ",\n"
+		<< "  \"shoulder_config_targets\": " << g_shoulder_targets.size() << ",\n"
+		<< "  \"shoulder_toggle_pending\": "
+		<< (g_shoulder_pending.load(std::memory_order_relaxed) ? "true" : "false") << ",\n"
+		<< "  \"shoulder_narrow_active\": "
+		<< (g_shoulder_active.load(std::memory_order_relaxed) ? "true" : "false") << ",\n"
+		<< "  \"shoulder_toggle_count\": " << g_shoulder_toggles << ",\n"
+		<< "  \"shoulder_error\": \"" << json_escape(g_shoulder_error) << "\",\n"
 		<< "  \"ib_hunt_phase\": " << g_hunt_phase.load(std::memory_order_relaxed) << ",\n"
 		<< "  \"ib_hunt_passes\": " << g_hunt_passes.load(std::memory_order_relaxed) << ",\n"
 		<< "  \"ib_hunt_bytes\": " << g_hunt_bytes.load(std::memory_order_relaxed) << ",\n"
@@ -1273,6 +1429,7 @@ void on_init_device(device *device)
 	g_hunt_not_before = std::chrono::steady_clock::now() + std::chrono::seconds(10);
 	initialize_runtime_files();
 	load_profiles();
+	load_shoulder_targets();
 	open_console();
 }
 
@@ -1287,6 +1444,9 @@ void on_destroy_device(device *device)
 	g_hits.clear();
 	g_profiles.clear();
 	g_active_targets.clear();
+	g_shoulder_targets.clear();
+	g_shoulder_pending.store(false, std::memory_order_release);
+	g_shoulder_active.store(false, std::memory_order_release);
 	g_device = nullptr;
 }
 
@@ -1347,11 +1507,22 @@ void on_present(command_queue *queue, swapchain *, const rect *, const rect *, u
 	++g_frame;
 	const uint32_t draws = g_draws.exchange(0, std::memory_order_relaxed);
 	g_last_draws.store(draws, std::memory_order_relaxed);
+	if ((GetAsyncKeyState(VK_F8) & 1) && game_has_focus())
+		toggle_shoulder_edit();
 	if (GetAsyncKeyState(VK_F9) & 1)
+	{
+		if (g_shoulder_active.load(std::memory_order_acquire))
+		{
+			end_edit();
+			g_shoulder_active.store(false, std::memory_order_release);
+		}
+		g_shoulder_pending.store(false, std::memory_order_release);
 		request_rescan();
+	}
 	if (g_hunt_phase.load(std::memory_order_acquire) == 0 &&
 		std::chrono::steady_clock::now() >= g_hunt_not_before)
 		ensure_hunt_thread();
+	service_shoulder_edit();
 	maintain_edit();
 	draw_console(draws);
 	write_telemetry(draws);
@@ -1360,7 +1531,10 @@ void on_present(command_queue *queue, swapchain *, const rect *, const rect *, u
 void on_reshade_present(effect_runtime *runtime)
 {
 	if (runtime->get_device() == g_device)
+	{
+		g_game_window = static_cast<HWND>(runtime->get_hwnd());
 		run_automation(runtime);
+	}
 }
 }
 

@@ -1,0 +1,8 @@
+# unit_id         slot  world_x  world_y  world_z
+# Slim left/right arm undergarments: l_shoulder / r_shoulder
+adb5d7b476e79121  5      0.08     0.0      0.0
+2ce2b973e335f79c  5     -0.08     0.0      0.0
+
+# Slim torso undergarment: l_shoulder / r_shoulder
+dd66041f2f232ac3  18     0.08     0.0      0.0
+dd66041f2f232ac3  83    -0.08     0.0      0.0
