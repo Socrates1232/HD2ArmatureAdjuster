@@ -78,21 +78,28 @@ Run the same export twice if reproducibility matters; byte-identical inputs prod
 
 ## 2. Author a target in Blender
 
-Install `hd2_armature_porter-1.0.0.zip` through Blender's **Preferences → Get Extensions → Install from Disk**. In the 3D View sidebar, open **HD2AA**.
+Install `hd2_armature_porter-1.1.0.zip` through Blender's **Preferences → Get Extensions → Install from Disk**. In the 3D View sidebar, open **HD2AA**.
 
-The safest path is:
+For an armature already modified from an exported HD2 avatar rig:
 
-1. Select `source.hd2source.json`.
-2. Click **Import Source Armature**.
-3. Click **Duplicate Source as Target**.
-4. Enter Edit Mode on `HD2AA_Target` and move bone heads/rest positions. Do not reparent or edit the root.
-5. Leave **Basis mode** at `Preserved` and **Capability** at `Automatic`.
-6. Click **Validate Target**.
-7. Choose an output ending in `.hd2rig.json`, then click **Export HD2RIG1**.
+1. Select the modified armature object and click **Use Selected Armature**.
+2. If the armature already carries `hd2_source_reference`, the add-on resolves it automatically. Otherwise select the generated `*.hd2source.json` once. A `.patch_N` file is not a source contract.
+3. Optionally click **Check Automatic Mapping**. Exact-name matching is performed automatically during validation, so this is only a coverage preview.
+4. Leave **Basis mode** at `Preserved` and **Capability** at `Automatic`.
+5. Click **Validate Target**. Source-only bones absent from this particular avatar armature remain unchanged; every mapped bone must preserve the expected parent relationship.
+6. Choose an output ending in `.hd2rig.json`, then click **Validate & Export Port**.
 
-For an independently created but name-compatible armature, select it as **Target** and click **Map Stable IDs by Exact Name**. The mapper expands one display-name match to every structurally distinct stable source identity and validates the corresponding parent names. Stable IDs, not names, are written into the package contract.
+Exact-name mapping expands one display-name match to every structurally distinct stable source identity. Stable IDs, not names, are written into the package contract.
+
+The alternate source-first workflow remains available: select the contract, click **Import Source**, click **Duplicate Imported Source**, and make rest-pose changes to that duplicate.
 
 Apply the armature object's transforms before export. Shape changes belong in Edit Mode; Pose Mode animation is not exported as a rest-armature adaptation.
+
+### Why the source contract remains necessary
+
+The selected Blender armature contains bone names, hierarchy, and its current rest pose. It does not reliably contain the original unmodified rest pose, exact patch unit IDs, LOD-specific `RealIndices`, IB-table hashes, slot-to-bone mappings, or active profile hashes. Those values are necessary to calculate a delta instead of mistaking the target as the baseline, and to tell the runtime which exact table entries may be changed.
+
+Consequently, removing the contract would make the export ambiguous or force the runtime back to hardcoded slot assumptions. Version 1.1 keeps the contract but treats it as remembered metadata: imported/duplicated armatures carry its path, and a saved `.blend` with exactly one adjacent `*.hd2source.json` resolves it automatically. An independently imported avatar armature needs the contract selected once.
 
 The headless equivalent is:
 
