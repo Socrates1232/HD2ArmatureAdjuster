@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Prepare patch copies with runtime-locatable, unweighted palette markers."""
+"""Prepare patch copies with arm control slots and runtime-locatable markers."""
 
 from __future__ import annotations
 
@@ -73,18 +73,25 @@ def bone_hash(name: str) -> int:
 
 def branch_side(node: int, parents: list[tuple[int, int]],
                 left: int | None, right: int | None) -> str:
+    return branch_membership(node, parents, left, right)[0]
+
+
+def branch_membership(node: int, parents: list[tuple[int, int]],
+                      left: int | None, right: int | None) -> tuple[str, int | None]:
     seen = set()
+    depth = 0
     while 0 <= node < len(parents) and node not in seen:
         if node == left:
-            return "left"
+            return "left", depth
         if node == right:
-            return "right"
+            return "right", depth
         seen.add(node)
         has_parent, parent = parents[node]
         if not has_parent or parent == node:
             break
         node = parent
-    return "other"
+        depth += 1
+    return "other", None
 
 
 def read_bone_info(unit: bytes) -> dict:
@@ -149,7 +156,7 @@ def serialize_bone_info(lods: list[dict]) -> bytes:
     return bytes(output)
 
 
-def grow_unit(unit: bytes, added: int) -> tuple[bytes, list[dict]]:
+def grow_unit(unit: bytes, tail_repeats: int) -> tuple[bytes, list[dict]]:
     parents, hashes = read_scene(unit)
     left_hits = [i for i, value in enumerate(hashes) if value == bone_hash("l_shoulder")]
     right_hits = [i for i, value in enumerate(hashes) if value == bone_hash("r_shoulder")]
@@ -163,6 +170,16 @@ def grow_unit(unit: bytes, added: int) -> tuple[bytes, list[dict]]:
     marker_lods = []
     grown = []
     for item in bone["lods"]:
+        controls = []
+        for source_slot, node in enumerate(item["real"]):
+            if source_slot == 0:
+                continue  # HD2's uploaded palette starts at table slot 1.
+            side, depth = branch_membership(node, parents, left, right)
+            if side in ("left", "right"):
+                controls.append({"source_slot": source_slot,
+                                 "control_slot": item["count"] + len(controls),
+                                 "node": node, "side": side, "depth": depth})
+        added = len(controls) + 1 + tail_repeats
         if item["count"] + added > MAX_PALETTE:
             raise ValueError(f"LOD {item['lod']} palette exceeds {MAX_PALETTE} entries")
         donor = next((slot for slot, node in enumerate(item["real"])
@@ -171,14 +188,28 @@ def grow_unit(unit: bytes, added: int) -> tuple[bytes, list[dict]]:
         donor_node = item["real"][donor]
         probe_matrix, _ = translate_world_file64(
             donor_matrix, (added * 0.0001, 0.0, 0.0))
+        control_matrices = b"".join(
+            item["inverse_binds"][control["source_slot"] * 64:
+                                  (control["source_slot"] + 1) * 64]
+            for control in controls)
+        control_nodes = [control["node"] for control in controls]
+        control_for = {control["source_slot"]: control["control_slot"]
+                       for control in controls}
+        remaps = [[control_for.get(slot, slot) for slot in remap]
+                  for remap in item["remaps"]]
+        probe_slot = item["count"] + len(controls)
         grown.append({"lod": item["lod"], "count": item["count"] + added,
-                      "inverse_binds": item["inverse_binds"] + probe_matrix +
-                                       donor_matrix * (added - 1),
-                      "real": item["real"] + [donor_node] * added,
-                      "remaps": item["remaps"]})
-        marker_lods.append({"lod": item["lod"], "probe_slot": item["count"],
+                      "inverse_binds": item["inverse_binds"] + control_matrices +
+                                       probe_matrix + donor_matrix * tail_repeats,
+                      "real": item["real"] + control_nodes +
+                              [donor_node] * (tail_repeats + 1),
+                      "remaps": remaps})
+        marker_lods.append({"lod": item["lod"],
+                            "first_control_slot": item["count"],
+                            "probe_slot": probe_slot,
                             "entries": item["count"] + added,
-                            "donor_slot": donor, "donor_node": donor_node})
+                            "donor_slot": donor, "donor_node": donor_node,
+                            "controls": controls})
 
     new_section = serialize_bone_info(grown)
     section_offsets = [struct.unpack_from("<I", unit, field)[0] for field in SECTION_FIELDS]
@@ -292,7 +323,7 @@ def prepare_pose_tree(root: str, output_root: str, marker_min: int) -> dict:
                            entry["type_id"] == UNIT_TYPE)
             unit = bundle[current["data_offset"]:current["data_offset"] + current["data_size"]]
             tail_repeats = repeats[unit_plan["signature"]]
-            grown, lods = grow_unit(unit, tail_repeats + 1)
+            grown, lods = grow_unit(unit, tail_repeats)
             bundle = replace_bundle_unit(bundle, unit_plan["unit_id"], grown)
             marked_units.append({"unit_id": f"{unit_plan['unit_id']:016x}",
                                  "variant": unit_plan["signature"],
@@ -310,10 +341,15 @@ def prepare_pose_tree(root: str, output_root: str, marker_min: int) -> dict:
                 key = (int(marked["unit_id"], 16), fnv1a(table), lod["count"])
                 record = marker_records.setdefault(key, {
                     "unit_id": marked["unit_id"], "table_key": f"{key[1]:016x}",
-                    "entries": lod["count"], "probe_slot": marker_lod["probe_slot"],
-                    "tail_repeats": marked["tail_repeats"], "sources": []})
-                expected = (marker_lod["probe_slot"], marked["tail_repeats"])
-                if (record["probe_slot"], record["tail_repeats"]) != expected:
+                    "entries": lod["count"],
+                    "first_control_slot": marker_lod["first_control_slot"],
+                    "probe_slot": marker_lod["probe_slot"],
+                    "tail_repeats": marked["tail_repeats"],
+                    "controls": marker_lod["controls"], "sources": []})
+                expected = (marker_lod["first_control_slot"], marker_lod["probe_slot"],
+                            marked["tail_repeats"], marker_lod["controls"])
+                if (record["first_control_slot"], record["probe_slot"], record["tail_repeats"],
+                        record["controls"]) != expected:
                     raise ValueError("one runtime table received conflicting marker layouts")
                 record["sources"].append({"patch": patch["relative"], "lod": lod["lod"]})
         patch_reports.append({"patch": patch["relative"], "units": marked_units})

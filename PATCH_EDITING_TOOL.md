@@ -122,17 +122,25 @@ python tools\patch_profile_tool.py pose-tree `
 ```
 
 This is the complete post-build hook for the dynamic armature path. It copies
-the tree, appends an unweighted probe plus repeated tail to shoulder-bearing
-palettes, profiles the marked patches, unions redundant runtime tables, and
-generates `palette_markers.txt` plus a uniform full-arm `shoulder_targets.txt`.
+the tree, duplicates every arm-descendant palette slot, redirects material
+remaps to those controls, appends an immutable delimiter/repeated tail, profiles
+the marked patches, unions redundant runtime tables, and generates
+`palette_markers.txt` plus a uniform full-arm `shoulder_targets.txt`.
 The original tree is never modified and the output cannot be a game directory.
 The left/right vectors configure the two logical shoulder corrections; every
 selected descendant inherits its side's request and receives a pose-derived IB
 matrix at runtime.
 
-The repeated tail identifies the palette layout in mapped GPU-upload memory.
-The probe is changed only at runtime and carries a table-instance code and
-revision, allowing the add-on to reject stale palettes. Neither marker is added
-to remap/weight arrays, so the new slots do not directly affect vertices. Each
-replacement variant needs marking because its palette shape may differ, while
-identical runtime tables are still represented once in the active profile union.
+Original arm slots remain byte-pristine and supply the live animated matrices.
+Vertices use the duplicate controls through the rewritten remaps. The repeated
+tail identifies the palette layout in mapped GPU-upload memory; ownership is
+checked by reconstructing a plausible skeleton from original slots. The marker
+itself is never changed at runtime. Each replacement variant needs processing
+because its palette shape may differ, while identical runtime tables are still
+represented once in the active profile union.
+
+Generated target rows are:
+
+```text
+unit_id table_fingerprint control_slot source_slot world_x world_y world_z
+```

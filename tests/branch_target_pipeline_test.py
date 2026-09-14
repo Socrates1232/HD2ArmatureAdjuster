@@ -48,9 +48,10 @@ def bone_block(real: list[int], seed: float) -> bytes:
     matrix_offset = 16
     real_offset = matrix_offset + 64 * count
     figure_offset = real_offset + 4 * count
+    fake = struct.pack("<3I", 1, 12, count) + struct.pack(f"<{count}I", *range(count))
     return (struct.pack("<4I", count, matrix_offset, real_offset, figure_offset) +
             b"".join(matrix(seed + index / 10) for index in range(count)) +
-            struct.pack(f"<{count}I", *real) + struct.pack("<I", 0))
+            struct.pack(f"<{count}I", *real) + fake)
 
 
 def synthetic_bundle(ambiguous: bool) -> bytes:

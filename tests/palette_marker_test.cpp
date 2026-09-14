@@ -7,7 +7,7 @@
 int main()
 {
 	using namespace armature_probe;
-	constexpr uint32_t entries = 21, probe_slot = 12, repeats = 8;
+	constexpr uint32_t entries = 21, first_control = 8, probe_slot = 12, repeats = 8;
 	std::vector<uint8_t> bytes(64 + static_cast<size_t>(entries - 1) * 48 + 64, 0xA5);
 	const size_t palette = 64;
 	for (uint32_t element = 0; element < entries - 1; ++element)
@@ -18,7 +18,8 @@ int main()
 		encode_t48(value, bytes.data() + palette + static_cast<size_t>(element) * 48);
 	}
 	const std::vector<palette_marker> markers {
-		{ 1, 2, entries, probe_slot, repeats }, { 3, 4, entries, probe_slot, repeats + 3 }
+		{ 1, 2, entries, first_control, probe_slot, repeats },
+		{ 3, 4, entries, first_control, probe_slot, repeats + 3 }
 	};
 	const auto hits = find_palette_markers(bytes.data(), bytes.size(), markers);
 	if (hits.size() != 1 || hits[0].marker_index != 0 || hits[0].palette_offset != palette ||

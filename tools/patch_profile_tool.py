@@ -153,14 +153,53 @@ def marker_slots(profile_directory: str | None) -> dict[tuple[int, int], int]:
             if not line:
                 continue
             fields = line.split()
-            if len(fields) != 5:
-                raise ValueError(f"palette_markers.txt:{line_number}: expected five fields")
+            if len(fields) not in (5, 6):
+                raise ValueError(f"palette_markers.txt:{line_number}: expected five or six fields")
             unit_id, table_key = int(fields[0], 16), int(fields[1], 16)
-            entries, probe_slot, tail_repeats = map(int, fields[2:])
+            entries = int(fields[2])
+            probe_slot = int(fields[-2])
+            tail_repeats = int(fields[-1])
             if probe_slot + tail_repeats + 1 != entries:
                 raise ValueError(f"palette_markers.txt:{line_number}: marker is not the table tail")
             result[(unit_id, table_key)] = probe_slot
     return result
+
+
+def generate_pose_targets(marker_result: dict, output_path: str, report_path: str,
+                          left_translation: tuple[float, float, float],
+                          right_translation: tuple[float, float, float]) -> dict:
+    targets = []
+    lines = [
+        "# unit_id table_fingerprint control_slot source_slot translate_x translate_y translate_z",
+        "# Vertices use control_slot; live animation is read from untouched source_slot.",
+    ]
+    for marker in marker_result["markers"]:
+        for control in marker["controls"]:
+            translation = left_translation if control["side"] == "left" else right_translation
+            target = {
+                "unit_id": marker["unit_id"], "table_key": marker["table_key"],
+                "control_slot": control["control_slot"],
+                "source_slot": control["source_slot"], "node": control["node"],
+                "side": control["side"], "depth": control["depth"],
+                "translation": list(translation),
+            }
+            targets.append(target)
+            values = " ".join(f"{value:+.9g}" for value in translation)
+            lines.append(f"{target['unit_id']} {target['table_key']} "
+                         f"{target['control_slot']} {target['source_slot']} {values}")
+    if not targets:
+        raise ValueError("no remapped arm control slots were generated")
+    report = {
+        "schema": 2, "operation": "generate_pose_control_targets",
+        "targets": targets,
+        "targets_by_side": {
+            "left": sum(target["side"] == "left" for target in targets),
+            "right": sum(target["side"] == "right" for target in targets),
+        },
+    }
+    write_atomic(output_path, ("\n".join(lines) + "\n").encode("utf-8"))
+    write_atomic(report_path, (json.dumps(report, indent=2) + "\n").encode("utf-8"))
+    return report
 
 
 def generate_branch_targets(root: str, output_path: str, report_path: str,
@@ -733,23 +772,21 @@ def main() -> int:
                                              "HD2ArmatureProfiles")
             profile_result = profile_tree(args.out_root, profile_directory, False)
             marker_lines = [
-                "# unit_id table_fingerprint entries probe_slot tail_repeats",
-                "# The probe is followed by an immutable repeated tail used for live-palette location.",
+                "# unit_id table_fingerprint entries first_control_slot delimiter_slot tail_repeats",
+                "# Original slots are animation sources; controls are followed by an immutable marker tail.",
             ]
             for marker in result["markers"]:
                 marker_lines.append(
                     f"{marker['unit_id']} {marker['table_key']} {marker['entries']} "
-                    f"{marker['probe_slot']} {marker['tail_repeats']}")
+                    f"{marker['first_control_slot']} {marker['probe_slot']} "
+                    f"{marker['tail_repeats']}")
             write_atomic(os.path.join(profile_directory, "palette_markers.txt"),
                          ("\n".join(marker_lines) + "\n").encode("utf-8"))
             write_atomic(os.path.join(profile_directory, "palette_markers.json"),
                          (json.dumps(result, indent=2) + "\n").encode("utf-8"))
-            targets = generate_branch_targets(
-                args.out_root,
-                os.path.join(profile_directory, "shoulder_targets.txt"),
-                os.path.join(profile_directory, "shoulder_targets.json"),
-                left, right,
-                profile_directory, -1, False)
+            targets = generate_pose_targets(
+                result, os.path.join(profile_directory, "shoulder_targets.txt"),
+                os.path.join(profile_directory, "shoulder_targets.json"), left, right)
             print(json.dumps({
                 "output_root": os.path.abspath(args.out_root),
                 "patches_marked": result["patches_marked"],

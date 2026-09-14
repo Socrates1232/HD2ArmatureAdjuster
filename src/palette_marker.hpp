@@ -15,6 +15,7 @@ struct palette_marker
 	uint64_t unit_id = 0;
 	uint64_t table_key = 0;
 	uint32_t entries = 0;
+	uint32_t first_control_slot = 0;
 	uint32_t probe_slot = 0;
 	uint32_t tail_repeats = 0;
 };

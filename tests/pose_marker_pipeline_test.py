@@ -10,11 +10,16 @@ import subprocess
 import sys
 import tempfile
 
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+
 from branch_target_pipeline_test import synthetic_bundle
+from build_ib_profile import file64_to_t48
+from extract_runtime_profile import fnv1a
+from pose_marker_pipeline import bundle_entries, read_bone_info
 
 
 PATCH = "0123456789abcdef.patch_0"
-ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 def digest(data: bytes) -> str:
@@ -59,16 +64,30 @@ def main() -> int:
         markers = [line.split() for line in
                    (profiles / "palette_markers.txt").read_text(encoding="utf-8").splitlines()
                    if line and not line.startswith("#")]
-        if len(markers) != 2 or any(row[2:] != ["17", "8", "8"] for row in markers):
+        if len(markers) != 2 or any(row[2:] != ["23", "8", "14", "8"] for row in markers):
             raise AssertionError(f"unexpected marker registry: {markers}")
         targets = [line.split() for line in
                    (profiles / "shoulder_targets.txt").read_text(encoding="utf-8").splitlines()
                    if line and not line.startswith("#")]
-        if len(targets) != 12 or any(int(row[2]) >= 8 for row in targets):
-            raise AssertionError("marker slots leaked into arm targets")
-        if {tuple(row[3:]) for row in targets} != {
+        if len(targets) != 12 or any(len(row) != 7 for row in targets):
+            raise AssertionError("pose targets do not map control slots to source slots")
+        if any(int(row[2]) not in range(8, 14) or int(row[3]) not in range(1, 8)
+               for row in targets):
+            raise AssertionError("control/source slot ranges are wrong")
+        if {tuple(row[4:]) for row in targets} != {
                 ("+0.04", "+0.01", "+0"), ("-0.04", "+0.01", "+0")}:
             raise AssertionError("arm descendants did not receive one uniform request per side")
+
+        bundle = (output / PATCH).read_bytes()
+        entry = bundle_entries(bundle)[0]
+        unit = bundle[entry["data_offset"]:entry["data_offset"] + entry["data_size"]]
+        for lod in read_bone_info(unit)["lods"]:
+            table_key = f"{fnv1a(file64_to_t48(lod['inverse_binds'])):016x}"
+            control_for = {int(row[3]): int(row[2]) for row in targets
+                           if row[0] == f"{entry['file_id']:016x}" and row[1] == table_key}
+            expected_remap = [control_for.get(slot, slot) for slot in range(8)]
+            if lod["remaps"] != [expected_remap]:
+                raise AssertionError(f"LOD {lod['lod']} did not redirect arm remaps")
 
     print("pose marker copy/profile/full-branch pipeline passed")
     return 0

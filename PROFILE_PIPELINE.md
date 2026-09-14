@@ -108,11 +108,14 @@ Every listed package is loaded and flattened into one runtime registry. Therefor
 If no active-list file exists, all profile files in the directory are loaded. This is useful for manual use but less reproducible than an explicit list.
 
 An optional `shoulder_targets.txt` in the same directory drives the F8 proof of
-concept. Each non-comment line contains `unit_id slot x y z`. It is kept
-separate from the table profiles because semantic slot mappings are per unit,
-while the profile packages describe exact patch-derived table variants. The
-add-on validates every configured unit/slot against the unioned active profiles
-before enabling the toggle.
+concept. The pose pipeline emits
+`unit_id table_fingerprint control_slot source_slot x y z`: vertices reference
+the duplicate control while animation is read from the untouched source. It is
+kept separate from the table profiles because semantic slot mappings are per
+table layout, while the profile packages describe exact patch-derived variants.
+The add-on validates both slots against the unioned active profiles before
+enabling the toggle. Legacy five- and six-field rows remain available for
+static diagnostics.
 
 ## Runtime identification
 

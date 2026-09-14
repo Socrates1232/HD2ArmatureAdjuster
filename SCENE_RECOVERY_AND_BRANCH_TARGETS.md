@@ -52,6 +52,12 @@ table is `OUR_OVERRIDE`; failed restore verification never reinjects the edit.
 
 ## Offline shoulder expansion
 
+The static `shoulder-targets` command below remains a diagnostic path. The
+current pose-aware path uses `pose-tree`, which duplicates every arm slot,
+redirects material remaps to the duplicates, and emits seven-field
+control/source rows. This prevents the full hierarchy correction from feeding
+back through the animated slots or distorting fingers at deeper levels.
+
 Run profile generation first, then:
 
 ```powershell

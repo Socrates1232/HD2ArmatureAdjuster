@@ -16,11 +16,11 @@ finished mod-tree copy
         v
 patch_profile_tool.py pose-tree
         |
-        +-- marked .patch_N   unweighted probe + repeated palette tail
+        +-- marked .patch_N   duplicated arm controls + remaps + marker tail
         +-- .hd2profile       exact converted IB tables + patch identity
         +-- palette_markers   live-palette locator metadata
         |
-        +-- shoulder_targets  scene graph + per-LOD RealIndices
+        +-- shoulder_targets  control slot -> untouched source slot + correction
                     |
                     +-- one uniform request for every arm descendant
                     |
@@ -79,12 +79,12 @@ python tools/patch_profile_tool.py pose-tree `
   --right-translate -0.03 0 0
 ```
 
-This appends one unweighted probe slot followed by a variant-specific repeated
-tail to every shoulder-bearing palette. GPU and stream companions are copied
-byte-identically. It then creates the active profile union, `palette_markers.txt`,
-and a full left/right arm-descendant target map. The marker lets the runtime
-associate an uploaded animated palette with both its unit layout and the exact
-inverse-bind revision that produced it.
+This duplicates every arm-descendant palette slot, redirects the material remaps
+from the original slots to those controls, and appends a delimiter plus a
+variant-specific repeated tail. GPU and stream companions are copied
+byte-identically. The original slots remain untouched animation carriers. The
+generated profile union, `palette_markers.txt`, and `shoulder_targets.txt` tell
+the runtime where each control and its corresponding source live.
 
 For static diagnostic experiments, `profile-tree` can still be followed by:
 
@@ -105,9 +105,11 @@ depth-three or deeper descendants are left pristine. This reaches zero at the
 hand before the finger chains, avoiding the per-finger rotations observed when
 the old uniform offset was propagated through the whole animated branch. Use
 `--falloff-depth -1` reproduces the old full-branch static diagnostic. The
-`pose-tree` command intentionally uses a uniform full branch: hierarchy chooses
-the affected slots, while runtime pose math derives each slot's required IB
-matrix instead of hardcoding a different displacement at every depth.
+`pose-tree` command intentionally uses a uniform full branch. Every descendant
+receives the same world-space translation through its own duplicate control, so
+the arm moves as one hierarchy instead of accumulating a hardcoded offset at
+each depth. Runtime pose math derives each control's IB from its untouched
+source slot.
 The two translation arguments are the only requested shoulder corrections;
 change them to tune width without editing code or individual descendants.
 
@@ -138,17 +140,17 @@ With the game stopped:
 
 If `active_profiles.txt` is absent, the add-on loads every `.hd2profile` in the directory. An explicit list is recommended because it prevents stale profiles from silently becoming active.
 
-The add-on validates profile structure and checksums, then looks only for complete exact 48-byte-per-entry table matches. One `F8` press records a persistent requested-ON state. With marker metadata present, the first guarded write changes only the unweighted probe. The add-on passively scans game-mapped upload buffers for the repeated tail, verifies the probe code/revision, and reconstructs each arm slot's current native skin transform. One common inward correction is then conjugated through each slot's live pose to derive the next IB table. Scene recovery rebinds new exact table instances and re-establishes the probe automatically. The next `F8` press requests OFF and restores only tables whose complete bytes still equal this add-on's expected override. `F9` manually requests a full discovery pass without changing the F8 state.
+The add-on validates profile structure and checksums, then looks only for complete exact 48-byte-per-entry table matches. One `F8` press records a persistent requested-ON state. With marker metadata present, the add-on passively locates the newest matching uploaded palette, checks its original slots against the profile's skeleton geometry, reads each untouched source slot's animated skin matrix, and derives the paired control-slot IB needed for one common inward correction. The marker is immutable; it is never used as a writable instance tag. Scene recovery rebinds new exact table instances and reacquires their palettes automatically. The next `F8` press requests OFF and restores only tables whose complete bytes still equal this add-on's expected override. `F9` manually requests a full discovery pass without changing the F8 state.
 
 `shoulder_targets.txt` uses one target per line:
 
 ```text
-unit_id  table_fingerprint  slot  world_x  world_y  world_z
+unit_id  table_fingerprint  control_slot  source_slot  world_x  world_y  world_z
 ```
 
-Blank lines and `#` comments are accepted. Legacy five-field unit-wide rows are
-still accepted for controlled experiments, but generated table-qualified rows
-are required for safe multi-LOD deployment.
+Blank lines and `#` comments are accepted. Legacy five- and six-field rows are
+still accepted for static controlled experiments; the pose-aware pipeline emits
+seven-field source/control rows.
 
 ## Automated validation
 
@@ -195,8 +197,8 @@ normalized across all logical processors and is included only for correlation.
 Every run also creates
 `%LOCALAPPDATA%\HD2ArmatureAdjuster\resource-monitor-<session>.csv`, with one row
 per second. It records scan requests and coalescing, full versus priority runs,
-bytes and CPU time spent scanning, live-palette bytes/hits and timing, pose
-updates/skips and timing, table-maintenance reads, rebind timing, and the game's
+bytes and CPU time spent scanning, live-palette bytes/hits/freshness and timing,
+pose candidates/ownership rejections/updates and timing, table-maintenance reads, rebind timing, and the game's
 working/private memory. Summarize the newest session with:
 
 ```powershell
@@ -212,7 +214,7 @@ sampling thread or change scan/rebind scheduling.
 This prototype now implements external-profile discovery, persistent edit
 intent, scene-change instance recovery, reversible writes, offline hierarchy
 selection, patch marker generation, live-palette association, and pose-derived
-full-arm IB updates. The pose-aware path has unit and offline tests but still
-requires its first in-game validation; the previously validated tapered static
-path remains the fallback when marker metadata is absent. A general naming
+full-arm IB updates. The source/control armature path has unit and real-patch
+offline validation and is the next in-game candidate; the previously validated
+tapered static path remains the fallback when marker metadata is absent. A general naming
 database and interactive editor remain future work.

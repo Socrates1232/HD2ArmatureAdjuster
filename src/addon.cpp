@@ -33,7 +33,7 @@ using namespace reshade::api;
 
 namespace
 {
-constexpr char k_runtime_version[] = "1.2";
+constexpr char k_runtime_version[] = "1.3";
 constexpr size_t k_scan_chunk_bytes = 4 * 1024 * 1024;
 constexpr size_t k_candidate_region_bytes = 64 * 1024;
 constexpr size_t k_max_hits = 256;
@@ -42,6 +42,7 @@ constexpr uint32_t k_max_profile_tables = 4096;
 constexpr float k_max_edit_translation = 10.0f;
 constexpr uint32_t k_stale_frames_before_retire = 3;
 constexpr size_t k_palette_scan_bytes = 4 * 1024 * 1024;
+constexpr size_t k_palette_track_bytes = 512 * 1024;
 
 enum class scan_reason : uint32_t
 {
@@ -84,9 +85,6 @@ struct active_target
 	uint32_t stale_frames = 0;
 	bool pose_aware = false;
 	size_t marker_index = SIZE_MAX;
-	uint32_t probe_slot = UINT32_MAX;
-	uint32_t probe_revision = 0;
-	float probe_code = 0.0f;
 	uint64_t last_palette_end = 0;
 };
 
@@ -97,6 +95,7 @@ struct live_palette
 	uint64_t offset = 0;
 	uint64_t end = 0;
 	uint64_t frame = 0;
+	bool fresh = false;
 	std::vector<uint8_t> bytes;
 };
 
@@ -105,6 +104,7 @@ struct edit_request
 	uint64_t unit_id = 0;
 	uint64_t table_key = 0; // zero keeps legacy unit-wide targeting
 	uint32_t slot = UINT32_MAX;
+	uint32_t source_slot = UINT32_MAX;
 	std::array<float, 3> world_translation {};
 };
 
@@ -155,8 +155,11 @@ uint64_t g_palette_track_end = 0;
 uint32_t g_palette_same_end_frames = 0;
 uint64_t g_palette_scanned_bytes = 0;
 uint64_t g_palette_hits = 0;
+uint64_t g_palette_fresh_hits = 0;
 uint64_t g_pose_updates = 0;
 uint64_t g_pose_update_skips = 0;
+uint64_t g_pose_candidate_checks = 0;
+uint64_t g_pose_ownership_rejects = 0;
 std::atomic<uint64_t> g_palette_scan_calls { 0 };
 std::atomic<uint64_t> g_palette_scan_total_wall_us { 0 };
 std::atomic<uint64_t> g_palette_scan_last_wall_us { 0 };
@@ -165,7 +168,6 @@ std::atomic<uint64_t> g_pose_driver_calls { 0 };
 std::atomic<uint64_t> g_pose_driver_total_wall_us { 0 };
 std::atomic<uint64_t> g_pose_driver_last_wall_us { 0 };
 std::atomic<uint64_t> g_pose_driver_max_wall_us { 0 };
-uint32_t g_next_probe_code = 1;
 std::vector<std::string> g_profile_errors;
 std::vector<instance_lifecycle::instance> g_hits;
 std::vector<active_target> g_active_targets;
@@ -488,10 +490,10 @@ void load_palette_markers()
 		if (const size_t comment = line.find('#'); comment != std::string::npos)
 			line.erase(comment);
 		std::istringstream fields(line);
-		std::array<std::string, 5> tokens;
+		std::array<std::string, 6> tokens;
 		if (!(fields >> tokens[0]))
 			continue;
-		if (!(fields >> tokens[1] >> tokens[2] >> tokens[3] >> tokens[4]))
+		if (!(fields >> tokens[1] >> tokens[2] >> tokens[3] >> tokens[4] >> tokens[5]))
 		{
 			g_profile_errors.push_back("palette_markers.txt line " +
 				std::to_string(line_number) + " is invalid");
@@ -505,18 +507,22 @@ void load_palette_markers()
 			marker.table_key, 16);
 		const auto entries = std::from_chars(tokens[2].data(), tokens[2].data() + tokens[2].size(),
 			marker.entries, 10);
-		const auto probe = std::from_chars(tokens[3].data(), tokens[3].data() + tokens[3].size(),
+		const auto first_control = std::from_chars(tokens[3].data(),
+			tokens[3].data() + tokens[3].size(), marker.first_control_slot, 10);
+		const auto probe = std::from_chars(tokens[4].data(), tokens[4].data() + tokens[4].size(),
 			marker.probe_slot, 10);
-		const auto repeats = std::from_chars(tokens[4].data(), tokens[4].data() + tokens[4].size(),
+		const auto repeats = std::from_chars(tokens[5].data(), tokens[5].data() + tokens[5].size(),
 			marker.tail_repeats, 10);
 		const bool parsed = unit.ec == std::errc() && table.ec == std::errc() &&
-			entries.ec == std::errc() && probe.ec == std::errc() && repeats.ec == std::errc();
+			entries.ec == std::errc() && first_control.ec == std::errc() &&
+			probe.ec == std::errc() && repeats.ec == std::errc();
 		const bool matched = std::any_of(g_profiles.begin(), g_profiles.end(),
 			[&marker](const loaded_table_profile &profile) {
 				return profile.unit_id == marker.unit_id && profile.table_key == marker.table_key &&
 					profile.entries == marker.entries;
 			});
 		if (!parsed || marker.unit_id == 0 || marker.table_key == 0 || marker.tail_repeats < 4 ||
+			marker.first_control_slot == 0 || marker.first_control_slot > marker.probe_slot ||
 			marker.probe_slot + marker.tail_repeats + 1 != marker.entries || !matched)
 		{
 			g_profile_errors.push_back("palette_markers.txt line " +
@@ -558,15 +564,17 @@ void load_shoulder_targets()
 		edit_request target;
 		if (tokens.empty())
 			continue;
-		if (tokens.size() != 5 && tokens.size() != 6)
+		if (tokens.size() != 5 && tokens.size() != 6 && tokens.size() != 7)
 		{
 			g_shoulder_error = "invalid shoulder target on line " + std::to_string(line_number);
 			g_shoulder_targets.clear();
 			return;
 		}
 		unit_text = tokens[0];
-		const size_t slot_field = tokens.size() == 6 ? 2 : 1;
-		if (tokens.size() == 6)
+		const size_t slot_field = tokens.size() >= 6 ? 2 : 1;
+		const size_t source_field = tokens.size() == 7 ? 3 : slot_field;
+		const size_t translation_field = tokens.size() == 7 ? 4 : slot_field + 1;
+		if (tokens.size() >= 6)
 			table_text = tokens[1];
 		const auto parsed = std::from_chars(unit_text.data(), unit_text.data() + unit_text.size(),
 			target.unit_id, 16);
@@ -575,10 +583,12 @@ void load_shoulder_targets()
 				target.table_key, 16);
 		const auto slot_parsed = std::from_chars(tokens[slot_field].data(),
 			tokens[slot_field].data() + tokens[slot_field].size(), target.slot, 10);
+		const auto source_parsed = std::from_chars(tokens[source_field].data(),
+			tokens[source_field].data() + tokens[source_field].size(), target.source_slot, 10);
 		bool numeric_ok = true;
 		for (size_t axis = 0; axis < 3; ++axis)
 		{
-			std::istringstream value(tokens[slot_field + 1 + axis]);
+			std::istringstream value(tokens[translation_field + axis]);
 			if (!(value >> target.world_translation[axis]) || value.peek() != EOF)
 				numeric_ok = false;
 		}
@@ -588,7 +598,9 @@ void load_shoulder_targets()
 				table_parsed.ptr != table_text.data() + table_text.size() || target.table_key == 0)) ||
 			slot_parsed.ec != std::errc() ||
 			slot_parsed.ptr != tokens[slot_field].data() + tokens[slot_field].size() || !numeric_ok ||
-			target.slot == UINT32_MAX ||
+			source_parsed.ec != std::errc() ||
+			source_parsed.ptr != tokens[source_field].data() + tokens[source_field].size() ||
+			target.slot == UINT32_MAX || target.source_slot == UINT32_MAX ||
 			!std::all_of(target.world_translation.begin(), target.world_translation.end(),
 				[](float value) { return std::isfinite(value) && std::fabs(value) <= k_max_edit_translation; }) ||
 			std::all_of(target.world_translation.begin(), target.world_translation.end(),
@@ -602,14 +614,21 @@ void load_shoulder_targets()
 			[&target](const loaded_table_profile &profile) {
 				return profile.unit_id == target.unit_id &&
 					(target.table_key == 0 || profile.table_key == target.table_key) &&
-					target.slot < profile.entries;
+					target.slot < profile.entries && target.source_slot < profile.entries;
 			});
+		const bool pose_layout = tokens.size() != 7 ||
+			std::any_of(g_palette_markers.begin(), g_palette_markers.end(),
+				[&target](const armature_probe::palette_marker &marker) {
+					return marker.unit_id == target.unit_id && marker.table_key == target.table_key &&
+						target.source_slot > 0 && target.source_slot < marker.first_control_slot &&
+						target.slot >= marker.first_control_slot && target.slot < marker.probe_slot;
+				});
 		const bool duplicate = std::any_of(g_shoulder_targets.begin(), g_shoulder_targets.end(),
 			[&target](const edit_request &loaded) {
 				return loaded.unit_id == target.unit_id && loaded.table_key == target.table_key &&
 					loaded.slot == target.slot;
 			});
-		if (!available || duplicate)
+		if (!available || !pose_layout || duplicate)
 		{
 			g_shoulder_error = "unmatched or duplicate shoulder target on line " +
 				std::to_string(line_number);
@@ -1014,7 +1033,8 @@ bool has_requested_target()
 
 void scan_live_palettes()
 {
-	if (g_palette_markers.empty())
+	if (g_palette_markers.empty() || !g_edit_active.load(std::memory_order_acquire) ||
+		(g_frame & 1u) != 0)
 		return;
 	const auto performance_started = std::chrono::steady_clock::now();
 	uint64_t handle = 0, window_offset = 0, count = 0;
@@ -1047,8 +1067,10 @@ void scan_live_palettes()
 		buffer_info &buffer = choose->second;
 		const uint64_t mapped_end = std::min(buffer.size, buffer.map_offset + buffer.map_size);
 		constexpr uint64_t overlap = 256ull * armature_profile::transform_stride;
-		if (g_palette_track_resource == choose->first && g_palette_track_end != 0 &&
-			g_palette_same_end_frames < 30)
+		const bool tracking = g_palette_track_resource == choose->first &&
+			g_palette_track_end != 0 &&
+			g_palette_same_end_frames < 30;
+		if (tracking)
 			window_offset = g_palette_track_end > overlap ? g_palette_track_end - overlap : buffer.map_offset;
 		else
 		{
@@ -1058,7 +1080,8 @@ void scan_live_palettes()
 		}
 		if (window_offset < buffer.map_offset)
 			window_offset = buffer.map_offset;
-		count = std::min<uint64_t>(k_palette_scan_bytes + overlap, mapped_end - window_offset);
+		const uint64_t scan_bytes = tracking ? k_palette_track_bytes : k_palette_scan_bytes;
+		count = std::min<uint64_t>(scan_bytes + overlap, mapped_end - window_offset);
 		if (count < 4 * armature_profile::transform_stride)
 			return;
 		handle = choose->first;
@@ -1066,7 +1089,7 @@ void scan_live_palettes()
 		armature_probe::copy_from_write_combined(snapshot.data(),
 			static_cast<const uint8_t *>(buffer.map_ptr) + (window_offset - buffer.map_offset),
 			snapshot.size());
-		buffer.scan_offset = window_offset + std::min<uint64_t>(k_palette_scan_bytes, count);
+		buffer.scan_offset = window_offset + std::min<uint64_t>(scan_bytes, count);
 		if (buffer.scan_offset >= mapped_end)
 			buffer.scan_offset = buffer.map_offset;
 	}
@@ -1076,8 +1099,10 @@ void scan_live_palettes()
 		g_palette_markers);
 	record_palette_scan_performance(performance_started);
 	std::lock_guard lock(g_mutex);
+	std::vector<live_palette> previous = std::move(g_live_palettes);
 	g_live_palettes.clear();
 	uint64_t highest_end = 0;
+	bool highest_fresh = false;
 	for (const armature_probe::palette_marker_hit &hit : hits)
 	{
 		const uint64_t absolute_offset = window_offset + hit.palette_offset;
@@ -1090,24 +1115,61 @@ void scan_live_palettes()
 		palette.frame = g_frame;
 		palette.bytes.assign(snapshot.begin() + static_cast<std::ptrdiff_t>(hit.palette_offset),
 			snapshot.begin() + static_cast<std::ptrdiff_t>(hit.palette_end));
+		uint64_t previous_end = 0;
+		for (const live_palette &old : previous)
+			if (old.marker_index == palette.marker_index && old.resource == palette.resource)
+			{
+				previous_end = std::max(previous_end, old.end);
+				if (old.end == palette.end && old.bytes != palette.bytes)
+					palette.fresh = true;
+			}
+		if (previous_end != 0 && palette.end > previous_end)
+			palette.fresh = true;
+		g_palette_fresh_hits += palette.fresh;
 		g_live_palettes.push_back(std::move(palette));
-		highest_end = std::max(highest_end, absolute_end);
+		if (absolute_end > highest_end)
+		{
+			highest_end = absolute_end;
+			highest_fresh = g_live_palettes.back().fresh;
+		}
 	}
+	std::sort(g_live_palettes.begin(), g_live_palettes.end(),
+		[](const live_palette &left, const live_palette &right) {
+			return left.fresh != right.fresh ? left.fresh > right.fresh : left.end > right.end;
+		});
 	g_palette_hits += hits.size();
 	if (highest_end != 0)
 	{
 		if (g_palette_track_resource == handle && g_palette_track_end == highest_end)
-			++g_palette_same_end_frames;
+			g_palette_same_end_frames = highest_fresh ? 0 : g_palette_same_end_frames + 1;
 		else
 			g_palette_same_end_frames = 0;
 		g_palette_track_resource = handle;
 		g_palette_track_end = highest_end;
+		if (g_palette_same_end_frames >= 30)
+		{
+			g_palette_track_resource = 0;
+			g_palette_track_end = 0;
+			g_palette_same_end_frames = 0;
+		}
 	}
 	else if (g_palette_track_resource == handle && ++g_palette_same_end_frames >= 30)
 	{
+		g_palette_track_resource = 0;
 		g_palette_track_end = 0;
 		g_palette_same_end_frames = 0;
 	}
+}
+
+void reset_palette_tracking()
+{
+	std::lock_guard lock(g_mutex);
+	g_live_palettes.clear();
+	g_palette_track_resource = 0;
+	g_palette_track_end = 0;
+	g_palette_same_end_frames = 0;
+	for (auto &[unused, buffer] : g_buffers)
+		buffer.scan_offset = buffer.map_offset;
 }
 
 bool make_expected_table(const loaded_table_profile &profile,
@@ -1148,25 +1210,11 @@ size_t marker_for_profile(const loaded_table_profile &profile)
 	return SIZE_MAX;
 }
 
-void set_pose_probe(const loaded_table_profile &profile, active_target &target,
-	std::vector<uint8_t> &table)
-{
-	const auto &marker = g_palette_markers[target.marker_index];
-	const size_t probe_offset = static_cast<size_t>(marker.probe_slot) *
-		armature_profile::transform_stride;
-	const size_t tail_offset = probe_offset + armature_profile::transform_stride;
-	const float revision_code = (target.probe_revision & 1u) != 0 ? 0.002f : -0.002f;
-	armature_probe::translate_world_t48(profile.t48.data() + tail_offset,
-		target.probe_code, revision_code, 0.0f, table.data() + probe_offset);
-}
-
 bool write_table_slots(const loaded_table_profile &profile, active_target &target,
 	const std::vector<uint8_t> &source, const std::vector<uint8_t> &destination,
 	bool rollback_on_failure = true)
 {
 	std::vector<uint32_t> owned = target.slots;
-	if (target.pose_aware)
-		owned.push_back(target.probe_slot);
 	for (uint32_t slot : owned)
 	{
 		const size_t offset = static_cast<size_t>(slot) * armature_profile::transform_stride;
@@ -1223,11 +1271,7 @@ size_t append_discovered_edits_locked(const std::vector<edit_request> &requests)
 		if (target.marker_index != SIZE_MAX)
 		{
 			target.pose_aware = true;
-			target.probe_slot = g_palette_markers[target.marker_index].probe_slot;
-			target.probe_revision = 1;
-			target.probe_code = 0.01f + static_cast<float>(g_next_probe_code++) * 0.001f;
 			target.expected = profile.t48;
-			set_pose_probe(profile, target, target.expected);
 		}
 		g_edit.targets_selected += static_cast<uint32_t>(target.slots.size());
 		std::vector<uint8_t> current(profile.t48.size());
@@ -1243,7 +1287,7 @@ size_t append_discovered_edits_locked(const std::vector<edit_request> &requests)
 			g_edit.stale_skips += target.slots.size();
 			continue;
 		}
-		if (state == instance_lifecycle::table_state::pristine &&
+		if (state == instance_lifecycle::table_state::pristine && !target.pose_aware &&
 			!write_table_slots(profile, target, profile.t48, target.expected))
 			continue;
 		g_edit.targets_written += static_cast<uint32_t>(target.slots.size());
@@ -1307,6 +1351,50 @@ const edit_request *request_for_slot(const loaded_table_profile &profile, uint32
 	return nullptr;
 }
 
+bool palette_matches_profile(const loaded_table_profile &profile,
+	const armature_probe::palette_marker &marker, const live_palette &palette)
+{
+	if (marker.first_control_slot < 4 || palette.bytes.size() <
+		static_cast<size_t>(marker.entries - 1) * armature_profile::transform_stride)
+		return false;
+	std::array<float, 3> low { 1.0e30f, 1.0e30f, 1.0e30f };
+	std::array<float, 3> high { -1.0e30f, -1.0e30f, -1.0e30f };
+	uint32_t used = 0;
+	const uint32_t limit = std::min<uint32_t>(marker.first_control_slot, 65);
+	for (uint32_t slot = 1; slot < limit; ++slot)
+	{
+		const size_t ib_offset = static_cast<size_t>(slot) *
+			armature_profile::transform_stride;
+		const size_t skin_offset = static_cast<size_t>(slot - 1) *
+			armature_profile::transform_stride;
+		if (ib_offset + armature_profile::transform_stride > profile.t48.size() ||
+			skin_offset + armature_profile::transform_stride > palette.bytes.size())
+			break;
+		const auto inverse_bind = armature_probe::decode_t48(profile.t48.data() + ib_offset);
+		armature_probe::affine_matrix bind {};
+		if (!armature_probe::affine_inverse(inverse_bind, bind))
+			continue;
+		const auto skin = armature_probe::decode_t48(palette.bytes.data() + skin_offset);
+		const auto world = armature_probe::multiply(bind, skin);
+		bool finite = true;
+		for (size_t axis = 0; axis < 3; ++axis)
+			finite = finite && std::isfinite(world[12 + axis]) &&
+				std::fabs(world[12 + axis]) < 1.0e6f;
+		if (!finite)
+			continue;
+		for (size_t axis = 0; axis < 3; ++axis)
+		{
+			low[axis] = std::min(low[axis], world[12 + axis]);
+			high[axis] = std::max(high[axis], world[12 + axis]);
+		}
+		++used;
+	}
+	if (used < 3)
+		return false;
+	const float x = high[0] - low[0], y = high[1] - low[1], z = high[2] - low[2];
+	return std::sqrt(x * x + y * y + z * z) <= 4.0f;
+}
+
 void drive_pose_targets()
 {
 	if (!g_edit_active.load(std::memory_order_acquire) || g_live_palettes.empty())
@@ -1322,31 +1410,16 @@ void drive_pose_targets()
 			continue;
 		const loaded_table_profile &profile = g_profiles[target.profile_index];
 		const auto &marker = g_palette_markers[target.marker_index];
-		const float wanted_revision = (target.probe_revision & 1u) != 0 ? 0.002f : -0.002f;
 		for (const live_palette &palette : g_live_palettes)
 		{
 			if (palette.marker_index != target.marker_index || palette.frame != g_frame)
 				continue;
-			const size_t probe_offset = static_cast<size_t>(marker.probe_slot - 1) *
-				armature_profile::transform_stride;
-			const size_t tail_offset = probe_offset + armature_profile::transform_stride;
-			if (tail_offset + armature_profile::transform_stride > palette.bytes.size())
+			++g_pose_candidate_checks;
+			if (!palette_matches_profile(profile, marker, palette))
+			{
+				++g_pose_ownership_rejects;
 				continue;
-			const auto probe_skin = armature_probe::decode_t48(palette.bytes.data() + probe_offset);
-			const auto tail_skin = armature_probe::decode_t48(palette.bytes.data() + tail_offset);
-			armature_probe::affine_matrix tail_inverse {};
-			if (!armature_probe::affine_inverse(tail_skin, tail_inverse))
-				continue;
-			const auto relation = armature_probe::multiply(probe_skin, tail_inverse);
-			const bool identity_basis = std::fabs(relation[0] - 1.0f) < 0.002f &&
-				std::fabs(relation[5] - 1.0f) < 0.002f &&
-				std::fabs(relation[10] - 1.0f) < 0.002f &&
-				std::fabs(relation[1]) < 0.002f && std::fabs(relation[2]) < 0.002f &&
-				std::fabs(relation[4]) < 0.002f && std::fabs(relation[6]) < 0.002f &&
-				std::fabs(relation[8]) < 0.002f && std::fabs(relation[9]) < 0.002f;
-			if (!identity_basis || std::fabs(relation[12] - target.probe_code) > 0.0002f ||
-				std::fabs(relation[13] - wanted_revision) > 0.0002f)
-				continue;
+			}
 
 			std::vector<uint8_t> current(profile.t48.size());
 			if (!read_process_bytes(target.address, current.data(), current.size()) ||
@@ -1359,25 +1432,26 @@ void drive_pose_targets()
 			uint32_t driven = 0;
 			for (uint32_t slot : target.slots)
 			{
-				if (slot == 0)
-					continue;
 				const edit_request *request = request_for_slot(profile, slot);
 				const size_t ib_offset = static_cast<size_t>(slot) *
 					armature_profile::transform_stride;
-				const size_t skin_offset = static_cast<size_t>(slot - 1) *
+				if (request == nullptr || request->source_slot == 0 ||
+					request->source_slot >= marker.first_control_slot ||
+					slot < marker.first_control_slot || slot >= marker.probe_slot)
+					continue;
+				const size_t skin_offset = static_cast<size_t>(request->source_slot - 1) *
 					armature_profile::transform_stride;
-				if (request == nullptr || skin_offset + armature_profile::transform_stride >
+				if (skin_offset + armature_profile::transform_stride >
 					palette.bytes.size())
 					continue;
 				const auto baseline_ib = armature_probe::decode_t48(profile.t48.data() + ib_offset);
-				const auto used_ib = armature_probe::decode_t48(target.expected.data() + ib_offset);
 				const auto observed_skin = armature_probe::decode_t48(
 					palette.bytes.data() + skin_offset);
 				const auto correction = armature_probe::translation(
 					request->world_translation[0], request->world_translation[1],
 					request->world_translation[2]);
 				armature_probe::affine_matrix driven_ib {};
-				if (!armature_probe::drive_inverse_bind(baseline_ib, used_ib, observed_skin,
+				if (!armature_probe::drive_inverse_bind(baseline_ib, baseline_ib, observed_skin,
 					correction, driven_ib))
 					continue;
 				armature_probe::encode_t48(driven_ib, next.data() + ib_offset);
@@ -1388,8 +1462,6 @@ void drive_pose_targets()
 				++g_pose_update_skips;
 				break;
 			}
-			++target.probe_revision;
-			set_pose_probe(profile, target, next);
 			if (write_table_slots(profile, target, target.expected, next))
 			{
 				target.expected.swap(next);
@@ -1444,11 +1516,16 @@ size_t maintain_edit()
 			}
 			else if (state == instance_lifecycle::table_state::pristine)
 			{
-				++g_edit.refills_observed;
-				if (write_table_slots(profile, target, profile.t48, target.expected))
+				if (target.pose_aware && target.expected == profile.t48)
 					target.stale_frames = 0;
 				else
-					++target.stale_frames;
+				{
+					++g_edit.refills_observed;
+					if (write_table_slots(profile, target, profile.t48, target.expected))
+						target.stale_frames = 0;
+					else
+						++target.stale_frames;
+				}
 			}
 			else
 			{
@@ -1524,6 +1601,7 @@ void toggle_shoulder_edit()
 	if (!enabled)
 	{
 		end_edit();
+		reset_palette_tracking();
 		g_shoulder_active.store(false, std::memory_order_release);
 		g_edit.completed = true;
 		g_shoulder_error.clear();
@@ -1540,6 +1618,7 @@ void toggle_shoulder_edit()
 		return;
 	}
 	g_shoulder_error.clear();
+	reset_palette_tracking();
 	if (begin_edits(g_shoulder_targets))
 	{
 		g_shoulder_active.store(true, std::memory_order_release);
@@ -1739,6 +1818,7 @@ void append_resource_monitor_row()
 			"rebind_instances_added,rebind_last_us,rebind_max_us,rebind_wall_percent,process_cpu_percent,"
 			"working_set_mib,private_mib,palette_scan_calls,palette_scan_total_mib,"
 			"palette_scan_last_ms,palette_scan_max_ms,palette_scan_wall_percent,palette_marker_hits,"
+			"palette_fresh_hits,pose_candidate_checks,pose_ownership_rejects,"
 			"pose_driver_calls,pose_driver_last_us,pose_driver_max_us,pose_driver_wall_percent,"
 			"pose_updates,pose_update_skips\r\n";
 		DWORD written = 0;
@@ -1779,6 +1859,8 @@ void append_resource_monitor_row()
 		<< g_palette_scan_last_wall_us.load(std::memory_order_relaxed) / 1000.0 << ','
 		<< g_palette_scan_max_wall_us.load(std::memory_order_relaxed) / 1000.0 << ','
 		<< g_resource_sample.palette_scan_wall_percent << ',' << g_palette_hits << ','
+		<< g_palette_fresh_hits << ',' << g_pose_candidate_checks << ','
+		<< g_pose_ownership_rejects << ','
 		<< g_pose_driver_calls.load(std::memory_order_relaxed) << ','
 		<< g_pose_driver_last_wall_us.load(std::memory_order_relaxed) << ','
 		<< g_pose_driver_max_wall_us.load(std::memory_order_relaxed) << ','
@@ -1897,7 +1979,7 @@ bool read_automation_request()
 	g_skip_intro = skip_intro != 0;
 	g_steam_capture = steam_capture != 0;
 	g_edit_requested.store(edit_test != 0, std::memory_order_release);
-	g_requested_edit = { static_cast<uint64_t>(unit_id), 0, slot, { x, y, z } };
+	g_requested_edit = { static_cast<uint64_t>(unit_id), 0, slot, slot, { x, y, z } };
 	g_edit.requested = edit_test != 0;
 	return true;
 }
@@ -2203,11 +2285,13 @@ void draw_console(uint32_t draws)
 		<< " us  scan queue " << g_scan_requests_coalesced.load(std::memory_order_relaxed)
 		<< '/' << g_scan_requests.load(std::memory_order_relaxed) << " coalesced\n"
 		<< "palette " << g_resource_sample.palette_scan_wall_percent << "% frame time  "
-		<< g_palette_scanned_bytes / mib << " MiB / " << g_palette_hits << " hits  last/max "
+		<< g_palette_scanned_bytes / mib << " MiB / " << g_palette_hits << " hits ("
+		<< g_palette_fresh_hits << " fresh)  last/max "
 		<< g_palette_scan_last_wall_us.load(std::memory_order_relaxed) / 1000.0 << '/'
 		<< g_palette_scan_max_wall_us.load(std::memory_order_relaxed) / 1000.0
 		<< " ms  pose " << g_resource_sample.pose_driver_wall_percent << "%  updates/skips "
-		<< g_pose_updates << '/' << g_pose_update_skips << '\n'
+		<< g_pose_updates << '/' << g_pose_update_skips << "  candidates/rejected "
+		<< g_pose_candidate_checks << '/' << g_pose_ownership_rejects << '\n'
 		<< "F8 shoulder narrowing "
 		<< (!g_shoulder_desired.load(std::memory_order_relaxed) ? "OFF" :
 			g_shoulder_active.load(std::memory_order_relaxed) ? "ACTIVE" : "WAITING")
@@ -2290,7 +2374,7 @@ void write_telemetry(uint32_t draws)
 
 	std::ostringstream json;
 	json << "{\n"
-		<< "  \"schema\": 8,\n"
+		<< "  \"schema\": 9,\n"
 		<< "  \"addon\": \"HD2 Armature Profile Runtime\",\n"
 		<< "  \"addon_version\": \"" << k_runtime_version << "\",\n"
 		<< "  \"experiment_mode\": \"" << experiment_mode_name() << "\",\n"
@@ -2412,6 +2496,9 @@ void write_telemetry(uint32_t draws)
 		<< "  \"palette_scan_wall_percent_sample\": "
 		<< g_resource_sample.palette_scan_wall_percent << ",\n"
 		<< "  \"palette_marker_hits_total\": " << g_palette_hits << ",\n"
+		<< "  \"palette_fresh_hits_total\": " << g_palette_fresh_hits << ",\n"
+		<< "  \"pose_candidate_checks_total\": " << g_pose_candidate_checks << ",\n"
+		<< "  \"pose_ownership_rejects_total\": " << g_pose_ownership_rejects << ",\n"
 		<< "  \"pose_driver_calls_total\": "
 		<< g_pose_driver_calls.load(std::memory_order_relaxed) << ",\n"
 		<< "  \"pose_driver_wall_ms_total\": "

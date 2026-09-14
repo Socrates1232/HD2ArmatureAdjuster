@@ -43,6 +43,16 @@ int main()
 		std::cerr << "static pre-offset negative control unexpectedly passed\n";
 		return 4;
 	}
+	// The production path reads animation from an untouched source slot and writes
+	// a duplicated control slot with the same pristine inverse bind.
+	affine_matrix duplicated_control {};
+	if (!drive_inverse_bind(baseline, baseline, native_skin, correction, duplicated_control))
+		return 5;
+	if (!close(multiply(duplicated_control, pose), multiply(native_skin, correction)))
+	{
+		std::cerr << "source/control slot correction failed\n";
+		return 6;
+	}
 	std::cout << "pose-aware inverse-bind driver identity passed\n";
 	return 0;
 }
