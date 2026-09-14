@@ -5,11 +5,11 @@
 Stage 1 now has two connected deliverables:
 
 - `HD2 Armature Adapter`, a Blender 4.2+ extension and headless exporter that turns a compatible edited rest armature into a deterministic `HD2RIG1` package.
-- `HD2 Armature Profile Runtime 1.6`, a ReShade add-on that associates that package with exact active patch profiles, recovers current native bone motion from a live skinning palette, generates replacement inverse-bind values, and publishes/restores them with guarded revision ownership.
+- `HD2 Armature Profile Runtime 1.7`, a ReShade add-on that associates that package with exact active patch profiles, recovers current native bone motion from a live skinning palette, generates replacement inverse-bind values, and publishes/restores them with guarded revision ownership.
 
 The original patches and `.vrm` files are read-only inputs. The workflow neither fingerprints nor rewrites them.
 
-The offline implementation and the real 257-bone/27-table package have passed the repository test suite and the runtime's strict C++ package parser. Runtime 1.3 removed the synchronous scan/service path that froze the game, then exposed a false `SUBJECT_AMBIGUOUS` gate because repeated exact table instances were treated as conflicting subjects. Runtime 1.4 accepts every exact discovered instance for an associated profile. Runtime 1.5 also prevents undersized mapped buffers from consuming the capture throttle, while keeping matching and publication on the worker. Runtime 1.6 builds each plan only from affected branches represented by that table and excludes tables with no affected slots. It has not yet passed the replacement live gate. See [`CUSTOM_ARMATURE_LIVE_FAILURE_2026-09-14.md`](CUSTOM_ARMATURE_LIVE_FAILURE_2026-09-14.md).
+The offline implementation and the real 257-bone/27-table package have passed the repository test suite and the runtime's strict C++ package parser. Runtime 1.3 removed the synchronous scan/service path that froze the game, then exposed a false `SUBJECT_AMBIGUOUS` gate because repeated exact table instances were treated as conflicting subjects. Runtime 1.4 accepts every exact discovered instance for an associated profile. Runtime 1.5 also prevents undersized mapped buffers from consuming the capture throttle, while keeping matching and publication on the worker. Runtime 1.6 builds each plan only from affected branches represented by that table and excludes tables with no affected slots. Runtime 1.7 uses one logical frame for sampling and planning within a worker cycle, so scan time cannot expire its own newly recovered pose. It has not yet passed the replacement live gate. See [`CUSTOM_ARMATURE_LIVE_FAILURE_2026-09-14.md`](CUSTOM_ARMATURE_LIVE_FAILURE_2026-09-14.md).
 
 ## Supported Stage-1 edit class
 
@@ -248,7 +248,7 @@ The current offline gate covers:
 
 The test suite currently reports 18/18 passing, including the atomic intent-mailbox, non-blocking presentation-path, and disjoint edited-branch regressions. The real validation package contains 257 logical bones, 27 exact tables, and 1,625 slot mappings, and it loads successfully through the runtime's C++ `HD2RIG1` parser. Eighteen of those tables contain an affected shoulder slot and participate in the runtime retarget plan.
 
-The remaining gate is a controlled in-game run of runtime 1.6. Until a run remains responsive after F8, reaches `APPLIED`, visibly follows animation, restores on F8, and survives a scene transition, the runtime should be described as implemented and offline-verified—not live-validated.
+The remaining gate is a controlled in-game run of runtime 1.7. Until a run remains responsive after F8, reaches `APPLIED`, visibly follows animation, restores on F8, and survives a scene transition, the runtime should be described as implemented and offline-verified—not live-validated.
 
 ## Implementation record
 

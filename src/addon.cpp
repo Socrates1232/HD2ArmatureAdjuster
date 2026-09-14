@@ -33,7 +33,7 @@ using namespace reshade::api;
 
 namespace
 {
-constexpr char k_runtime_version[] = "1.6";
+constexpr char k_runtime_version[] = "1.7";
 constexpr size_t k_scan_chunk_bytes = 4 * 1024 * 1024;
 constexpr size_t k_custom_capture_bytes = 256 * 1024;
 constexpr size_t k_custom_scan_chunk_bytes = 16 * 1024;
@@ -1301,7 +1301,7 @@ DWORD WINAPI custom_worker_proc(void *)
 
 		intent_changed = apply_custom_intent(handled_revision) || intent_changed;
 		if (g_custom_runtime.desired() || intent_changed || stopping)
-			service_custom_runtime_state(g_frame.load(std::memory_order_acquire));
+			service_custom_runtime_state(frame);
 		publish_custom_view();
 		record_custom_worker_performance(started);
 		g_custom_worker_busy.store(false, std::memory_order_release);

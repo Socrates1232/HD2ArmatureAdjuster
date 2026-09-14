@@ -46,6 +46,11 @@ def main() -> int:
     assert "g_custom_active_scan_buffer" in scan
     assert "k_custom_scan_chunk_bytes + k_custom_scan_overlap_bytes" in scan
     assert "g_custom_active_cursor" in scan
+
+    worker = function_body(source, "DWORD WINAPI custom_worker_proc(")
+    assert "scan_custom_pose_input(frame);" in worker
+    assert "service_custom_runtime_state(frame);" in worker
+    assert "service_custom_runtime_state(g_frame.load" not in worker
     return 0
 
 

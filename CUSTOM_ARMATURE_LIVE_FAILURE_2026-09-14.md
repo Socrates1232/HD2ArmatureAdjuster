@@ -124,3 +124,9 @@ The exported rig has three affected structural shoulder variants distributed acr
 Runtime 1.6 restricts a table's required pose set to the ancestor paths of affected slots actually represented by that table. It also omits the nine table layouts with no affected slots from custom-runtime binding and capture. The discovery matcher, pose ownership checks, matrix conversion, and guarded publisher are unchanged. A regression test now proves that an edited branch absent from a table cannot prevent the represented branch from producing a plan.
 
 The next live gate is therefore specific: a qualifying pose sample must increment `custom_plans_built`, followed by `custom_publications` and `APPLIED`. If it does not, the next diagnostic should expose the exact per-table `pose_error` rather than changing discovery again.
+
+## Runtime 1.6 live result and runtime 1.7 correction
+
+Runtime 1.6 remained responsive, accepted three F8 intent revisions, found 75 exact IB instances, and recovered one qualifying pose sample, but again produced zero plans and publications. Its final status was `WAITING_FOR_LIVE_POSE`, not `LIVE_LAYOUT_UNVERIFIED`. That distinction proves the planner did not reject the sample: the service path considered it stale before calling the planner.
+
+The worker passed the presentation-frame value captured before scanning into `observe_window`, then passed a newer presentation frame into `service`. The observed scan took 117,504 microseconds, enough for the three-frame freshness window to expire inside the same worker cycle. Runtime 1.7 passes the same logical frame to both operations. The freshness rule remains unchanged between cycles, and the scanner, plan math, and publisher are untouched.
