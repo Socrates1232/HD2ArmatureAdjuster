@@ -20,13 +20,14 @@ bone_name_hash = _core.bone_name_hash
 build_rig = _core.build_rig
 parent_matches = _core.parent_matches
 read_source = _core.read_source
+runtime_dependency_ids = _core.runtime_dependency_ids
 write_rig = _core.write_rig
 
 
 bl_info = {
     "name": "HD2 Armature Adapter",
     "author": "HD2ArmatureAdjuster contributors",
-    "version": (1, 1, 3),
+    "version": (1, 2, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > HD2AA",
     "description": "Port compatible custom rest armatures to HD2RIG1",
@@ -121,49 +122,64 @@ def collect_target(obj, source_path=None):
     stable_values = [bone.get(STABLE_ID) for bone in obj.data.bones if bone.get(STABLE_ID)]
     if len(stable_values) != len(set(stable_values)):
         raise ValueError("target contains duplicate stable IDs")
-    by_stable_id = {bone.get(STABLE_ID): bone for bone in obj.data.bones
-                    if bone.get(STABLE_ID)}
-    by_name_hash = {}
-    for bone in obj.data.bones:
-        by_name_hash.setdefault(f"{armature_name_hash(bone.name):08x}", []).append(bone)
-    mapped = 0
-    for record in source["bones"]:
-        bone = by_stable_id.get(record["stable_id"])
-        if bone is None:
-            candidates = by_name_hash.get(record["name_hash"].lower(), [])
-            if len(candidates) > 1:
-                raise ValueError(f"{record['display_name']}: multiple target bones have the "
-                                 "same HD2 name hash")
-            bone = candidates[0] if candidates else None
-        if bone is None:
-            continue
-        parent_id = record["parent_id"]
-        actual_parent = bone.parent
-        actual_parent_name = None if actual_parent is None else actual_parent.name
-        actual_parent_id = None if actual_parent is None else actual_parent.get(STABLE_ID)
-        if not parent_matches(source_by_id, parent_id, actual_parent_name, actual_parent_id):
-            expected = None if parent_id is None else source_by_id[parent_id]["name_hash"]
-            raise ValueError(f"{bone.name}: target parent {actual_parent_name!r} differs from "
-                             f"source parent hash {expected!r}")
+    mappings = target_mappings(obj, source)
+    for record, bone in mappings:
         matrix = bone.matrix_local if bone.parent is None else bone.parent.matrix_local.inverted() @ bone.matrix_local
         local[record["stable_id"]] = _flat(matrix)
-        parents[record["stable_id"]] = parent_id
-        mapped += 1
-    if mapped == 0:
-        raise ValueError("the selected armature has no HD2 bone-name matches with the source")
+        parents[record["stable_id"]] = record["parent_id"]
     return local, parents
+
+
+def target_mappings(obj, source):
+    source_by_id = {bone["stable_id"]: bone for bone in source["bones"]}
+    required = runtime_dependency_ids(source)
+    by_hash = {}
+    for record in source["bones"]:
+        if record["stable_id"] in required:
+            by_hash.setdefault(record["name_hash"].lower(), []).append(record)
+    mappings = {}
+    for bone in obj.data.bones:
+        stable_id = bone.get(STABLE_ID)
+        if stable_id in required:
+            records = [source_by_id[stable_id]]
+            exact = True
+        elif stable_id is None and not bone.name.isdecimal():
+            records = by_hash.get(f"{bone_name_hash(bone.name):08x}", [])
+            exact = False
+        else:
+            continue
+        if not records:
+            continue
+        actual_parent = bone.parent
+        actual_name = None if actual_parent is None else actual_parent.name
+        actual_id = None if actual_parent is None else actual_parent.get(STABLE_ID)
+        compatible = _core.matching_parent_records(
+            source_by_id, records, actual_name, actual_id)
+        if not compatible:
+            expected = sorted({None if record["parent_id"] is None else
+                               source_by_id[record["parent_id"]]["name_hash"]
+                               for record in records}, key=lambda value: "" if value is None else value)
+            raise ValueError(f"{bone.name}: target parent {actual_name!r} matches no source "
+                             f"variant; expected parent hash from {expected}")
+        if exact and len(compatible) != 1:
+            raise ValueError(f"{bone.name}: stable ID mapping is ambiguous")
+        for record in compatible:
+            previous = mappings.get(record["stable_id"])
+            if previous is not None and previous != bone:
+                raise ValueError(f"{record['display_name']}: multiple target bones map to one "
+                                 "source identity")
+            mappings[record["stable_id"]] = bone
+    if not mappings:
+        raise ValueError("the selected armature has no named runtime-bone matches with the source")
+    return [(source_by_id[stable_id], bone) for stable_id, bone in mappings.items()]
 
 
 def mapping_summary(obj, source_path):
     source = read_source(source_path)
-    source_ids = {bone["stable_id"] for bone in source["bones"]}
-    stable_ids = {bone.get(STABLE_ID) for bone in obj.data.bones if bone.get(STABLE_ID)}
-    if source_ids <= stable_ids:
-        return "stable IDs", len(source_ids), len(source_ids)
-    name_hashes = {f"{armature_name_hash(bone.name):08x}" for bone in obj.data.bones}
-    mapped = sum(bone["stable_id"] in stable_ids or bone["name_hash"].lower() in name_hashes
-                 for bone in source["bones"])
-    return "stable IDs/name hashes", mapped, len(source["bones"])
+    required = runtime_dependency_ids(source)
+    mappings = target_mappings(obj, source)
+    mode = "stable IDs" if all(bone.get(STABLE_ID) for _, bone in mappings) else "named bones"
+    return mode, len(mappings), len(required)
 
 
 def package_from_scene(settings):
@@ -338,6 +354,7 @@ class HD2AA_PT_panel(Panel):
         layout.prop(settings, "source_path")
         layout.label(text="Use *.hd2source.json, not *.patch_N", icon="INFO")
         layout.operator("hd2aa.map_exact_names", text="Check Automatic Mapping")
+        layout.label(text="Maps named runtime bones; anonymous nodes stay unchanged")
         row = layout.row(align=True)
         row.operator("hd2aa.import_source", text="Import Source")
         row.operator("hd2aa.duplicate_target", text="Duplicate Imported Source")

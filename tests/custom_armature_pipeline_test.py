@@ -49,6 +49,23 @@ def main() -> int:
     decimal_parent = {"node_c89b0fd3": {"name_hash": "c89b0fd3"}}
     if not porter.parent_matches(decimal_parent, "node_c89b0fd3", "3365605331"):
         raise AssertionError("a decimal Blender parent did not match its HD2 hash")
+    variant_source = {
+        "bones": [
+            {"stable_id": "root_a", "parent_id": None, "name_hash": "c89b0fd3"},
+            {"stable_id": "root_b", "parent_id": None, "name_hash": "582bc7a5"},
+            {"stable_id": "mesh_a", "parent_id": "root_a", "name_hash": "315cd161"},
+            {"stable_id": "mesh_b", "parent_id": "root_b", "name_hash": "315cd161"},
+            {"stable_id": "shoulder", "parent_id": "root_a", "name_hash": "03752c98"},
+        ],
+        "tables": [{"slots": [{"source_bone_id": "shoulder"}]}],
+    }
+    if porter.runtime_dependency_ids(variant_source) != {"root_a", "shoulder"}:
+        raise AssertionError("non-skinning structural variants entered the runtime closure")
+    compatible = porter.matching_parent_records(
+        {bone["stable_id"]: bone for bone in variant_source["bones"]},
+        variant_source["bones"][2:4], "3365605331")
+    if [record["stable_id"] for record in compatible] != ["mesh_a"]:
+        raise AssertionError("union variants were not qualified by their parent identity")
 
     with tempfile.TemporaryDirectory() as temporary:
         root = pathlib.Path(temporary) / "mod"

@@ -60,6 +60,25 @@ def parent_matches(source_by_id: dict, expected_parent_id: str | None,
     return f"{armature_name_hash(actual_parent_name):08x}" == expected_hash
 
 
+def runtime_dependency_ids(source: dict) -> set[str]:
+    source_by_id = {bone["stable_id"]: bone for bone in source["bones"]}
+    required = set()
+    for table in source.get("tables", []):
+        for slot in table["slots"]:
+            stable_id = slot["source_bone_id"]
+            while stable_id is not None and stable_id not in required:
+                required.add(stable_id)
+                stable_id = source_by_id[stable_id]["parent_id"]
+    return required
+
+
+def matching_parent_records(source_by_id: dict, records: list[dict],
+                            actual_parent_name: str | None,
+                            actual_parent_id: str | None = None) -> list[dict]:
+    return [record for record in records if parent_matches(
+        source_by_id, record["parent_id"], actual_parent_name, actual_parent_id)]
+
+
 def canonical_bytes(value: object) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
 
