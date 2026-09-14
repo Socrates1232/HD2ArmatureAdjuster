@@ -94,3 +94,25 @@ PUBLISH_FINISHED
 ```
 
 Runtime 1.3 exposes the equivalent requested/accepted boundary through telemetry counters. Append-only transition logging remains a useful follow-up if another process-ending fault prevents the periodic snapshot from being written.
+
+## Runtime 1.4 and 1.5 follow-up
+
+Runtime 1.4 remained responsive after F8 and eliminated the false subject gate. The ordinary scanner found 76 exact IB instances, while the custom runtime reported `WAITING_FOR_LIVE_POSE` and `custom_rejected_instances = 0`. This confirms that repeated exact instances are no longer misclassified as ambiguous. That run found no qualifying live palette.
+
+Runtime 1.5 moved the 32 ms capture throttle behind the minimum useful mapped-buffer size check. Its final telemetry reported:
+
+```text
+custom_status                WAITING_FOR_LIVE_POSE
+custom_intent_revision       3
+custom_worker_intent_revision 3
+converted_ib_hits            75
+custom_palette_candidates    2
+custom_pose_samples          2
+custom_plans_built           0
+custom_publications          0
+custom_rejected_instances    0
+custom_scan_wall_us_max      350166
+custom_worker_wall_us_max    350181
+```
+
+The capture correction therefore recovered qualifying pose samples without restoring presentation-thread matching, but the run did not reach plan construction or publication. The current live gate is required-pose/plan coverage, not IB-table discovery or subject ambiguity. The final ReShade log tail showed runtime destruction and add-on unregistration without an exception entry; it does not by itself establish why the game process ended.
