@@ -15,6 +15,7 @@ from . import core as _core
 
 
 _core = importlib.reload(_core)
+armature_name_hash = _core.armature_name_hash
 bone_name_hash = _core.bone_name_hash
 build_rig = _core.build_rig
 parent_matches = _core.parent_matches
@@ -25,7 +26,7 @@ write_rig = _core.write_rig
 bl_info = {
     "name": "HD2 Armature Adapter",
     "author": "HD2ArmatureAdjuster contributors",
-    "version": (1, 1, 2),
+    "version": (1, 1, 3),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > HD2AA",
     "description": "Port compatible custom rest armatures to HD2RIG1",
@@ -124,7 +125,7 @@ def collect_target(obj, source_path=None):
                     if bone.get(STABLE_ID)}
     by_name_hash = {}
     for bone in obj.data.bones:
-        by_name_hash.setdefault(f"{bone_name_hash(bone.name):08x}", []).append(bone)
+        by_name_hash.setdefault(f"{armature_name_hash(bone.name):08x}", []).append(bone)
     mapped = 0
     for record in source["bones"]:
         bone = by_stable_id.get(record["stable_id"])
@@ -159,7 +160,7 @@ def mapping_summary(obj, source_path):
     stable_ids = {bone.get(STABLE_ID) for bone in obj.data.bones if bone.get(STABLE_ID)}
     if source_ids <= stable_ids:
         return "stable IDs", len(source_ids), len(source_ids)
-    name_hashes = {f"{bone_name_hash(bone.name):08x}" for bone in obj.data.bones}
+    name_hashes = {f"{armature_name_hash(bone.name):08x}" for bone in obj.data.bones}
     mapped = sum(bone["stable_id"] in stable_ids or bone["name_hash"].lower() in name_hashes
                  for bone in source["bones"])
     return "stable IDs/name hashes", mapped, len(source["bones"])

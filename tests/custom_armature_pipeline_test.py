@@ -39,11 +39,16 @@ def reject(action, message):
 def main() -> int:
     if porter.bone_name_hash("l_clavicle") != 0xC4787B4E:
         raise AssertionError("Blender bone-name hashing does not match HD2")
+    if porter.armature_name_hash("3365605331") != 0xC89B0FD3:
+        raise AssertionError("decimal Blender bone hashes are not preserved")
     aliased_parent = {"node_c4787b4e_variant": {"name_hash": "c4787b4e"}}
     if not porter.parent_matches(aliased_parent, "node_c4787b4e_variant", "l_clavicle"):
         raise AssertionError("a named Blender parent did not match its structural source alias")
     if porter.parent_matches(aliased_parent, "node_c4787b4e_variant", "spine_2"):
         raise AssertionError("a genuinely different target parent was accepted")
+    decimal_parent = {"node_c89b0fd3": {"name_hash": "c89b0fd3"}}
+    if not porter.parent_matches(decimal_parent, "node_c89b0fd3", "3365605331"):
+        raise AssertionError("a decimal Blender parent did not match its HD2 hash")
 
     with tempfile.TemporaryDirectory() as temporary:
         root = pathlib.Path(temporary) / "mod"

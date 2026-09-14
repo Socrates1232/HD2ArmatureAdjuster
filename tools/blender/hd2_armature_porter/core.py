@@ -39,6 +39,14 @@ def bone_name_hash(name: str) -> int:
     return value >> 32
 
 
+def armature_name_hash(name: str) -> int:
+    if name.isdecimal():
+        value = int(name)
+        if value <= 0xFFFFFFFF:
+            return value
+    return bone_name_hash(name)
+
+
 def parent_matches(source_by_id: dict, expected_parent_id: str | None,
                    actual_parent_name: str | None,
                    actual_parent_id: str | None = None) -> bool:
@@ -49,7 +57,7 @@ def parent_matches(source_by_id: dict, expected_parent_id: str | None,
     if actual_parent_name is None:
         return False
     expected_hash = source_by_id[expected_parent_id]["name_hash"].lower()
-    return f"{bone_name_hash(actual_parent_name):08x}" == expected_hash
+    return f"{armature_name_hash(actual_parent_name):08x}" == expected_hash
 
 
 def canonical_bytes(value: object) -> bytes:
