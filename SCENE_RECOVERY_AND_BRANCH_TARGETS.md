@@ -89,12 +89,15 @@ files as 27 unique runtime tables with zero profile/config errors, parsed all
 777 targets, completed the scripted walk/turn/stretch sequence, and shut down
 cleanly. Candidate scanning read about 384 MiB instead of the earlier 3.4 GiB
 full-heap pass, and no new Windows crash event occurred. The equipped model in
-that smoke run produced no exact table match, so visible F8 deformation and an
-actual scene-transition rebind remain the next user-assisted acceptance test.
+that smoke run produced no exact table match. The subsequent user-assisted test
+confirmed visible bilateral descendant deformation, persistence across a scene
+change, automatic rebinding, and F8 restoration.
 
-The default `+0.25 m` left and `-0.25 m` right translations are deliberately
-exaggerated for the next visual validation. They are uniform bind/model-space
-pre-offsets across each branch, not a final pose-aware shoulder-width algorithm.
+The acceptance test used deliberately exaggerated `+0.25 m` left and `-0.25 m`
+right translations. After validation, the default deployment preset was reduced
+to `+0.03 m` left and `-0.03 m` right, approximately 6 cm total narrowing. These
+remain uniform bind/model-space pre-offsets across each branch, not a final
+pose-aware shoulder-width algorithm.
 
 ## Automated checks
 
@@ -107,6 +110,7 @@ The test suite covers:
   semantics;
 - add-on load/register/unload and the existing profile/scan/layout pipelines.
 
-The next in-game acceptance test is successful only if one F8 press produces an
-obvious bilateral branch displacement, a scene transition retires the old table
-instances, and new instances are discovered and edited without another F8 press.
+Acceptance status: passed. One F8 press produced obvious bilateral branch
+displacement, a scene transition retired the old table instances, new instances
+were discovered and edited without another F8 press, and the second F8 restored
+the unmodified appearance.

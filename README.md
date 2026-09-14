@@ -79,8 +79,9 @@ This walks the unit scene-graph parents, expands `l_shoulder` and `r_shoulder`
 to all descendants, maps those nodes through every LOD's `RealIndices`, and
 qualifies every output slot with the exact table's FNV-1a fingerprint. It rejects
 an exact runtime table if the same slot has conflicting semantics in another LOD
-or replacement variant. The default diagnostic displacement is an exaggerated
-`+0.25 m` for the left branch and `-0.25 m` for the right branch.
+or replacement variant. The validated normal preset moves the left branch
+`+0.03 m` and the right branch `-0.03 m`, narrowing total shoulder width by
+approximately 6 cm.
 
 ## Build
 
@@ -159,6 +160,5 @@ Telemetry is written to `%LOCALAPPDATA%\HD2ArmatureAdjuster\telemetry.json`; tes
 This prototype now provides external-profile discovery, persistent edit intent,
 scene-change instance recovery, reversible writes, and offline hierarchy-aware
 shoulder branch expansion. The configured translation remains a bind/model-space
-pre-offset; it is intentionally exaggerated for validation and is not yet a
-pose-aware shoulder-width control. A general naming database and interactive
-editor remain future work.
+pre-offset rather than a pose-aware shoulder-width control. A general naming
+database and interactive editor remain future work.

@@ -122,7 +122,7 @@ def main() -> int:
         if len({row[1] for row in rows}) != 2:
             raise AssertionError("different LOD tables were not kept semantically distinct")
         if {tuple(row[3:]) for row in rows} != {
-                ("+0.25", "+0", "+0"), ("-0.25", "+0", "+0")}:
+                ("+0.03", "+0", "+0"), ("-0.03", "+0", "+0")}:
             raise AssertionError("left/right translations were not assigned correctly")
 
         conflict = pathlib.Path(temporary) / "conflict"

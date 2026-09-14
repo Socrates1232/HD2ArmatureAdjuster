@@ -606,9 +606,9 @@ def build_parser() -> argparse.ArgumentParser:
     branch_command.add_argument("--report",
                                 help="default: <profile-dir>/shoulder_targets.json")
     branch_command.add_argument("--left-translate", type=float, nargs=3,
-                                default=(0.25, 0.0, 0.0), metavar=("X", "Y", "Z"))
+                                default=(0.03, 0.0, 0.0), metavar=("X", "Y", "Z"))
     branch_command.add_argument("--right-translate", type=float, nargs=3,
-                                default=(-0.25, 0.0, 0.0), metavar=("X", "Y", "Z"))
+                                default=(-0.03, 0.0, 0.0), metavar=("X", "Y", "Z"))
     branch_command.add_argument("--force", action="store_true")
 
     edit_command = commands.add_parser("translate", help="copy a patch, translate one IB slot, and profile it")
