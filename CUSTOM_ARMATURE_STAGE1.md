@@ -78,12 +78,12 @@ Run the same export twice if reproducibility matters; byte-identical inputs prod
 
 ## 2. Author a target in Blender
 
-Install `hd2_armature_porter-1.3.0.zip` through Blender's **Preferences → Get Extensions → Install from Disk**. In the 3D View sidebar, open **HD2AA**.
+Install `hd2_armature_porter-1.3.1.zip` through Blender's **Preferences → Get Extensions → Install from Disk**. In the 3D View sidebar, open **HD2AA**.
 
 For an armature already modified from an exported HD2 avatar rig:
 
 1. Select the modified armature object and click **Use Selected Armature**.
-2. In Edit Mode, select only the bone roots whose local rest transforms you intentionally changed, then click **Mark Selected for Port**. Moving a complete shoulder branch normally requires marking its shoulder root, not every unchanged descendant.
+2. In Edit Mode, select only the bone roots whose local rest transforms you intentionally changed, then click **Add Selected to Port**. The button reads Blender's EditBone selection and adds it to the existing marks; **Clear Port Marks** resets the set. Moving a complete shoulder branch normally requires marking its shoulder root, not every unchanged descendant.
 3. If the armature already carries `hd2_source_reference`, the add-on resolves it automatically. Otherwise select the generated `*.hd2source.json` once. A `.patch_N` file is not a source contract.
 4. Optionally click **Check Automatic Mapping**. Only explicitly marked runtime bones are matched; every other source record remains unchanged. Non-skinning structural nodes such as `game_mesh` are excluded. When the union contract contains several structural variants of a marked bone, only variants compatible with the target bone's parent are selected.
 5. Leave **Basis mode** at `Preserved` and **Capability** at `Automatic`.

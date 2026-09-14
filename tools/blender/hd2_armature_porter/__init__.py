@@ -28,7 +28,7 @@ write_rig = _core.write_rig
 bl_info = {
     "name": "HD2 Armature Adapter",
     "author": "HD2ArmatureAdjuster contributors",
-    "version": (1, 3, 0),
+    "version": (1, 3, 1),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > HD2AA",
     "description": "Port compatible custom rest armatures to HD2RIG1",
@@ -145,7 +145,7 @@ def target_mappings(obj, source):
     exact_complete = required <= target_stable_ids
     marked = set() if exact_complete else marked_bone_names(obj)
     if not exact_complete and not marked:
-        raise ValueError("select the rest bones you changed and click Mark Selected for Port")
+        raise ValueError("select the rest bones you changed and click Add Selected to Port")
     by_hash = {}
     for record in source["bones"]:
         if record["stable_id"] in required:
@@ -252,7 +252,7 @@ class HD2AA_OT_use_selected(Operator):
 
 class HD2AA_OT_mark_selected_bones(Operator):
     bl_idname = "hd2aa.mark_selected_bones"
-    bl_label = "Mark Selected for Port"
+    bl_label = "Add Selected to Port"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -261,13 +261,19 @@ class HD2AA_OT_mark_selected_bones(Operator):
         if target is None or target.type != "ARMATURE":
             self.report({"ERROR"}, "select the target armature first")
             return {"CANCELLED"}
-        selected = sorted(bone.name for bone in target.data.bones if bone.select)
+        if context.mode == "EDIT_ARMATURE" and context.active_object == target:
+            selected = {bone.name for bone in (context.selected_editable_bones or [])}
+        elif context.mode == "POSE" and context.active_object == target:
+            selected = {bone.name for bone in (context.selected_pose_bones or [])}
+        else:
+            selected = {bone.name for bone in target.data.bones if bone.select}
         if not selected:
             self.report({"ERROR"}, "select the rest bones that you intentionally changed")
             return {"CANCELLED"}
-        target[PORT_BONES] = json.dumps(selected)
-        settings.status = f"Marked {len(selected)} bone(s) for port: " + ", ".join(selected)
-        self.report({"INFO"}, f"Marked {len(selected)} bone(s) for port")
+        marked = sorted(marked_bone_names(target) | selected)
+        target[PORT_BONES] = json.dumps(marked)
+        settings.status = f"Marked {len(marked)} bone(s) for port: " + ", ".join(marked)
+        self.report({"INFO"}, f"Marked {len(marked)} bone(s) for port")
         return {"FINISHED"}
 
 
@@ -402,7 +408,7 @@ class HD2AA_PT_panel(Panel):
         layout.operator("hd2aa.use_selected")
         layout.label(text="Exports rest bones; Pose Mode changes are ignored", icon="INFO")
         row = layout.row(align=True)
-        row.operator("hd2aa.mark_selected_bones")
+        row.operator("hd2aa.mark_selected_bones", text="Add Selected to Port")
         row.operator("hd2aa.clear_marked_bones")
         target = settings.target_object
         marked = 0 if target is None else len(marked_bone_names(target))
