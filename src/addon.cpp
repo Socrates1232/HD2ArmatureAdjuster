@@ -33,7 +33,7 @@ using namespace reshade::api;
 
 namespace
 {
-constexpr char k_runtime_version[] = "1.4";
+constexpr char k_runtime_version[] = "1.5";
 constexpr size_t k_scan_chunk_bytes = 4 * 1024 * 1024;
 constexpr size_t k_custom_capture_bytes = 256 * 1024;
 constexpr size_t k_custom_scan_chunk_bytes = 16 * 1024;
@@ -1181,6 +1181,7 @@ void queue_custom_pose_input(uint64_t resource)
 	const hd2aa::retarget::custom_intent_snapshot intent = g_custom_intent.load();
 	if (!intent.desired)
 		return;
+	const uint64_t tick = GetTickCount64();
 	uintptr_t address = 0;
 	uint64_t absolute_offset = 0;
 	size_t size = 0;
@@ -1188,7 +1189,11 @@ void queue_custom_pose_input(uint64_t resource)
 		std::lock_guard lock(g_mutex);
 		auto found = g_buffers.find(resource);
 		if (found == g_buffers.end() || found->second.map_ptr == nullptr ||
-			found->second.map_size < 4096)
+			found->second.map_size < k_custom_scan_chunk_bytes + k_custom_scan_overlap_bytes)
+			return;
+		uint64_t previous = g_custom_callback_scan_last_tick.load(std::memory_order_relaxed);
+		if (tick < previous + 32 || !g_custom_callback_scan_last_tick.compare_exchange_strong(
+			previous, tick, std::memory_order_relaxed))
 			return;
 		buffer_info &buffer = found->second;
 		uint64_t start = buffer.capture_cursor;
@@ -2759,13 +2764,7 @@ void on_map_buffer(device *device, resource resource, uint64_t offset, uint64_t 
 		found->second.map_size = map_size;
 	}
 	if (g_custom_capture_enabled.load(std::memory_order_acquire))
-	{
-		const uint64_t tick = GetTickCount64();
-		uint64_t previous = g_custom_callback_scan_last_tick.load(std::memory_order_relaxed);
-		if (tick >= previous + 32 && g_custom_callback_scan_last_tick.compare_exchange_strong(
-			previous, tick, std::memory_order_relaxed))
-			queue_custom_pose_input(resource.handle);
-	}
+		queue_custom_pose_input(resource.handle);
 }
 
 void on_unmap_buffer(device *device, resource resource)

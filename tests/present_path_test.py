@@ -38,6 +38,8 @@ def main() -> int:
 
     queue = function_body(source, "void queue_custom_pose_input(")
     assert "k_custom_capture_bytes + k_custom_scan_overlap_bytes" in queue
+    assert "map_size < k_custom_scan_chunk_bytes + k_custom_scan_overlap_bytes" in queue
+    assert "g_custom_callback_scan_last_tick.compare_exchange_strong" in queue
     assert "observe_window(" not in queue
 
     scan = function_body(source, "void scan_custom_pose_input(")
