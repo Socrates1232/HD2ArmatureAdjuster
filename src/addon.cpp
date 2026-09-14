@@ -3,6 +3,8 @@
 #include "ib_layout.hpp"
 #include "instance_lifecycle.hpp"
 #include "profile_scan.hpp"
+#include "retarget/custom_runtime.hpp"
+#include "retarget/sha256.hpp"
 #include "runtime_profile.hpp"
 
 #include <Windows.h>
@@ -30,7 +32,7 @@ using namespace reshade::api;
 
 namespace
 {
-constexpr char k_runtime_version[] = "1.1";
+constexpr char k_runtime_version[] = "1.2";
 constexpr size_t k_scan_chunk_bytes = 4 * 1024 * 1024;
 constexpr size_t k_candidate_region_bytes = 64 * 1024;
 constexpr size_t k_max_hits = 256;
@@ -53,7 +55,12 @@ struct buffer_info
 {
 	uint64_t size = 0;
 	void *map_ptr = nullptr;
+	uint64_t map_offset = 0;
 	uint64_t map_size = 0;
+	uint64_t scan_cursor = 0;
+	uint64_t scan_round = 0;
+	uint64_t scan_map_offset = UINT64_MAX;
+	uint64_t scan_map_size = 0;
 };
 
 struct loaded_table_profile
@@ -67,6 +74,8 @@ struct loaded_table_profile
 	uint32_t first_lod = 0;
 	uint32_t source_records = 1;
 	std::vector<uint8_t> t48;
+	std::string profile_sha256;
+	std::string table_sha256;
 };
 
 struct active_target
@@ -115,6 +124,7 @@ struct resource_sample
 	double scan_cpu_core_percent = 0.0;
 	double maintenance_wall_percent = 0.0;
 	double rebind_wall_percent = 0.0;
+	double custom_scan_wall_percent = 0.0;
 };
 
 std::mutex g_mutex;
@@ -126,6 +136,17 @@ std::vector<std::string> g_profile_errors;
 std::vector<instance_lifecycle::instance> g_hits;
 std::vector<active_target> g_active_targets;
 std::wstring g_profile_directory;
+std::wstring g_rig_directory;
+std::wstring g_active_rig_file;
+std::wstring g_source_reference_file;
+std::string g_custom_error;
+hd2aa::retarget::custom_runtime g_custom_runtime;
+std::vector<uint8_t> g_custom_scan_buffer;
+std::vector<uint8_t> g_custom_pending_scan_buffer;
+uint64_t g_custom_pending_resource = 0;
+uint64_t g_custom_pending_offset = 0;
+uint64_t g_custom_scan_resource = 0;
+std::atomic<bool> g_custom_capture_enabled { false };
 uint32_t g_profile_files = 0;
 uint32_t g_profile_records = 0;
 uint32_t g_profile_duplicates = 0;
@@ -179,12 +200,18 @@ std::atomic<uint64_t> g_rebind_instances_added_metric { 0 };
 std::atomic<uint64_t> g_rebind_total_wall_us { 0 };
 std::atomic<uint64_t> g_rebind_last_wall_us { 0 };
 std::atomic<uint64_t> g_rebind_max_wall_us { 0 };
+std::atomic<uint64_t> g_custom_scan_calls { 0 };
+std::atomic<uint64_t> g_custom_scan_total_wall_us { 0 };
+std::atomic<uint64_t> g_custom_scan_last_wall_us { 0 };
+std::atomic<uint64_t> g_custom_scan_max_wall_us { 0 };
+std::atomic<uint64_t> g_custom_callback_scan_last_tick { 0 };
 uint64_t g_monitor_started_tick_ms = 0;
 uint64_t g_previous_sample_tick_ms = 0;
 uint64_t g_previous_process_cpu_100ns = 0;
 uint64_t g_previous_scan_cpu_us = 0;
 uint64_t g_previous_maintenance_wall_us = 0;
 uint64_t g_previous_rebind_wall_us = 0;
+uint64_t g_previous_custom_scan_wall_us = 0;
 resource_sample g_resource_sample;
 
 std::wstring g_telemetry_path;
@@ -229,6 +256,8 @@ std::chrono::steady_clock::time_point g_next_full_scan;
 
 const char *experiment_mode_name()
 {
+	if (g_custom_runtime.configured())
+		return g_custom_runtime.desired() ? "custom_armature_retarget" : "custom_armature_ready";
 	if (g_shoulder_desired.load(std::memory_order_relaxed))
 		return "shoulder_narrow_toggle";
 	return g_edit_requested.load(std::memory_order_relaxed) ?
@@ -385,6 +414,7 @@ void load_profiles()
 			g_profile_errors.push_back(utf8(name.c_str()) + ": could not read profile");
 			continue;
 		}
+		const std::string profile_sha256 = hd2aa::sha256_hex(bytes.data(), bytes.size());
 		armature_profile::package package;
 		std::string error;
 		if (!armature_profile::parse(bytes.data(), bytes.size(), package, error))
@@ -419,12 +449,80 @@ void load_profiles()
 				g_profile_errors.push_back("runtime table-profile limit reached");
 				break;
 			}
+			const std::string table_sha256 = hd2aa::sha256_hex(table.t48.data(), table.t48.size());
 			g_profiles.push_back({ package.patch_name, utf8(name.c_str()), table.unit_id,
 				table.table_fnv1a, table.lod_mask, table.entries, table.first_lod, 1,
-				std::move(table.t48) });
+				std::move(table.t48), profile_sha256, table_sha256 });
 		}
 		++g_profile_files;
 	}
+}
+
+void load_custom_rig()
+{
+	g_custom_runtime.clear();
+	g_custom_error.clear();
+	g_active_rig_file.clear();
+	g_source_reference_file.clear();
+	const size_t separator = g_profile_directory.find_last_of(L"\\/");
+	if (separator == std::wstring::npos)
+		return;
+	g_rig_directory = g_profile_directory.substr(0, separator) + L"\\HD2ArmatureRigs";
+	std::vector<uint8_t> active_bytes;
+	if (!read_file(g_rig_directory + L"\\active_rig.txt", active_bytes))
+		return;
+	std::vector<std::string> lines;
+	std::istringstream input(std::string(active_bytes.begin(), active_bytes.end()));
+	for (std::string line; std::getline(input, line);)
+	{
+		if (!line.empty() && line.back() == '\r')
+			line.pop_back();
+		if (!line.empty())
+			lines.push_back(line);
+	}
+	if (lines.size() != 2 || lines[0].find_first_of("/\\") != std::string::npos ||
+		lines[1].find_first_of("/\\") != std::string::npos ||
+		lines[0].size() < 12 || lines[0].substr(lines[0].size() - 12) != ".hd2rig.json" ||
+		lines[1].size() < 15 || lines[1].substr(lines[1].size() - 15) != ".hd2source.json")
+	{
+		g_custom_error = "active_rig.txt must contain a rig basename and source-reference basename";
+		return;
+	}
+	g_active_rig_file = wide(lines[0]);
+	g_source_reference_file = wide(lines[1]);
+	if (g_active_rig_file.empty() || g_source_reference_file.empty())
+	{
+		g_custom_error = "active_rig.txt is not valid UTF-8";
+		return;
+	}
+	std::vector<uint8_t> rig_bytes, source_bytes;
+	if (!read_file(g_rig_directory + L"\\" + g_active_rig_file, rig_bytes) ||
+		!read_file(g_rig_directory + L"\\" + g_source_reference_file, source_bytes))
+	{
+		g_custom_error = "active rig or source-reference file is unreadable";
+		return;
+	}
+	hd2aa::retarget::rig_package rig;
+	if (!hd2aa::retarget::parse_rig_json(reinterpret_cast<const char *>(rig_bytes.data()),
+		rig_bytes.size(), rig, g_custom_error))
+		return;
+	if (hd2aa::sha256_hex(source_bytes.data(), source_bytes.size()) !=
+		rig.source_reference_sha256)
+	{
+		g_custom_error = "active source-reference hash does not match the rig";
+		return;
+	}
+	std::vector<hd2aa::retarget::runtime_profile_data> profiles;
+	profiles.reserve(g_profiles.size());
+	for (const loaded_table_profile &profile : g_profiles)
+	{
+		hd2aa::retarget::runtime_profile_data item;
+		item.identity = { profile.unit_id, profile.entries, profile.table_sha256,
+			profile.profile_file, profile.profile_sha256 };
+		item.pristine = profile.t48;
+		profiles.push_back(std::move(item));
+	}
+	g_custom_runtime.configure(std::move(rig), std::move(profiles), g_custom_error);
 }
 
 void load_shoulder_targets()
@@ -610,6 +708,16 @@ void record_rebind_performance(std::chrono::steady_clock::time_point started,
 	g_rebind_total_wall_us.fetch_add(wall_us, std::memory_order_relaxed);
 	g_rebind_last_wall_us.store(wall_us, std::memory_order_relaxed);
 	update_max(g_rebind_max_wall_us, wall_us);
+}
+
+void record_custom_scan_performance(std::chrono::steady_clock::time_point started)
+{
+	const uint64_t wall_us = static_cast<uint64_t>(std::chrono::duration_cast<
+		std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+	g_custom_scan_calls.fetch_add(1, std::memory_order_relaxed);
+	g_custom_scan_total_wall_us.fetch_add(wall_us, std::memory_order_relaxed);
+	g_custom_scan_last_wall_us.store(wall_us, std::memory_order_relaxed);
+	update_max(g_custom_scan_max_wall_us, wall_us);
 }
 
 void publish_hunt_results(const std::vector<instance_lifecycle::instance> &found_hits,
@@ -877,6 +985,182 @@ bool write_process_bytes(uintptr_t address, const void *data, size_t size)
 	SIZE_T written = 0;
 	return WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void *>(address),
 		data, size, &written) != FALSE && written == size;
+}
+
+void scan_custom_pose_input()
+{
+	if (!g_custom_runtime.configured() || !g_custom_runtime.desired())
+		return;
+	{
+		std::vector<uint8_t> pending;
+		uint64_t resource = 0, offset = 0;
+		{
+			std::lock_guard lock(g_mutex);
+			pending.swap(g_custom_pending_scan_buffer);
+			resource = g_custom_pending_resource;
+			offset = g_custom_pending_offset;
+		}
+		if (!pending.empty())
+		{
+			const auto started = std::chrono::steady_clock::now();
+			g_custom_runtime.observe_window(pending.data(), pending.size(),
+				resource, offset, g_frame);
+			record_custom_scan_performance(started);
+			return;
+		}
+	}
+	struct mapped_window
+	{
+		uint64_t resource = 0;
+		uintptr_t address = 0;
+		uint64_t offset = 0;
+		size_t size = 0;
+	};
+	mapped_window selected;
+	uint64_t live_resource = 0, live_offset = 0, live_frame = 0;
+	const bool recent = g_custom_runtime.latest_pose_location(
+		live_resource, live_offset, live_frame) && g_frame <= live_frame + 3;
+	bool using_recent = false;
+	{
+		std::lock_guard lock(g_mutex);
+		auto choose = g_buffers.end();
+		if (recent)
+			choose = g_buffers.find(live_resource);
+		if (choose == g_buffers.end() || choose->second.map_ptr == nullptr ||
+			choose->second.map_size < 48)
+		{
+			choose = g_buffers.find(g_custom_scan_resource);
+			if (choose == g_buffers.end() || choose->second.map_ptr == nullptr ||
+				choose->second.map_size < 4096)
+				choose = g_buffers.end();
+		}
+		if (choose == g_buffers.end())
+			for (auto item = g_buffers.begin(); item != g_buffers.end(); ++item)
+				if (item->second.map_ptr != nullptr && item->second.map_size >= 4096 &&
+					(choose == g_buffers.end() || item->second.scan_round < choose->second.scan_round ||
+					 (item->second.scan_round == choose->second.scan_round &&
+					  item->second.map_size > choose->second.map_size)))
+					choose = item;
+		if (choose == g_buffers.end() || choose->second.map_ptr == nullptr)
+			return;
+		buffer_info &buffer = choose->second;
+		using_recent = recent && choose->first == live_resource;
+		uint64_t start = buffer.scan_cursor;
+		size_t advance = 256 * 1024;
+		size_t wanted = advance + 8192;
+		if (using_recent && live_offset >= buffer.map_offset)
+		{
+			const uint64_t relative = live_offset - buffer.map_offset;
+			start = relative > 128 * 1024 ? relative - 128 * 1024 : 0;
+			wanted = 256 * 1024 + 8192;
+		}
+		if (start >= buffer.map_size)
+			start = 0;
+		wanted = static_cast<size_t>(std::min<uint64_t>(wanted, buffer.map_size - start));
+		if (!using_recent)
+		{
+			if (start + advance >= buffer.map_size)
+			{
+				buffer.scan_cursor = 0;
+				++buffer.scan_round;
+				g_custom_scan_resource = 0;
+			}
+			else
+			{
+				buffer.scan_cursor = start + advance;
+				g_custom_scan_resource = choose->first;
+			}
+		}
+		selected = { choose->first,
+			reinterpret_cast<uintptr_t>(buffer.map_ptr) + start,
+			buffer.map_offset + start, wanted };
+	}
+	if (selected.size < 48)
+		return;
+	const auto started = std::chrono::steady_clock::now();
+	g_custom_scan_buffer.resize(selected.size);
+	if (!read_process_bytes(selected.address, g_custom_scan_buffer.data(), selected.size))
+	{
+		record_custom_scan_performance(started);
+		return;
+	}
+	g_custom_runtime.observe_window(g_custom_scan_buffer.data(), g_custom_scan_buffer.size(),
+		selected.resource, selected.offset, g_frame);
+	record_custom_scan_performance(started);
+}
+
+void queue_custom_pose_input(uint64_t resource)
+{
+	uintptr_t address = 0;
+	uint64_t absolute_offset = 0;
+	size_t size = 0;
+	{
+		std::lock_guard lock(g_mutex);
+		auto found = g_buffers.find(resource);
+		if (found == g_buffers.end() || found->second.map_ptr == nullptr ||
+			found->second.map_size < 4096)
+			return;
+		buffer_info &buffer = found->second;
+		uint64_t start = buffer.scan_cursor;
+		if (start >= buffer.map_size)
+			start = 0;
+		size = static_cast<size_t>(std::min<uint64_t>(256 * 1024 + 8192,
+			buffer.map_size - start));
+		address = reinterpret_cast<uintptr_t>(buffer.map_ptr) + start;
+		absolute_offset = buffer.map_offset + start;
+		if (start + 256 * 1024 >= buffer.map_size)
+		{
+			buffer.scan_cursor = 0;
+			++buffer.scan_round;
+		}
+		else
+			buffer.scan_cursor = start + 256 * 1024;
+	}
+	if (size < 48)
+		return;
+	const auto started = std::chrono::steady_clock::now();
+	std::vector<uint8_t> pending(size);
+	if (read_process_bytes(address, pending.data(), pending.size()))
+	{
+		std::lock_guard lock(g_mutex);
+		g_custom_pending_scan_buffer.swap(pending);
+		g_custom_pending_resource = resource;
+		g_custom_pending_offset = absolute_offset;
+	}
+	record_custom_scan_performance(started);
+}
+
+void service_custom_runtime()
+{
+	if (!g_custom_runtime.configured())
+		return;
+	scan_custom_pose_input();
+	std::vector<hd2aa::retarget::discovered_bind_instance> instances;
+	{
+		std::lock_guard lock(g_mutex);
+		instances.reserve(g_hits.size());
+		for (const instance_lifecycle::instance &hit : g_hits)
+			instances.push_back({ hit.address, hit.profile_index, hit.last_seen_generation });
+	}
+	g_custom_runtime.service(instances,
+		g_discovery_generation.load(std::memory_order_acquire), g_frame,
+		[](uintptr_t address, void *data, size_t size) {
+			return read_process_bytes(address, data, size);
+		},
+		[](uintptr_t address, const void *data, size_t size) {
+			return write_process_bytes(address, data, size);
+		});
+}
+
+void stop_custom_runtime()
+{
+	if (!g_custom_runtime.configured())
+		return;
+	if (g_custom_runtime.desired())
+		g_custom_runtime.toggle();
+	g_custom_capture_enabled.store(false, std::memory_order_release);
+	service_custom_runtime();
+	g_custom_runtime.clear();
 }
 
 bool has_requested_target()
@@ -1224,7 +1508,8 @@ void service_shoulder_edit()
 
 void schedule_shoulder_discovery(std::chrono::steady_clock::time_point now)
 {
-	if (!g_shoulder_desired.load(std::memory_order_acquire) ||
+	if ((!g_shoulder_desired.load(std::memory_order_acquire) &&
+		!g_custom_runtime.desired()) ||
 		g_hunt_phase.load(std::memory_order_acquire) <= 1)
 		return;
 	const uint64_t resource_generation = g_resource_generation.load(std::memory_order_acquire);
@@ -1317,6 +1602,8 @@ void update_resource_sample()
 	const uint64_t maintenance_wall_us =
 		g_maintenance_total_wall_us.load(std::memory_order_relaxed);
 	const uint64_t rebind_wall_us = g_rebind_total_wall_us.load(std::memory_order_relaxed);
+	const uint64_t custom_scan_wall_us =
+		g_custom_scan_total_wall_us.load(std::memory_order_relaxed);
 	if (g_previous_sample_tick_ms != 0 && now_tick_ms > g_previous_sample_tick_ms)
 	{
 		const uint64_t interval_us = (now_tick_ms - g_previous_sample_tick_ms) * 1000;
@@ -1327,6 +1614,8 @@ void update_resource_sample()
 			maintenance_wall_us - g_previous_maintenance_wall_us, interval_us);
 		g_resource_sample.rebind_wall_percent = percent_of_interval(
 			rebind_wall_us - g_previous_rebind_wall_us, interval_us);
+		g_resource_sample.custom_scan_wall_percent = percent_of_interval(
+			custom_scan_wall_us - g_previous_custom_scan_wall_us, interval_us);
 		if (process_cpu_100ns >= g_previous_process_cpu_100ns)
 		{
 			const uint64_t process_cpu_us =
@@ -1342,6 +1631,7 @@ void update_resource_sample()
 	g_previous_scan_cpu_us = scan_cpu_us;
 	g_previous_maintenance_wall_us = maintenance_wall_us;
 	g_previous_rebind_wall_us = rebind_wall_us;
+	g_previous_custom_scan_wall_us = custom_scan_wall_us;
 }
 
 void append_resource_monitor_row()
@@ -1361,7 +1651,9 @@ void append_resource_monitor_row()
 			"scan_session_cpu_core_percent,maintenance_calls,maintenance_table_checks,maintenance_read_mib,"
 			"maintenance_last_us,maintenance_max_us,maintenance_wall_percent,rebind_calls,rebind_candidates,"
 			"rebind_instances_added,rebind_last_us,rebind_max_us,rebind_wall_percent,process_cpu_percent,"
-			"working_set_mib,private_mib\r\n";
+			"custom_scan_calls,custom_scan_total_mib,custom_scan_last_us,custom_scan_max_us,"
+			"custom_scan_wall_percent,custom_palette_candidates,custom_pose_samples,custom_plans,"
+			"custom_publications,custom_restores,working_set_mib,private_mib\r\n";
 		DWORD written = 0;
 		WriteFile(file, header, static_cast<DWORD>(sizeof(header) - 1), &written, nullptr);
 	}
@@ -1393,6 +1685,16 @@ void append_resource_monitor_row()
 		<< g_rebind_max_wall_us.load(std::memory_order_relaxed) << ','
 		<< g_resource_sample.rebind_wall_percent << ','
 		<< g_resource_sample.process_cpu_percent << ','
+		<< g_custom_scan_calls.load(std::memory_order_relaxed) << ','
+		<< g_custom_runtime.metrics().mapped_bytes_scanned / mib << ','
+		<< g_custom_scan_last_wall_us.load(std::memory_order_relaxed) << ','
+		<< g_custom_scan_max_wall_us.load(std::memory_order_relaxed) << ','
+		<< g_resource_sample.custom_scan_wall_percent << ','
+		<< g_custom_runtime.metrics().palette_candidates << ','
+		<< g_custom_runtime.metrics().pose_samples << ','
+		<< g_custom_runtime.metrics().plans_built << ','
+		<< g_custom_runtime.metrics().publications << ','
+		<< g_custom_runtime.metrics().restores << ','
 		<< g_resource_sample.process_working_set_bytes / mib << ','
 		<< g_resource_sample.process_private_bytes / mib << "\r\n";
 	const std::string bytes = row.str();
@@ -1775,6 +2077,7 @@ void draw_console(uint32_t draws)
 	const double rebind_average_us = rebind_calls == 0 ? 0.0 :
 		static_cast<double>(g_rebind_total_wall_us.load(std::memory_order_relaxed)) /
 		rebind_calls;
+	const hd2aa::retarget::custom_metrics &custom = g_custom_runtime.metrics();
 	constexpr double mib = 1024.0 * 1024.0;
 	out << "\x1b[2J\x1b[H"
 		<< "HD2 Armature Profile Runtime " << k_runtime_version << "  |  "
@@ -1813,11 +2116,23 @@ void draw_console(uint32_t draws)
 		<< rebind_average_us << '/' << g_rebind_max_wall_us.load(std::memory_order_relaxed)
 		<< " us  scan queue " << g_scan_requests_coalesced.load(std::memory_order_relaxed)
 		<< '/' << g_scan_requests.load(std::memory_order_relaxed) << " coalesced\n"
-		<< "F8 shoulder narrowing "
-		<< (!g_shoulder_desired.load(std::memory_order_relaxed) ? "OFF" :
-			g_shoulder_active.load(std::memory_order_relaxed) ? "ACTIVE" : "WAITING")
-		<< " (" << g_shoulder_targets.size() << " mapped slots, "
-		<< g_active_targets.size() << " live tables)  |  F9 rescan\n"
+		<< "F8 " << (g_custom_runtime.configured() ? "custom armature " : "shoulder narrowing ")
+		<< (g_custom_runtime.configured() ?
+			hd2aa::retarget::custom_status_name(g_custom_runtime.status()) :
+			(!g_shoulder_desired.load(std::memory_order_relaxed) ? "OFF" :
+			 g_shoulder_active.load(std::memory_order_relaxed) ? "ACTIVE" : "WAITING"))
+		<< "  |  F9 rescan\n";
+	if (g_custom_runtime.configured())
+		out << "custom rig " << g_custom_runtime.rig().rig_id.substr(0, 12)
+			<< "  mapped scan " << custom.mapped_bytes_scanned / (1024.0 * 1024.0)
+			<< " MiB @ " << g_resource_sample.custom_scan_wall_percent
+			<< "% frame time (last/max "
+			<< g_custom_scan_last_wall_us.load(std::memory_order_relaxed) << '/'
+			<< g_custom_scan_max_wall_us.load(std::memory_order_relaxed) << " us)  candidates "
+			<< custom.palette_candidates
+			<< "  samples " << custom.pose_samples << "  plans " << custom.plans_built
+			<< "  publishes/restores " << custom.publications << '/' << custom.restores << '\n';
+	out
 		<< "edit " << (g_edit.active ? "ACTIVE" : g_edit.completed ? "complete" :
 			g_edit.requested ? "armed" : "off") << "  slot ";
 	if (g_edit.slot == UINT32_MAX)
@@ -1843,6 +2158,8 @@ void draw_console(uint32_t draws)
 	}
 	for (const std::string &error : g_profile_errors)
 		out << "PROFILE ERROR: " << error << '\n';
+	if (!g_custom_error.empty())
+		out << "CUSTOM RIG ERROR: " << g_custom_error << '\n';
 	if (!g_shoulder_error.empty())
 		out << "SHOULDER ERROR: " << g_shoulder_error << '\n';
 	console_write(out.str());
@@ -1892,10 +2209,11 @@ void write_telemetry(uint32_t draws)
 	}
 	const bool shoulder_desired = g_shoulder_desired.load(std::memory_order_relaxed);
 	const bool shoulder_active = g_shoulder_active.load(std::memory_order_relaxed);
+	const hd2aa::retarget::custom_metrics custom = g_custom_runtime.metrics();
 
 	std::ostringstream json;
 	json << "{\n"
-		<< "  \"schema\": 7,\n"
+		<< "  \"schema\": 8,\n"
 		<< "  \"addon\": \"HD2 Armature Profile Runtime\",\n"
 		<< "  \"addon_version\": \"" << k_runtime_version << "\",\n"
 		<< "  \"experiment_mode\": \"" << experiment_mode_name() << "\",\n"
@@ -1914,6 +2232,34 @@ void write_telemetry(uint32_t draws)
 		<< "  \"profile_duplicate_records\": " << profile_duplicates << ",\n"
 		<< "  \"profile_tables_loaded\": " << profiles.size() << ",\n"
 		<< "  \"profile_load_errors\": " << profile_errors.size() << ",\n"
+		<< "  \"custom_rig_configured\": "
+		<< (g_custom_runtime.configured() ? "true" : "false") << ",\n"
+		<< "  \"custom_rig_id\": \"" << (g_custom_runtime.configured() ?
+			json_escape(g_custom_runtime.rig().rig_id) : "") << "\",\n"
+		<< "  \"custom_rig_file\": \"" << json_escape(utf8(g_active_rig_file.c_str())) << "\",\n"
+		<< "  \"custom_source_file\": \"" << json_escape(utf8(g_source_reference_file.c_str())) << "\",\n"
+		<< "  \"custom_status\": \""
+		<< hd2aa::retarget::custom_status_name(g_custom_runtime.status()) << "\",\n"
+		<< "  \"custom_desired_enabled\": "
+		<< (g_custom_runtime.desired() ? "true" : "false") << ",\n"
+		<< "  \"custom_error\": \"" << json_escape(g_custom_error) << "\",\n"
+		<< "  \"custom_mapped_bytes_scanned\": " << custom.mapped_bytes_scanned << ",\n"
+		<< "  \"custom_palette_candidates\": " << custom.palette_candidates << ",\n"
+		<< "  \"custom_pose_samples\": " << custom.pose_samples << ",\n"
+		<< "  \"custom_plans_built\": " << custom.plans_built << ",\n"
+		<< "  \"custom_publications\": " << custom.publications << ",\n"
+		<< "  \"custom_restores\": " << custom.restores << ",\n"
+		<< "  \"custom_rejected_instances\": " << custom.rejected_instances << ",\n"
+		<< "  \"custom_scan_calls_total\": "
+		<< g_custom_scan_calls.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"custom_scan_wall_ms_total\": "
+		<< g_custom_scan_total_wall_us.load(std::memory_order_relaxed) / 1000.0 << ",\n"
+		<< "  \"custom_scan_wall_us_last\": "
+		<< g_custom_scan_last_wall_us.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"custom_scan_wall_us_max\": "
+		<< g_custom_scan_max_wall_us.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"custom_scan_wall_percent_sample\": "
+		<< g_resource_sample.custom_scan_wall_percent << ",\n"
 		<< "  \"shoulder_config_targets\": " << shoulder_target_count << ",\n"
 		<< "  \"shoulder_desired_enabled\": "
 		<< (shoulder_desired ? "true" : "false") << ",\n"
@@ -2104,6 +2450,7 @@ void on_init_device(device *device)
 	g_hunt_reason_next.store(static_cast<uint32_t>(scan_reason::initial), std::memory_order_release);
 	initialize_runtime_files();
 	load_profiles();
+	load_custom_rig();
 	load_shoulder_targets();
 	open_console();
 }
@@ -2112,12 +2459,16 @@ void on_destroy_device(device *device)
 {
 	if (device != g_device)
 		return;
+	stop_custom_runtime();
 	end_edit();
 	stop_hunt_thread();
 	std::lock_guard lock(g_mutex);
 	g_buffers.clear();
 	g_hits.clear();
 	g_profiles.clear();
+	g_custom_scan_buffer.clear();
+	g_custom_pending_scan_buffer.clear();
+	g_custom_capture_enabled.store(false, std::memory_order_release);
 	g_active_targets.clear();
 	g_shoulder_targets.clear();
 	g_shoulder_desired.store(false, std::memory_order_release);
@@ -2146,6 +2497,8 @@ void on_destroy_resource(device *device, resource resource)
 	{
 		std::lock_guard lock(g_mutex);
 		g_buffers.erase(resource.handle);
+		if (g_custom_scan_resource == resource.handle)
+			g_custom_scan_resource = 0;
 	}
 	g_resource_generation.fetch_add(1, std::memory_order_relaxed);
 	g_last_resource_tick.store(GetTickCount64(), std::memory_order_release);
@@ -2156,13 +2509,31 @@ void on_map_buffer(device *device, resource resource, uint64_t offset, uint64_t 
 {
 	if (device != g_device || data == nullptr || *data == nullptr)
 		return;
-	std::lock_guard lock(g_mutex);
-	auto found = g_buffers.find(resource.handle);
-	if (found == g_buffers.end())
-		return;
-	found->second.map_ptr = *data;
-	found->second.map_size = size == 0 || size == UINT64_MAX ?
-		(offset < found->second.size ? found->second.size - offset : 0) : size;
+	{
+		std::lock_guard lock(g_mutex);
+		auto found = g_buffers.find(resource.handle);
+		if (found == g_buffers.end())
+			return;
+		const uint64_t map_size = size == 0 || size == UINT64_MAX ?
+			(offset < found->second.size ? found->second.size - offset : 0) : size;
+		if (found->second.scan_map_offset != offset || found->second.scan_map_size != map_size)
+		{
+			found->second.scan_cursor = 0;
+			found->second.scan_map_offset = offset;
+			found->second.scan_map_size = map_size;
+		}
+		found->second.map_ptr = *data;
+		found->second.map_offset = offset;
+		found->second.map_size = map_size;
+	}
+	if (g_custom_capture_enabled.load(std::memory_order_acquire))
+	{
+		const uint64_t tick = GetTickCount64();
+		uint64_t previous = g_custom_callback_scan_last_tick.load(std::memory_order_relaxed);
+		if (tick >= previous + 32 && g_custom_callback_scan_last_tick.compare_exchange_strong(
+			previous, tick, std::memory_order_relaxed))
+			queue_custom_pose_input(resource.handle);
+	}
 }
 
 void on_unmap_buffer(device *device, resource resource)
@@ -2174,7 +2545,10 @@ void on_unmap_buffer(device *device, resource resource)
 	if (found != g_buffers.end())
 	{
 		found->second.map_ptr = nullptr;
+		found->second.map_offset = 0;
 		found->second.map_size = 0;
+		if (g_custom_scan_resource == resource.handle)
+			g_custom_scan_resource = 0;
 	}
 }
 
@@ -2192,7 +2566,17 @@ void on_present(command_queue *queue, swapchain *, const rect *, const rect *, u
 	const uint32_t draws = g_draws.exchange(0, std::memory_order_relaxed);
 	g_last_draws.store(draws, std::memory_order_relaxed);
 	if ((GetAsyncKeyState(VK_F8) & 1) && game_has_focus())
-		toggle_shoulder_edit();
+	{
+		if (g_custom_runtime.configured())
+		{
+			const bool enabled = g_custom_runtime.toggle();
+			g_custom_capture_enabled.store(enabled, std::memory_order_release);
+			if (enabled)
+				request_discovery(true, scan_reason::enable);
+		}
+		else
+			toggle_shoulder_edit();
+	}
 	if (GetAsyncKeyState(VK_F9) & 1)
 		request_discovery(true, scan_reason::manual);
 	const auto now = std::chrono::steady_clock::now();
@@ -2201,6 +2585,7 @@ void on_present(command_queue *queue, swapchain *, const rect *, const rect *, u
 		now >= g_hunt_not_before)
 		ensure_hunt_thread();
 	service_shoulder_edit();
+	service_custom_runtime();
 	const size_t retired = maintain_edit();
 	if (retired != 0 && g_shoulder_desired.load(std::memory_order_acquire))
 	{
@@ -2253,6 +2638,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 		release_keys();
 		if (reserved == nullptr)
 		{
+			stop_custom_runtime();
 			end_edit();
 			stop_hunt_thread();
 		}

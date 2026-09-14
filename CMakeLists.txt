@@ -15,7 +15,10 @@ endif()
 
 add_library(HD2PaletteProbe SHARED src/addon.cpp)
 target_sources(HD2PaletteProbe PRIVATE src/ib_layout.hpp src/instance_lifecycle.hpp
-    src/profile_scan.hpp src/runtime_profile.hpp)
+    src/profile_scan.hpp src/runtime_profile.hpp src/retarget/custom_runtime.hpp
+    src/retarget/live_palette.hpp src/retarget/publisher.hpp src/retarget/runtime_adapter.hpp
+    src/retarget/rig_package.hpp src/retarget/json.hpp src/retarget/sha256.hpp
+    src/retarget/plan_encoder.hpp src/retarget/evaluator.hpp src/retarget/math_affine.hpp)
 target_compile_features(HD2PaletteProbe PRIVATE cxx_std_17)
 target_include_directories(HD2PaletteProbe PRIVATE
 	"${RESHADE_INCLUDE_DIR}")
@@ -72,6 +75,37 @@ if(BUILD_TESTING)
         target_compile_options(retarget_core_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME custom_armature_retarget_core COMMAND retarget_core_test)
+
+    add_executable(rig_package_test tests/rig_package_test.cpp
+        src/retarget/rig_package.hpp src/retarget/runtime_adapter.hpp src/retarget/sha256.hpp
+        src/retarget/json.hpp src/retarget/evaluator.hpp
+        src/retarget/math_affine.hpp src/ib_layout.hpp)
+    target_compile_features(rig_package_test PRIVATE cxx_std_17)
+    target_include_directories(rig_package_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if(MSVC)
+        target_compile_options(rig_package_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME custom_armature_rig_package COMMAND rig_package_test)
+
+    add_executable(live_palette_test tests/live_palette_test.cpp
+        src/retarget/live_palette.hpp src/retarget/custom_runtime.hpp src/retarget/publisher.hpp
+        src/retarget/runtime_adapter.hpp src/retarget/rig_package.hpp src/retarget/json.hpp
+        src/retarget/plan_encoder.hpp src/retarget/evaluator.hpp src/retarget/math_affine.hpp
+        src/ib_layout.hpp)
+    target_compile_features(live_palette_test PRIVATE cxx_std_17)
+    target_include_directories(live_palette_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if(MSVC)
+        target_compile_options(live_palette_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME custom_armature_live_palette COMMAND live_palette_test)
+
+    add_executable(publisher_test tests/publisher_test.cpp src/retarget/publisher.hpp)
+    target_compile_features(publisher_test PRIVATE cxx_std_17)
+    target_include_directories(publisher_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if(MSVC)
+        target_compile_options(publisher_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME custom_armature_publisher COMMAND publisher_test)
 
     add_executable(profile_scan_test tests/profile_scan_test.cpp src/profile_scan.hpp)
     target_compile_features(profile_scan_test PRIVATE cxx_std_17)
