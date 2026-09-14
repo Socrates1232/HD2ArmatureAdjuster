@@ -17,6 +17,7 @@ from build_ib_profile import (file64_to_t48, inverse_bind_tables, read_file, sha
 from extract_runtime_profile import (HEADER_SIZE, MAGIC, RECORD_HEADER_SIZE,
                                      UNIT_TYPE, bundle_entries, fnv1a, generate_profile,
                                      write_atomic)
+from pose_branch_plan import build_pose_branch_plan
 from rig_sidecar import export_rig_tree
 
 
@@ -630,6 +631,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="assign a known chest/shoulder/elbow/hand node name; repeatable")
     rig_command.add_argument("--force", action="store_true")
 
+    pose_command = commands.add_parser(
+        "pose-branch-plan",
+        help="build a clavicle-rooted, no-falloff dynamic shoulder plan from rig sidecars")
+    pose_command.add_argument("--rig-dir", required=True,
+                              help="directory containing generated .hd2rig.json sidecars")
+    pose_command.add_argument("--profile-dir", required=True,
+                              help="directory containing active_profiles.txt")
+    pose_command.add_argument("--out", required=True)
+    pose_command.add_argument("--left-output", type=float, nargs=3,
+                              default=(0.06, 0.0, 0.0), metavar=("X", "Y", "Z"))
+    pose_command.add_argument("--right-output", type=float, nargs=3,
+                              default=(-0.06, 0.0, 0.0), metavar=("X", "Y", "Z"))
+    pose_command.add_argument("--force", action="store_true")
+
     branch_command = commands.add_parser(
         "shoulder-targets",
         help="derive table-qualified shoulder and descendant slots from scene graphs")
@@ -697,6 +712,18 @@ def main() -> int:
                 "sidecars": len(result["sidecars"]),
                 "skipped_units": len(result["skipped_units"]),
                 "configured_roles": result["configured_roles"],
+            }, indent=2))
+        elif args.command == "pose-branch-plan":
+            refuse_game_output(args.out)
+            result = build_pose_branch_plan(
+                args.rig_dir, args.out, tuple(args.left_output), tuple(args.right_output),
+                active_runtime_tables(args.profile_dir), args.force)
+            print(json.dumps({
+                "output": os.path.abspath(args.out),
+                "tables": result["table_count"],
+                "slots": result["slot_count"],
+                "slots_by_side": result["slots_by_side"],
+                "runtime_status": result["runtime_status"],
             }, indent=2))
         elif args.command == "shoulder-targets":
             left = tuple(args.left_translate)

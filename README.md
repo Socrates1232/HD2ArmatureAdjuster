@@ -101,6 +101,29 @@ and validated parents, per-LOD slot mapping, exact table identities, and complet
 shoulder branches without falloff. This command reads patches and writes only
 JSON sidecars. The current runtime does not consume them yet.
 
+Generate the dynamic target plan separately from the legacy pre-offset map:
+
+```powershell
+python tools/patch_profile_tool.py pose-branch-plan `
+  --rig-dir "build\converted-mod\HD2ArmatureProfiles" `
+  --profile-dir "build\converted-mod\HD2ArmatureProfiles" `
+  --out "build\converted-mod\HD2ArmatureProfiles\pose_shoulder_plan.json" `
+  --left-output 0.06 0 0 `
+  --right-output -0.06 0 0
+```
+
+This derives each clavicle as the immediate structural parent of the resolved
+shoulder, then selects every weighted descendant in each exact runtime table.
+Every selected left slot receives the same `(+0.06, 0, 0)` requested output
+displacement and every right slot receives `(-0.06, 0, 0)`; there is no depth
+falloff. Redundant patch sidecars are unioned by exact unit/table/slot identity.
+
+The plan intentionally declares `runtime_status: offline_plan_only`. It is an FK
+branch translation, not an IK solve and not a legacy `shoulder_targets.txt` file.
+Runtime use still requires a verified live skin-linear snapshot and instance
+association so the replacement generator can calculate the different IB
+pre-offset needed by each currently animated slot.
+
 The exact table-qualified 2x legacy preset confirmed in game is retained as
 [`profiles/lacrima_static_shoulder_targets_2x.txt`](profiles/lacrima_static_shoulder_targets_2x.txt).
 Its validation record is
@@ -211,8 +234,9 @@ sampling thread or change scan/rebind scheduling.
 
 This prototype now provides external-profile discovery, persistent edit intent,
 scene-change instance recovery, reversible writes, and offline hierarchy-aware
-shoulder branch expansion with configurable depth falloff. The configured
-translation remains a bind/model-space pre-offset rather than a pose-aware
-shoulder-width control. The tapered preset limits distal animation artifacts; it
-does not replace the future live-pose correction. A general naming database and
-interactive editor remain future work.
+shoulder branch expansion with configurable depth falloff. It also produces an
+exact-table, clavicle-rooted no-falloff plan for the pose-correct path. The
+installed runtime translation remains a bind/model-space pre-offset rather than
+a pose-aware shoulder-width control: the plan is not applied until the separate
+live-pose/instance gate is satisfied. A general naming database, runtime pose
+source, and interactive editor remain future work.
