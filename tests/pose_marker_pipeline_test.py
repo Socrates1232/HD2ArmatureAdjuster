@@ -69,12 +69,13 @@ def main() -> int:
         targets = [line.split() for line in
                    (profiles / "shoulder_targets.txt").read_text(encoding="utf-8").splitlines()
                    if line and not line.startswith("#")]
-        if len(targets) != 12 or any(len(row) != 7 for row in targets):
+        if len(targets) != 12 or any(len(row) != 8 or
+                                     row[0] != "POSE_CONTROL_FROM_SOURCE" for row in targets):
             raise AssertionError("pose targets do not map control slots to source slots")
-        if any(int(row[2]) not in range(8, 14) or int(row[3]) not in range(1, 8)
+        if any(int(row[3]) not in range(8, 14) or int(row[4]) not in range(1, 8)
                for row in targets):
             raise AssertionError("control/source slot ranges are wrong")
-        if {tuple(row[4:]) for row in targets} != {
+        if {tuple(row[5:]) for row in targets} != {
                 ("+0.04", "+0.01", "+0"), ("-0.04", "+0.01", "+0")}:
             raise AssertionError("arm descendants did not receive one uniform request per side")
 
@@ -83,8 +84,8 @@ def main() -> int:
         unit = bundle[entry["data_offset"]:entry["data_offset"] + entry["data_size"]]
         for lod in read_bone_info(unit)["lods"]:
             table_key = f"{fnv1a(file64_to_t48(lod['inverse_binds'])):016x}"
-            control_for = {int(row[3]): int(row[2]) for row in targets
-                           if row[0] == f"{entry['file_id']:016x}" and row[1] == table_key}
+            control_for = {int(row[4]): int(row[3]) for row in targets
+                           if row[1] == f"{entry['file_id']:016x}" and row[2] == table_key}
             expected_remap = [control_for.get(slot, slot) for slot in range(8)]
             if lod["remaps"] != [expected_remap]:
                 raise AssertionError(f"LOD {lod['lod']} did not redirect arm remaps")

@@ -140,17 +140,19 @@ With the game stopped:
 
 If `active_profiles.txt` is absent, the add-on loads every `.hd2profile` in the directory. An explicit list is recommended because it prevents stale profiles from silently becoming active.
 
-The add-on validates profile structure and checksums, then looks only for complete exact 48-byte-per-entry table matches. One `F8` press records a persistent requested-ON state. With marker metadata present, the add-on passively locates the newest matching uploaded palette, checks its original slots against the profile's skeleton geometry, reads each untouched source slot's animated skin matrix, and derives the paired control-slot IB needed for one common inward correction. The marker is immutable; it is never used as a writable instance tag. Scene recovery rebinds new exact table instances and reacquires their palettes automatically. The next `F8` press requests OFF and restores only tables whose complete bytes still equal this add-on's expected override. `F9` manually requests a full discovery pass without changing the F8 state.
+The add-on validates profile structure and checksums, then looks only for complete exact 48-byte-per-entry table matches. One `F8` press records a persistent requested-ON state. Pose requests passively locate an uploaded palette matching an armed target's marker, check its original slots against the profile's skeleton geometry, read each untouched source slot's animated skin matrix, and derive the paired control-slot IB needed for one common inward correction. Unrelated loaded-profile markers cannot capture the palette tracker. The marker is immutable; it is never used as a writable instance tag. Scene recovery rebinds new exact table instances and reacquires their palettes automatically, including bounded full-scan retries after an initially empty scan. The next `F8` press requests OFF and restores only slot values still recognized as this add-on's output. `F9` manually requests a full discovery pass without changing the F8 state.
 
 `shoulder_targets.txt` uses one target per line:
 
 ```text
-unit_id  table_fingerprint  control_slot  source_slot  world_x  world_y  world_z
+POSE_CONTROL_FROM_SOURCE unit_id table_fingerprint control_slot source_slot world_x world_y world_z
+STATIC_IB_OFFSET         unit_id table_fingerprint slot                         world_x world_y world_z
 ```
 
-Blank lines and `#` comments are accepted. Legacy five- and six-field rows are
-still accepted for static controlled experiments; the pose-aware pipeline emits
-seven-field source/control rows.
+Blank lines and `#` comments are accepted. Legacy seven-field pose rows and
+five/six-field static rows remain readable, but newly generated profiles declare
+the mode explicitly. Marker presence never changes a static request into a pose
+request.
 
 ## Automated validation
 
@@ -182,7 +184,7 @@ powershell -ExecutionPolicy Bypass -File tools/run_live_test.ps1 `
   -SteamCapture -ShutdownAfterTest
 ```
 
-An edit is attempted only after a full profile-table match. Every target must still equal the profiled source bytes immediately before writing. The add-on verifies its write, maintains it if the engine refills the exact source value, and restores only values that still equal its injected bytes. Unknown third-party or engine states are not overwritten.
+An edit is attempted only after a full profile-table match. Every target must still equal the add-on's last expected bytes immediately before writing. Multi-slot writes are transactional: a failed write or final readback rolls back the slots it may have touched, and an unverified partial slot remains explicitly tracked as dirty instead of being abandoned. The add-on maintains verified edits if the engine refills the exact source value and restores only recognized slot values. Unknown third-party or engine states are not overwritten.
 
 Telemetry is written to `%LOCALAPPDATA%\HD2ArmatureAdjuster\telemetry.json`; test artifacts go to `test-results/<timestamp>`.
 

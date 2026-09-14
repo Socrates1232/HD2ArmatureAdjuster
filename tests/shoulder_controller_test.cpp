@@ -15,6 +15,8 @@ struct controller_model
 	uint32_t scan_ticks = 0;
 	uint32_t scan_starts = 0;
 	uint32_t edit_calls = 0;
+	int32_t retry_ticks = -1;
+	bool target_available = true;
 
 	void enable()
 	{
@@ -27,12 +29,21 @@ struct controller_model
 	void complete_scan()
 	{
 		if (phase == 1 && ++scan_ticks >= 2)
-			phase = 2;
+			phase = target_available ? 2u : 3u;
 	}
 
 	void present()
 	{
 		complete_scan();
+		if (desired && !active && !pending && phase == 3 && retry_ticks < 0)
+			retry_ticks = 2;
+		if (retry_ticks > 0)
+			--retry_ticks;
+		if (retry_ticks == 0 && shoulder_controller::background_scan_allowed(pending))
+		{
+			phase = 0;
+			retry_ticks = -1;
+		}
 		if (pending && phase > 1 && shoulder_controller::background_scan_allowed(pending))
 			phase = 0;
 		if (shoulder_controller::background_scan_allowed(pending) && phase == 0)
@@ -52,8 +63,18 @@ struct controller_model
 			active = true;
 			pending = false;
 			break;
+		case shoulder_controller::action::release_for_retry:
+			pending = false;
+			needs_fresh_scan = false;
+			retry_ticks = 2;
+			break;
 		case shoulder_controller::action::none:
 			break;
+		}
+		if (desired && !active && !pending && phase == 2)
+		{
+			++edit_calls;
+			active = true;
 		}
 	}
 
@@ -101,6 +122,23 @@ int main()
 		"an existing scan must be discarded before one shoulder-owned scan starts");
 	require(in_flight.edit_calls == 1,
 		"enable during an existing scan must eventually reach the editor");
+
+	controller_model delayed_target;
+	delayed_target.target_available = false;
+	delayed_target.enable();
+	for (uint32_t frame = 0; frame < 10; ++frame)
+		delayed_target.present();
+	require(delayed_target.scan_starts >= 2,
+		"an empty fresh scan must schedule a bounded retry");
+	delayed_target.target_available = true;
+	for (uint32_t frame = 0; frame < 20; ++frame)
+		delayed_target.present();
+	require(delayed_target.edit_calls == 1 && delayed_target.active,
+		"a target appearing after an empty scan must still reach the editor");
+
+	require(shoulder_controller::next_refresh(true, true) ==
+		shoulder_controller::refresh_action::full_scan,
+		"an overdue full scan must take priority over a priority-region scan");
 
 	std::cout << "shoulder controller scan ownership passed\n";
 	return 0;

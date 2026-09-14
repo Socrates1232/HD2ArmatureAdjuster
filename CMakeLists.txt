@@ -101,6 +101,22 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME shoulder_controller_scan_ownership COMMAND shoulder_controller_test)
 
+    add_executable(guarded_slot_writer_test tests/guarded_slot_writer_test.cpp src/guarded_slot_writer.hpp)
+    target_include_directories(guarded_slot_writer_test PRIVATE src)
+    target_compile_features(guarded_slot_writer_test PRIVATE cxx_std_17)
+    if(MSVC)
+        target_compile_options(guarded_slot_writer_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME guarded_multi_slot_write COMMAND guarded_slot_writer_test)
+
+    add_executable(edit_mode_test tests/edit_mode_test.cpp src/edit_mode.hpp)
+    target_include_directories(edit_mode_test PRIVATE src)
+    target_compile_features(edit_mode_test PRIVATE cxx_std_17)
+    if(MSVC)
+        target_compile_options(edit_mode_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME explicit_edit_mode_routing COMMAND edit_mode_test)
+
     add_test(NAME runtime_profile_pipeline
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/profile_pipeline_test.py")
     add_test(NAME shoulder_branch_pipeline

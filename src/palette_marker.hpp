@@ -27,6 +27,16 @@ struct palette_marker_hit
 	size_t palette_end = 0;
 };
 
+inline std::vector<palette_marker_hit> requested_palette_hits(
+	const std::vector<palette_marker_hit> &hits, const std::vector<uint8_t> &wanted_markers)
+{
+	std::vector<palette_marker_hit> requested;
+	for (const palette_marker_hit &hit : hits)
+		if (hit.marker_index < wanted_markers.size() && wanted_markers[hit.marker_index] != 0)
+			requested.push_back(hit);
+	return requested;
+}
+
 inline std::vector<palette_marker_hit> find_palette_markers(const uint8_t *data, size_t size,
 	const std::vector<palette_marker> &markers)
 {

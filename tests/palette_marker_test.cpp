@@ -32,11 +32,21 @@ int main()
 		std::cerr << '\n';
 		return 1;
 	}
+	const std::vector<palette_marker_hit> mixed_hits {
+		{ 1, 64, 1024 },
+		{ 0, 128, 768 },
+	};
+	const auto requested = requested_palette_hits(mixed_hits, std::vector<uint8_t> { 1, 0 });
+	if (requested.size() != 1 || requested[0].marker_index != 0 || requested[0].palette_end != 768)
+	{
+		std::cerr << "an unrelated higher palette displaced the requested marker\n";
+		return 2;
+	}
 	bytes[palette + static_cast<size_t>(probe_slot + 2) * 48] ^= 1;
 	if (!find_palette_markers(bytes.data(), bytes.size(), markers).empty())
 	{
 		std::cerr << "broken marker tail was accepted\n";
-		return 2;
+		return 3;
 	}
 	std::cout << "palette marker location and rejection passed\n";
 	return 0;

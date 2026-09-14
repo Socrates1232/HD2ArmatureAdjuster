@@ -121,11 +121,12 @@ def main() -> int:
         rows = [line.split() for line in
                 (root / "HD2ArmatureProfiles" / "shoulder_targets.txt").read_text(
                     encoding="utf-8").splitlines() if line and not line.startswith("#")]
-        if len(rows) != 10 or any(len(row) != 6 for row in rows):
+        if len(rows) != 10 or any(len(row) != 7 or row[0] != "STATIC_IB_OFFSET"
+                                  for row in rows):
             raise AssertionError("branch generator did not emit ten table-qualified targets")
-        if len({row[1] for row in rows}) != 2:
+        if len({row[2] for row in rows}) != 2:
             raise AssertionError("different LOD tables were not kept semantically distinct")
-        if {tuple(row[3:]) for row in rows} != {
+        if {tuple(row[4:]) for row in rows} != {
                 ("+0.03", "+0", "+0"), ("+0.02", "+0", "+0"),
                 ("+0.01", "+0", "+0"), ("-0.03", "+0", "+0"),
                 ("-0.02", "+0", "+0")}:

@@ -170,7 +170,7 @@ def generate_pose_targets(marker_result: dict, output_path: str, report_path: st
                           right_translation: tuple[float, float, float]) -> dict:
     targets = []
     lines = [
-        "# unit_id table_fingerprint control_slot source_slot translate_x translate_y translate_z",
+        "# mode unit_id table_fingerprint control_slot source_slot translate_x translate_y translate_z",
         "# Vertices use control_slot; live animation is read from untouched source_slot.",
     ]
     for marker in marker_result["markers"]:
@@ -185,7 +185,7 @@ def generate_pose_targets(marker_result: dict, output_path: str, report_path: st
             }
             targets.append(target)
             values = " ".join(f"{value:+.9g}" for value in translation)
-            lines.append(f"{target['unit_id']} {target['table_key']} "
+            lines.append(f"POSE_CONTROL_FROM_SOURCE {target['unit_id']} {target['table_key']} "
                          f"{target['control_slot']} {target['source_slot']} {values}")
     if not targets:
         raise ValueError("no remapped arm control slots were generated")
@@ -333,12 +333,13 @@ def generate_branch_targets(root: str, output_path: str, report_path: str,
         raise ValueError("no shoulder or descendant palette slots were found")
 
     lines = [
-        "# unit_id table_fingerprint slot translate_x translate_y translate_z",
+        "# mode unit_id table_fingerprint slot translate_x translate_y translate_z",
         "# Generated from scene-graph parent links and per-LOD RealIndices.",
     ]
     for target in targets:
         values = " ".join(f"{value:+.9g}" for value in target["translation"])
-        lines.append(f"{target['unit_id']} {target['table_key']} {target['slot']} {values}")
+        lines.append(f"STATIC_IB_OFFSET {target['unit_id']} {target['table_key']} "
+                     f"{target['slot']} {values}")
     result = {
         "schema": 1,
         "operation": "generate_table_qualified_shoulder_branches",

@@ -1,5 +1,7 @@
 #include <reshade.hpp>
 
+#include "edit_mode.hpp"
+#include "guarded_slot_writer.hpp"
 #include "ib_layout.hpp"
 #include "instance_lifecycle.hpp"
 #include "palette_marker.hpp"
@@ -31,10 +33,11 @@
 
 using namespace reshade;
 using namespace reshade::api;
+using shoulder_edit::edit_mode;
 
 namespace
 {
-constexpr char k_runtime_version[] = "1.4";
+constexpr char k_runtime_version[] = "1.5";
 constexpr char k_build_identifier[] = __DATE__ " " __TIME__;
 constexpr size_t k_scan_chunk_bytes = 4 * 1024 * 1024;
 constexpr size_t k_candidate_region_bytes = 64 * 1024;
@@ -87,8 +90,11 @@ struct active_target
 	uint32_t stale_frames = 0;
 	bool pose_aware = false;
 	bool ever_written = false;
+	bool dirty = false;
 	size_t marker_index = SIZE_MAX;
 	uint64_t last_palette_end = 0;
+	std::vector<uint32_t> dirty_slots;
+	std::vector<uint8_t> dirty_expected;
 };
 
 struct live_palette
@@ -109,6 +115,7 @@ struct edit_request
 	uint32_t slot = UINT32_MAX;
 	uint32_t source_slot = UINT32_MAX;
 	std::array<float, 3> world_translation {};
+	edit_mode mode = edit_mode::static_ib_offset;
 };
 
 struct edit_state
@@ -126,6 +133,7 @@ struct edit_state
 	uint32_t targets_selected = 0;
 	uint32_t targets_written = 0;
 	uint32_t targets_restored = 0;
+	uint32_t dirty_targets = 0;
 	bool restore_attempted = false;
 	bool restore_succeeded = false;
 	uint32_t error = 0;
@@ -160,10 +168,18 @@ uint32_t g_palette_same_end_frames = 0;
 uint64_t g_palette_scanned_bytes = 0;
 uint64_t g_palette_hits = 0;
 uint64_t g_palette_fresh_hits = 0;
+uint64_t g_palette_relevant_hits = 0;
+uint64_t g_palette_irrelevant_hits = 0;
+uint64_t g_palette_match_logged_request = 0;
 uint64_t g_pose_updates = 0;
 uint64_t g_pose_update_skips = 0;
 uint64_t g_pose_candidate_checks = 0;
 uint64_t g_pose_ownership_rejects = 0;
+uint64_t g_pose_request_unresolved = 0;
+uint64_t g_pose_candidates_at_enable = 0;
+uint64_t g_pose_rejects_at_enable = 0;
+uint64_t g_pose_unresolved_at_enable = 0;
+uint64_t g_pose_unresolved_logged_request = 0;
 std::atomic<uint64_t> g_palette_scan_calls { 0 };
 std::atomic<uint64_t> g_palette_scan_total_wall_us { 0 };
 std::atomic<uint64_t> g_palette_scan_last_wall_us { 0 };
@@ -619,18 +635,37 @@ void load_shoulder_targets()
 		edit_request target;
 		if (tokens.empty())
 			continue;
-		if (tokens.size() != 5 && tokens.size() != 6 && tokens.size() != 7)
+		size_t first_field = 0;
+		if (tokens[0] == "STATIC_IB_OFFSET")
+		{
+			target.mode = edit_mode::static_ib_offset;
+			first_field = 1;
+		}
+		else if (tokens[0] == "POSE_CONTROL_FROM_SOURCE")
+		{
+			target.mode = edit_mode::pose_control_from_source;
+			first_field = 1;
+		}
+		else
+			target.mode = tokens.size() == 7 ? edit_mode::pose_control_from_source :
+				edit_mode::static_ib_offset;
+		const size_t payload_fields = tokens.size() - first_field;
+		const bool field_count_ok = target.mode == edit_mode::pose_control_from_source ?
+			payload_fields == 7 : payload_fields == 5 || payload_fields == 6;
+		if (!field_count_ok)
 		{
 			g_shoulder_error = "invalid shoulder target on line " + std::to_string(line_number);
 			g_shoulder_targets.clear();
 			return;
 		}
-		unit_text = tokens[0];
-		const size_t slot_field = tokens.size() >= 6 ? 2 : 1;
-		const size_t source_field = tokens.size() == 7 ? 3 : slot_field;
-		const size_t translation_field = tokens.size() == 7 ? 4 : slot_field + 1;
-		if (tokens.size() >= 6)
-			table_text = tokens[1];
+		unit_text = tokens[first_field];
+		const size_t slot_field = first_field + (payload_fields >= 6 ? 2 : 1);
+		const size_t source_field = target.mode == edit_mode::pose_control_from_source ?
+			first_field + 3 : slot_field;
+		const size_t translation_field = target.mode == edit_mode::pose_control_from_source ?
+			first_field + 4 : slot_field + 1;
+		if (payload_fields >= 6)
+			table_text = tokens[first_field + 1];
 		const auto parsed = std::from_chars(unit_text.data(), unit_text.data() + unit_text.size(),
 			target.unit_id, 16);
 		const auto table_parsed = table_text.empty() ? std::from_chars_result {} :
@@ -671,7 +706,7 @@ void load_shoulder_targets()
 					(target.table_key == 0 || profile.table_key == target.table_key) &&
 					target.slot < profile.entries && target.source_slot < profile.entries;
 			});
-		const bool pose_layout = tokens.size() != 7 ||
+		const bool pose_layout = target.mode == edit_mode::static_ib_offset ||
 			std::any_of(g_palette_markers.begin(), g_palette_markers.end(),
 				[&target](const armature_probe::palette_marker &marker) {
 					return marker.unit_id == target.unit_id && marker.table_key == target.table_key &&
@@ -1052,7 +1087,7 @@ void request_discovery(bool full_scan, scan_reason reason)
 {
 	g_scan_requests.fetch_add(1, std::memory_order_relaxed);
 	const uint64_t scan_id = g_scan_id_counter.fetch_add(1, std::memory_order_acq_rel) + 1;
-	const uint64_t request_id = g_shoulder_pending.load(std::memory_order_acquire) ?
+	const uint64_t request_id = g_shoulder_desired.load(std::memory_order_acquire) ?
 		g_shoulder_request_id.load(std::memory_order_acquire) : 0;
 	g_scan_id_requested.store(scan_id, std::memory_order_release);
 	g_scan_request_id_requested.store(request_id, std::memory_order_release);
@@ -1112,9 +1147,17 @@ void scan_live_palettes()
 	const auto performance_started = std::chrono::steady_clock::now();
 	uint64_t handle = 0, window_offset = 0, count = 0;
 	std::vector<uint8_t> snapshot;
+	std::vector<uint8_t> wanted_markers;
 	{
 		std::unique_lock lock(g_mutex, std::try_to_lock);
 		if (!lock.owns_lock() || g_buffers.empty())
+			return;
+		wanted_markers.resize(g_palette_markers.size());
+		for (const active_target &target : g_active_targets)
+			if (target.pose_aware && target.marker_index < wanted_markers.size())
+				wanted_markers[target.marker_index] = 1;
+		if (std::none_of(wanted_markers.begin(), wanted_markers.end(),
+			[](uint8_t wanted) { return wanted != 0; }))
 			return;
 		auto choose = g_buffers.end();
 		if (g_palette_track_resource != 0)
@@ -1170,14 +1213,17 @@ void scan_live_palettes()
 	g_palette_scanned_bytes += snapshot.size();
 	const auto hits = armature_probe::find_palette_markers(snapshot.data(), snapshot.size(),
 		g_palette_markers);
+	const auto relevant_hits = armature_probe::requested_palette_hits(hits, wanted_markers);
 	record_palette_scan_performance(performance_started);
 	std::lock_guard lock(g_mutex);
 	std::vector<live_palette> previous = std::move(g_live_palettes);
 	g_live_palettes.clear();
 	uint64_t highest_end = 0;
 	bool highest_fresh = false;
-	for (const armature_probe::palette_marker_hit &hit : hits)
+	g_palette_irrelevant_hits += hits.size() - relevant_hits.size();
+	for (const armature_probe::palette_marker_hit &hit : relevant_hits)
 	{
+		++g_palette_relevant_hits;
 		const uint64_t absolute_offset = window_offset + hit.palette_offset;
 		const uint64_t absolute_end = window_offset + hit.palette_end;
 		live_palette palette;
@@ -1200,6 +1246,15 @@ void scan_live_palettes()
 			palette.fresh = true;
 		g_palette_fresh_hits += palette.fresh;
 		g_live_palettes.push_back(std::move(palette));
+		const uint64_t request_id = g_shoulder_request_id.load(std::memory_order_acquire);
+		if (g_palette_match_logged_request != request_id)
+		{
+			g_palette_match_logged_request = request_id;
+			log_control_event("PALETTE_MATCHED",
+				g_scan_id_current.load(std::memory_order_acquire), request_id,
+				"marker_index=" + std::to_string(hit.marker_index) +
+				" resource=" + std::to_string(handle));
+		}
 		if (absolute_end > highest_end)
 		{
 			highest_end = absolute_end;
@@ -1284,50 +1339,56 @@ size_t marker_for_profile(const loaded_table_profile &profile)
 }
 
 bool write_table_slots(const loaded_table_profile &profile, active_target &target,
-	const std::vector<uint8_t> &source, const std::vector<uint8_t> &destination,
-	bool rollback_on_failure = true)
+	const std::vector<uint8_t> &source, const std::vector<uint8_t> &destination)
 {
-	std::vector<uint32_t> owned = target.slots;
-	for (uint32_t slot : owned)
-	{
-		const size_t offset = static_cast<size_t>(slot) * armature_profile::transform_stride;
-		++g_edit.write_attempts;
-		if (!write_process_bytes(target.address + offset, destination.data() + offset,
-			armature_profile::transform_stride))
-		{
-			if (rollback_on_failure)
-				log_control_event("WRITE_RESULT",
-					g_scan_id_current.load(std::memory_order_acquire),
-					g_shoulder_request_id.load(std::memory_order_acquire),
-					"success=0 reason=write_failed address=" + std::to_string(target.address));
-			return false;
-		}
-		++g_edit.write_successes;
-	}
 	std::vector<uint8_t> current(profile.t48.size());
-	if (read_process_bytes(target.address, current.data(), current.size()) && current == destination)
+	const auto result = guarded_slot_writer::apply(target.slots,
+		armature_profile::transform_stride, source.data(), destination.data(),
+		[&](uint32_t slot, uint8_t *data, size_t size) {
+			return read_process_bytes(target.address + static_cast<size_t>(slot) *
+				armature_profile::transform_stride, data, size);
+		},
+		[&](uint32_t slot, const uint8_t *data, size_t size) {
+			return write_process_bytes(target.address + static_cast<size_t>(slot) *
+				armature_profile::transform_stride, data, size);
+		},
+		[&]() {
+			return read_process_bytes(target.address, current.data(), current.size()) &&
+				current == destination;
+		});
+	g_edit.write_attempts += result.forward_attempts;
+	g_edit.write_successes += result.forward_successes;
+	if (result.state == guarded_slot_writer::status::applied)
 	{
-		g_edit.immediate_readbacks += owned.size();
-		if (rollback_on_failure && !target.ever_written)
+		target.dirty = false;
+		target.dirty_slots.clear();
+		target.dirty_expected.clear();
+		g_edit.immediate_readbacks += target.slots.size();
+		if (!target.ever_written)
 			log_control_event("WRITE_RESULT",
 				g_scan_id_current.load(std::memory_order_acquire),
 				g_shoulder_request_id.load(std::memory_order_acquire),
-				"success=1 slots=" + std::to_string(owned.size()) +
+				"success=1 slots=" + std::to_string(target.slots.size()) +
 				" address=" + std::to_string(target.address));
 		return true;
 	}
-	if (rollback_on_failure)
-		for (uint32_t slot : owned)
-		{
-			const size_t offset = static_cast<size_t>(slot) * armature_profile::transform_stride;
-			write_process_bytes(target.address + offset, source.data() + offset,
-				armature_profile::transform_stride);
-		}
-	if (rollback_on_failure)
-		log_control_event("WRITE_RESULT",
-			g_scan_id_current.load(std::memory_order_acquire),
-			g_shoulder_request_id.load(std::memory_order_acquire),
-			"success=0 reason=readback_failed address=" + std::to_string(target.address));
+	const char *reason = result.state == guarded_slot_writer::status::write_failed_restored ?
+		"write_failed_rolled_back" :
+		result.state == guarded_slot_writer::status::readback_failed_restored ?
+		"readback_failed_rolled_back" : "dirty_partial_write";
+	if (result.state == guarded_slot_writer::status::dirty)
+	{
+		target.dirty = true;
+		target.dirty_slots = result.dirty_slots;
+		target.dirty_expected = destination;
+		++g_edit.dirty_targets;
+		g_edit.error = 4;
+	}
+	log_control_event("WRITE_RESULT",
+		g_scan_id_current.load(std::memory_order_acquire),
+		g_shoulder_request_id.load(std::memory_order_acquire),
+		"success=0 reason=" + std::string(reason) +
+		" address=" + std::to_string(target.address));
 	return false;
 }
 
@@ -1364,9 +1425,36 @@ size_t append_discovered_edits_locked(const std::vector<edit_request> &requests)
 				"accepted=0 reason=no_matching_slots address=" + std::to_string(target.address));
 			continue;
 		}
-		target.marker_index = marker_for_profile(profile);
-		if (target.marker_index != SIZE_MAX)
+		bool has_static_request = false;
+		bool has_pose_request = false;
+		for (const edit_request &request : requests)
+			if (request.unit_id == profile.unit_id &&
+				(request.table_key == 0 || request.table_key == profile.table_key) &&
+				std::find(target.slots.begin(), target.slots.end(), request.slot) != target.slots.end())
+			{
+				has_static_request |= !shoulder_edit::uses_pose_driver(request.mode);
+				has_pose_request |= shoulder_edit::uses_pose_driver(request.mode);
+			}
+		if (has_static_request && has_pose_request)
 		{
+			log_control_event("TARGET_VALIDATION_RESULT",
+				g_scan_id_current.load(std::memory_order_acquire),
+				g_shoulder_request_id.load(std::memory_order_acquire),
+				"accepted=0 reason=mixed_edit_modes address=" + std::to_string(target.address));
+			continue;
+		}
+		if (has_pose_request)
+		{
+			target.marker_index = marker_for_profile(profile);
+			if (target.marker_index == SIZE_MAX)
+			{
+				log_control_event("TARGET_VALIDATION_RESULT",
+					g_scan_id_current.load(std::memory_order_acquire),
+					g_shoulder_request_id.load(std::memory_order_acquire),
+					"accepted=0 reason=pose_marker_missing address=" +
+					std::to_string(target.address));
+				continue;
+			}
 			target.pose_aware = true;
 			target.expected = profile.t48;
 		}
@@ -1394,7 +1482,14 @@ size_t append_discovered_edits_locked(const std::vector<edit_request> &requests)
 		}
 		if (state == instance_lifecycle::table_state::pristine && !target.pose_aware &&
 			!write_table_slots(profile, target, profile.t48, target.expected))
+		{
+			if (target.dirty)
+			{
+				g_active_targets.push_back(std::move(target));
+				++instances_added;
+			}
 			continue;
+		}
 		if (!target.pose_aware)
 		{
 			target.ever_written = true;
@@ -1404,6 +1499,8 @@ size_t append_discovered_edits_locked(const std::vector<edit_request> &requests)
 			g_scan_id_current.load(std::memory_order_acquire),
 			g_shoulder_request_id.load(std::memory_order_acquire),
 			"accepted=1 pose_aware=" + std::to_string(target.pose_aware ? 1 : 0) +
+			" marker_index=" + (target.marker_index == SIZE_MAX ? std::string("none") :
+				std::to_string(target.marker_index)) +
 			" slots=" + std::to_string(target.slots.size()) +
 			" address=" + std::to_string(target.address));
 		g_active_targets.push_back(std::move(target));
@@ -1456,7 +1553,8 @@ bool begin_edit(std::chrono::steady_clock::time_point now)
 const edit_request *request_for_slot(const loaded_table_profile &profile, uint32_t slot)
 {
 	for (const edit_request &request : g_shoulder_targets)
-		if (request.unit_id == profile.unit_id && request.table_key == profile.table_key &&
+		if (request.mode == edit_mode::pose_control_from_source &&
+			request.unit_id == profile.unit_id && request.table_key == profile.table_key &&
 			request.slot == slot)
 			return &request;
 	if (g_requested_edit.unit_id == profile.unit_id &&
@@ -1520,7 +1618,7 @@ void drive_pose_targets()
 	const auto performance_started = std::chrono::steady_clock::now();
 	for (active_target &target : g_active_targets)
 	{
-		if (!target.pose_aware || target.profile_index >= g_profiles.size() ||
+		if (target.dirty || !target.pose_aware || target.profile_index >= g_profiles.size() ||
 			target.marker_index >= g_palette_markers.size())
 			continue;
 		const loaded_table_profile &profile = g_profiles[target.profile_index];
@@ -1533,6 +1631,12 @@ void drive_pose_targets()
 			if (!palette_matches_profile(profile, marker, palette))
 			{
 				++g_pose_ownership_rejects;
+				if (g_pose_rejects_at_enable == g_pose_ownership_rejects - 1)
+					log_control_event("PALETTE_REJECTED",
+						g_scan_id_current.load(std::memory_order_acquire),
+						g_shoulder_request_id.load(std::memory_order_acquire),
+						"reason=profile_geometry marker_index=" +
+						std::to_string(target.marker_index));
 				continue;
 			}
 
@@ -1574,6 +1678,16 @@ void drive_pose_targets()
 			}
 			if (driven == 0)
 			{
+				++g_pose_request_unresolved;
+				const uint64_t request_id =
+					g_shoulder_request_id.load(std::memory_order_acquire);
+				if (g_pose_unresolved_logged_request != request_id)
+				{
+					g_pose_unresolved_logged_request = request_id;
+					log_control_event("REQUEST_UNRESOLVED",
+						g_scan_id_current.load(std::memory_order_acquire), request_id,
+						"marker_index=" + std::to_string(target.marker_index));
+				}
 				++g_pose_update_skips;
 				break;
 			}
@@ -1610,6 +1724,11 @@ size_t maintain_edit()
 	for (auto item = g_active_targets.begin(); item != g_active_targets.end();)
 	{
 		active_target &target = *item;
+		if (target.dirty)
+		{
+			++item;
+			continue;
+		}
 		if (target.profile_index >= g_profiles.size())
 		{
 			item = g_active_targets.erase(item);
@@ -1673,41 +1792,57 @@ void end_edit()
 		return;
 	std::lock_guard lock(g_mutex);
 	g_edit.active = false;
-	bool restored = true;
+	std::vector<active_target> unresolved_targets;
 	for (active_target &target : g_active_targets)
 	{
-		if (!target.ever_written)
+		if (!target.ever_written && !target.dirty)
 			continue;
 		if (target.profile_index >= g_profiles.size())
 		{
-			restored = false;
+			unresolved_targets.push_back(std::move(target));
 			continue;
 		}
 		const loaded_table_profile &profile = g_profiles[target.profile_index];
-		std::vector<uint8_t> current(profile.t48.size());
 		g_edit.restore_attempted = true;
-		if (!read_process_bytes(target.address, current.data(), current.size()))
+		std::vector<uint32_t> slots = target.ever_written ? target.slots : target.dirty_slots;
+		bool unresolved = false;
+		for (uint32_t slot : slots)
 		{
-			restored = false;
-			continue;
+			const size_t offset = static_cast<size_t>(slot) * armature_profile::transform_stride;
+			std::array<uint8_t, armature_profile::transform_stride> current {};
+			if (!read_process_bytes(target.address + offset, current.data(), current.size()))
+			{
+				unresolved |= target.dirty;
+				continue;
+			}
+			const uint8_t *baseline = profile.t48.data() + offset;
+			if (std::memcmp(current.data(), baseline, current.size()) == 0)
+			{
+				g_edit.targets_restored += target.ever_written;
+				continue;
+			}
+			const bool expected_owned = offset + current.size() <= target.expected.size() &&
+				std::memcmp(current.data(), target.expected.data() + offset, current.size()) == 0;
+			const bool dirty_owned = offset + current.size() <= target.dirty_expected.size() &&
+				std::memcmp(current.data(), target.dirty_expected.data() + offset, current.size()) == 0;
+			if ((!expected_owned && !dirty_owned) ||
+				!write_process_bytes(target.address + offset, baseline, current.size()) ||
+				!read_process_bytes(target.address + offset, current.data(), current.size()) ||
+				std::memcmp(current.data(), baseline, current.size()) != 0)
+			{
+				unresolved = true;
+				continue;
+			}
+			g_edit.targets_restored += target.ever_written;
 		}
-		const instance_lifecycle::table_state state = instance_lifecycle::classify(
-			current.data(), profile.t48.data(), target.expected.data(), current.size());
-		if (state == instance_lifecycle::table_state::pristine)
-		{
-			g_edit.targets_restored += static_cast<uint32_t>(target.slots.size());
-			continue;
-		}
-		if (state != instance_lifecycle::table_state::our_override ||
-			!write_table_slots(profile, target, target.expected, profile.t48, false) ||
-			!read_process_bytes(target.address, current.data(), current.size()) || current != profile.t48)
-		{
-			restored = false;
-			continue;
-		}
-		g_edit.targets_restored += static_cast<uint32_t>(target.slots.size());
+		if (unresolved)
+			unresolved_targets.push_back(std::move(target));
 	}
-	g_edit.restore_succeeded = restored && g_edit.targets_restored == g_edit.targets_written;
+	g_active_targets = std::move(unresolved_targets);
+	g_edit.active = !g_active_targets.empty();
+	g_edit_active.store(g_edit.active, std::memory_order_release);
+	g_edit.restore_succeeded = !g_edit.active &&
+		g_edit.targets_restored == g_edit.targets_written;
 	if (!g_edit.restore_succeeded)
 		g_edit.error = 3;
 	log_control_event("RESTORE_RESULT",
@@ -1715,8 +1850,8 @@ void end_edit()
 		g_shoulder_request_id.load(std::memory_order_acquire),
 		"success=" + std::to_string(g_edit.restore_succeeded ? 1 : 0) +
 		" restored=" + std::to_string(g_edit.targets_restored) +
-		" written=" + std::to_string(g_edit.targets_written));
-	g_active_targets.clear();
+		" written=" + std::to_string(g_edit.targets_written) +
+		" unresolved_targets=" + std::to_string(g_active_targets.size()));
 }
 
 void toggle_shoulder_edit()
@@ -1733,7 +1868,10 @@ void toggle_shoulder_edit()
 		reset_palette_tracking();
 		g_shoulder_active.store(false, std::memory_order_release);
 		g_edit.completed = true;
-		g_shoulder_error.clear();
+		if (g_edit_active.load(std::memory_order_acquire))
+			g_shoulder_error = "restore left an unresolved dirty target";
+		else
+			g_shoulder_error.clear();
 		return;
 	}
 	if (g_edit_active.load(std::memory_order_acquire))
@@ -1749,6 +1887,9 @@ void toggle_shoulder_edit()
 	}
 	const uint64_t request_id = g_shoulder_request_id.fetch_add(1,
 		std::memory_order_acq_rel) + 1;
+	g_pose_candidates_at_enable = g_pose_candidate_checks;
+	g_pose_rejects_at_enable = g_pose_ownership_rejects;
+	g_pose_unresolved_at_enable = g_pose_request_unresolved;
 	g_shoulder_error.clear();
 	reset_palette_tracking();
 	g_shoulder_pending.store(true, std::memory_order_release);
@@ -1811,6 +1952,16 @@ void service_shoulder_edit()
 			g_shoulder_error = "fresh scan completed; no valid shoulder instance";
 		}
 		return;
+	case shoulder_controller::action::release_for_retry:
+		g_shoulder_applied_generation = generation;
+		g_shoulder_pending.store(false, std::memory_order_release);
+		g_shoulder_needs_fresh_scan.store(false, std::memory_order_release);
+		g_next_full_scan = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+		g_shoulder_error = "fresh scan empty; full retry scheduled";
+		log_control_event("SCAN_RETRY_SCHEDULED",
+			g_scan_id_current.load(std::memory_order_acquire),
+			g_shoulder_request_id.load(std::memory_order_acquire), "delay_ms=2000 scope=full");
+		return;
 	case shoulder_controller::action::none:
 		break;
 	}
@@ -1862,16 +2013,19 @@ void schedule_shoulder_discovery(std::chrono::steady_clock::time_point now)
 		request_discovery(true, scan_reason::resource_change);
 		return;
 	}
-	if (now >= g_next_priority_scan)
+	switch (shoulder_controller::next_refresh(
+		now >= g_next_full_scan, now >= g_next_priority_scan))
 	{
+	case shoulder_controller::refresh_action::full_scan:
+		g_next_full_scan = now + std::chrono::seconds(30);
+		request_discovery(true, scan_reason::resource_change);
+		return;
+	case shoulder_controller::refresh_action::priority_scan:
 		g_next_priority_scan = now + std::chrono::seconds(2);
 		request_discovery(false, scan_reason::priority_refresh);
 		return;
-	}
-	if (now >= g_next_full_scan)
-	{
-		g_next_full_scan = now + std::chrono::seconds(30);
-		request_discovery(true, scan_reason::resource_change);
+	case shoulder_controller::refresh_action::none:
+		return;
 	}
 }
 
@@ -2536,7 +2690,8 @@ void write_telemetry(uint32_t draws)
 	std::vector<std::string> profile_errors;
 	edit_state edit;
 	size_t buffer_count = 0, mapped_count = 0, active_instances = 0,
-		shoulder_target_count = 0;
+		shoulder_target_count = 0, static_target_count = 0, pose_target_count = 0,
+		required_marker_count = 0;
 	uint32_t profile_files = 0, profile_records = 0, profile_duplicates = 0;
 	{
 		std::lock_guard lock(g_mutex);
@@ -2554,15 +2709,36 @@ void write_telemetry(uint32_t draws)
 		profile_duplicates = g_profile_duplicates;
 		active_instances = g_active_targets.size();
 		shoulder_target_count = g_shoulder_targets.size();
+		for (const edit_request &target : g_shoulder_targets)
+			if (target.mode == edit_mode::pose_control_from_source)
+				++pose_target_count;
+			else
+				++static_target_count;
+		std::vector<size_t> required_markers;
+		for (const active_target &target : g_active_targets)
+			if (target.pose_aware && target.marker_index != SIZE_MAX &&
+				std::find(required_markers.begin(), required_markers.end(),
+					target.marker_index) == required_markers.end())
+				required_markers.push_back(target.marker_index);
+		required_marker_count = required_markers.size();
 	}
 	const bool shoulder_desired = g_shoulder_desired.load(std::memory_order_relaxed);
 	const bool shoulder_active = g_shoulder_active.load(std::memory_order_relaxed);
 	const bool shoulder_pending = g_shoulder_pending.load(std::memory_order_relaxed);
-	const bool shoulder_applied = shoulder_desired && edit.active && edit.write_successes != 0;
+	const bool shoulder_applied = shoulder_desired && edit.active && edit.targets_written != 0;
+	const char *shoulder_state = edit.active && edit.dirty_targets != 0 ?
+		"DIRTY_WRITE_UNRESOLVED" :
+		!shoulder_desired ? "OFF" :
+		shoulder_pending ? "WAITING_FOR_SCAN" :
+		!shoulder_active ? "WAITING_FOR_INSTANCE" :
+		shoulder_applied ? "APPLIED" :
+		g_pose_request_unresolved > g_pose_unresolved_at_enable ? "ARMED_REQUEST_UNRESOLVED" :
+		g_pose_ownership_rejects > g_pose_rejects_at_enable ? "ARMED_PALETTE_REJECTED" :
+		"ARMED_WAITING_FOR_PALETTE";
 
 	std::ostringstream json;
 	json << "{\n"
-		<< "  \"schema\": 10,\n"
+		<< "  \"schema\": 11,\n"
 		<< "  \"addon\": \"HD2 Armature Profile Runtime\",\n"
 		<< "  \"addon_version\": \"" << k_runtime_version << "\",\n"
 		<< "  \"build_identifier\": \"" << k_build_identifier << "\",\n"
@@ -2585,6 +2761,9 @@ void write_telemetry(uint32_t draws)
 		<< "  \"profile_tables_loaded\": " << profiles.size() << ",\n"
 		<< "  \"profile_load_errors\": " << profile_errors.size() << ",\n"
 		<< "  \"shoulder_config_targets\": " << shoulder_target_count << ",\n"
+		<< "  \"shoulder_static_targets\": " << static_target_count << ",\n"
+		<< "  \"shoulder_pose_targets\": " << pose_target_count << ",\n"
+		<< "  \"shoulder_state\": \"" << shoulder_state << "\",\n"
 		<< "  \"shoulder_desired_enabled\": "
 		<< (shoulder_desired ? "true" : "false") << ",\n"
 		<< "  \"shoulder_applied\": " << (shoulder_applied ? "true" : "false") << ",\n"
@@ -2696,9 +2875,13 @@ void write_telemetry(uint32_t draws)
 		<< "  \"palette_scan_wall_percent_sample\": "
 		<< g_resource_sample.palette_scan_wall_percent << ",\n"
 		<< "  \"palette_marker_hits_total\": " << g_palette_hits << ",\n"
+		<< "  \"palette_relevant_hits_total\": " << g_palette_relevant_hits << ",\n"
+		<< "  \"palette_irrelevant_hits_total\": " << g_palette_irrelevant_hits << ",\n"
+		<< "  \"palette_required_markers\": " << required_marker_count << ",\n"
 		<< "  \"palette_fresh_hits_total\": " << g_palette_fresh_hits << ",\n"
 		<< "  \"pose_candidate_checks_total\": " << g_pose_candidate_checks << ",\n"
 		<< "  \"pose_ownership_rejects_total\": " << g_pose_ownership_rejects << ",\n"
+		<< "  \"pose_request_unresolved_total\": " << g_pose_request_unresolved << ",\n"
 		<< "  \"pose_driver_calls_total\": "
 		<< g_pose_driver_calls.load(std::memory_order_relaxed) << ",\n"
 		<< "  \"pose_driver_wall_ms_total\": "
@@ -2764,6 +2947,7 @@ void write_telemetry(uint32_t draws)
 		<< "  \"edit_targets_selected\": " << edit.targets_selected << ",\n"
 		<< "  \"edit_targets_written\": " << edit.targets_written << ",\n"
 		<< "  \"edit_targets_restored\": " << edit.targets_restored << ",\n"
+		<< "  \"edit_dirty_targets\": " << edit.dirty_targets << ",\n"
 		<< "  \"edit_restore_attempted\": " << (edit.restore_attempted ? "true" : "false") << ",\n"
 		<< "  \"edit_restore_succeeded\": " << (edit.restore_succeeded ? "true" : "false") << ",\n"
 		<< "  \"edit_error\": " << edit.error << "\n"
