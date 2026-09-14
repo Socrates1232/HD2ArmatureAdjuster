@@ -15,7 +15,7 @@ endif()
 
 add_library(HD2PaletteProbe SHARED src/addon.cpp)
 target_sources(HD2PaletteProbe PRIVATE src/ib_layout.hpp src/instance_lifecycle.hpp
-    src/profile_scan.hpp src/runtime_profile.hpp)
+    src/palette_marker.hpp src/pose_driver.hpp src/profile_scan.hpp src/runtime_profile.hpp)
 target_compile_features(HD2PaletteProbe PRIVATE cxx_std_17)
 target_include_directories(HD2PaletteProbe PRIVATE
 	"${RESHADE_INCLUDE_DIR}")
@@ -53,6 +53,22 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME inverse_bind_layouts COMMAND ib_layout_test)
 
+    add_executable(pose_driver_test tests/pose_driver_test.cpp src/pose_driver.hpp)
+    target_compile_features(pose_driver_test PRIVATE cxx_std_17)
+    target_include_directories(pose_driver_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if(MSVC)
+        target_compile_options(pose_driver_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME pose_aware_inverse_bind_driver COMMAND pose_driver_test)
+
+    add_executable(palette_marker_test tests/palette_marker_test.cpp src/palette_marker.hpp)
+    target_compile_features(palette_marker_test PRIVATE cxx_std_17)
+    target_include_directories(palette_marker_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if(MSVC)
+        target_compile_options(palette_marker_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME live_palette_marker COMMAND palette_marker_test)
+
     add_executable(profile_scan_test tests/profile_scan_test.cpp src/profile_scan.hpp)
     target_compile_features(profile_scan_test PRIVATE cxx_std_17)
     target_include_directories(profile_scan_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -81,6 +97,8 @@ if(BUILD_TESTING)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/profile_pipeline_test.py")
     add_test(NAME shoulder_branch_pipeline
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/branch_target_pipeline_test.py")
+    add_test(NAME pose_marker_pipeline
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/pose_marker_pipeline_test.py")
     add_test(NAME resource_monitor_summary
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/resource_monitor_summary_test.py")
 endif()

@@ -77,6 +77,9 @@ def synthetic_bundle(ambiguous: bool) -> bytes:
     struct.pack_into("<I", unit, 0x34, scene_offset)
     struct.pack_into("<I", unit, 0x58, bone_offset)
     unit += scene + bone_info
+    ending_offset = (len(unit) + 15) & ~15
+    unit += bytes(ending_offset + 8 - len(unit))
+    struct.pack_into("<I", unit, 0x60, ending_offset)
 
     data_offset = 72 + 32 + 80
     bundle = bytearray(data_offset)

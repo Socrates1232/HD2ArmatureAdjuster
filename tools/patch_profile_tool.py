@@ -17,6 +17,7 @@ from build_ib_profile import (file64_to_t48, inverse_bind_tables, read_file, sha
 from extract_runtime_profile import (HEADER_SIZE, MAGIC, RECORD_HEADER_SIZE,
                                      UNIT_TYPE, bundle_entries, fnv1a, generate_profile,
                                      write_atomic)
+from pose_marker_pipeline import prepare_pose_tree
 
 
 PATCH_NAME = re.compile(r"^[0-9a-fA-F]{16}\.patch_[0-9]+$")
@@ -139,6 +140,29 @@ def active_runtime_tables(profile_directory: str | None) -> set[tuple[int, int, 
     return active
 
 
+def marker_slots(profile_directory: str | None) -> dict[tuple[int, int], int]:
+    if profile_directory is None:
+        return {}
+    path = os.path.join(profile_directory, "palette_markers.txt")
+    if not os.path.isfile(path):
+        return {}
+    result = {}
+    with open(path, encoding="utf-8") as stream:
+        for line_number, raw in enumerate(stream, 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            fields = line.split()
+            if len(fields) != 5:
+                raise ValueError(f"palette_markers.txt:{line_number}: expected five fields")
+            unit_id, table_key = int(fields[0], 16), int(fields[1], 16)
+            entries, probe_slot, tail_repeats = map(int, fields[2:])
+            if probe_slot + tail_repeats + 1 != entries:
+                raise ValueError(f"palette_markers.txt:{line_number}: marker is not the table tail")
+            result[(unit_id, table_key)] = probe_slot
+    return result
+
+
 def generate_branch_targets(root: str, output_path: str, report_path: str,
                             left_translation: tuple[float, float, float],
                             right_translation: tuple[float, float, float],
@@ -152,6 +176,7 @@ def generate_branch_targets(root: str, output_path: str, report_path: str,
     refuse_game_output(output_path)
     require_new_outputs([output_path, report_path], force)
     active = active_runtime_tables(profile_directory)
+    probes = marker_slots(profile_directory)
     patches = []
     for directory, child_directories, files in os.walk(root):
         child_directories.sort(key=str.casefold)
@@ -208,6 +233,9 @@ def generate_branch_targets(root: str, output_path: str, report_path: str,
                 if len(palette["real"]) != table["bones"]:
                     raise ValueError(f"{relative}: unit {unit_id:016x} LOD {table['lod']} palette mismatch")
                 for slot, node in enumerate(palette["real"]):
+                    marker_start = probes.get((unit_id, table_key))
+                    if marker_start is not None and slot >= marker_start:
+                        continue
                     side, depth = branch_membership(node, parents, left_root, right_root)
                     key = (unit_id, table_key, slot)
                     item = observations.setdefault(key, {
@@ -620,6 +648,12 @@ def build_parser() -> argparse.ArgumentParser:
     tree_command.add_argument("--out-dir", required=True)
     tree_command.add_argument("--force", action="store_true")
 
+    pose_command = commands.add_parser(
+        "pose-tree", help="copy a mod tree, append palette markers, and build pose-aware profiles")
+    pose_command.add_argument("--root", required=True)
+    pose_command.add_argument("--out-root", required=True)
+    pose_command.add_argument("--marker-min", type=int, default=8)
+
     branch_command = commands.add_parser(
         "shoulder-targets",
         help="derive table-qualified shoulder and descendant slots from scene graphs")
@@ -679,6 +713,39 @@ def main() -> int:
                 "unique_runtime_tables": result["unique_runtime_tables"],
                 "distinct_units": result["distinct_units"],
                 "skipped_patches": len(result["skipped_patches"]),
+            }, indent=2))
+        elif args.command == "pose-tree":
+            if args.marker_min < 4:
+                raise ValueError("--marker-min must be at least four")
+            result = prepare_pose_tree(args.root, args.out_root, args.marker_min)
+            profile_directory = os.path.join(os.path.abspath(args.out_root),
+                                             "HD2ArmatureProfiles")
+            profile_result = profile_tree(args.out_root, profile_directory, False)
+            marker_lines = [
+                "# unit_id table_fingerprint entries probe_slot tail_repeats",
+                "# The probe is followed by an immutable repeated tail used for live-palette location.",
+            ]
+            for marker in result["markers"]:
+                marker_lines.append(
+                    f"{marker['unit_id']} {marker['table_key']} {marker['entries']} "
+                    f"{marker['probe_slot']} {marker['tail_repeats']}")
+            write_atomic(os.path.join(profile_directory, "palette_markers.txt"),
+                         ("\n".join(marker_lines) + "\n").encode("utf-8"))
+            write_atomic(os.path.join(profile_directory, "palette_markers.json"),
+                         (json.dumps(result, indent=2) + "\n").encode("utf-8"))
+            targets = generate_branch_targets(
+                args.out_root,
+                os.path.join(profile_directory, "shoulder_targets.txt"),
+                os.path.join(profile_directory, "shoulder_targets.json"),
+                (0.03, 0.0, 0.0), (-0.03, 0.0, 0.0),
+                profile_directory, -1, False)
+            print(json.dumps({
+                "output_root": os.path.abspath(args.out_root),
+                "patches_marked": result["patches_marked"],
+                "marker_variants": result["variants"],
+                "marker_tables": len(result["markers"]),
+                "profiles_active": profile_result["profiles_active"],
+                "arm_targets": len(targets["targets"]),
             }, indent=2))
         elif args.command == "shoulder-targets":
             left = tuple(args.left_translate)

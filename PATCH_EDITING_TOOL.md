@@ -110,3 +110,24 @@ only the profiles that contribute at least one new exact runtime table. The
 add-on then unions those active profiles. Two patches need only one active
 fingerprint when their unit ID, table size, and inverse-bind bytes are all
 identical; variants with different table bytes must both remain active.
+
+### Build a pose-aware marked tree
+
+```powershell
+python tools\patch_profile_tool.py pose-tree `
+  --root "C:\path\to\finished-mod" `
+  --out-root "C:\path\to\finished-mod-pose-aware"
+```
+
+This is the complete post-build hook for the dynamic armature path. It copies
+the tree, appends an unweighted probe plus repeated tail to shoulder-bearing
+palettes, profiles the marked patches, unions redundant runtime tables, and
+generates `palette_markers.txt` plus a uniform full-arm `shoulder_targets.txt`.
+The original tree is never modified and the output cannot be a game directory.
+
+The repeated tail identifies the palette layout in mapped GPU-upload memory.
+The probe is changed only at runtime and carries a table-instance code and
+revision, allowing the add-on to reject stale palettes. Neither marker is added
+to remap/weight arrays, so the new slots do not directly affect vertices. Each
+replacement variant needs marking because its palette shape may differ, while
+identical runtime tables are still represented once in the active profile union.

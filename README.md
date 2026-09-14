@@ -11,23 +11,24 @@ runtime profile in one command. See [`PATCH_EDITING_TOOL.md`](PATCH_EDITING_TOOL
 ## Current architecture
 
 ```text
-finished .patch_N
+finished mod-tree copy
         |
         v
-extract_runtime_profile.py
+patch_profile_tool.py pose-tree
         |
+        +-- marked .patch_N   unweighted probe + repeated palette tail
         +-- .hd2profile       exact converted IB tables + patch identity
-        +-- .hd2profile.json  reviewable manifest
+        +-- palette_markers   live-palette locator metadata
         |
-        +-- shoulder-targets  scene graph + per-LOD RealIndices
+        +-- shoulder_targets  scene graph + per-LOD RealIndices
                     |
-                    +-- shoulder_targets.txt (unit + exact table + slot)
+                    +-- one uniform request for every arm descendant
                     |
                     v
 HD2ArmatureProfiles beside the add-on
                     |
                     v
-ReShade add-on: discover -> register live instance -> guarded edit -> recover/reapply
+ReShade add-on: find IB -> locate live palette -> derive per-slot IB -> recover/reapply
 ```
 
 Each profile represents one finished main patch bundle. It may contain several unit IDs and LOD tables. Identical tables shared by multiple LODs are stored once with an LOD mask. Multiple active profile files compose into one runtime registry; records with the same unit ID, entry count, and exact table bytes are merged during loading.
@@ -67,7 +68,23 @@ python tools/patch_profile_tool.py translate `
   --translate 0.0 0.15 0.0
 ```
 
-After `profile-tree`, generate the shoulder branches from the copied mod tree:
+For pose-aware shoulder adjustment, run the combined pipeline on a finished mod
+tree. The output must not already exist and is a separate, installable copy:
+
+```powershell
+python tools/patch_profile_tool.py pose-tree `
+  --root "C:\path\to\finished-mod" `
+  --out-root "C:\path\to\finished-mod-pose-aware"
+```
+
+This appends one unweighted probe slot followed by a variant-specific repeated
+tail to every shoulder-bearing palette. GPU and stream companions are copied
+byte-identically. It then creates the active profile union, `palette_markers.txt`,
+and a full left/right arm-descendant target map. The marker lets the runtime
+associate an uploaded animated palette with both its unit layout and the exact
+inverse-bind revision that produced it.
+
+For static diagnostic experiments, `profile-tree` can still be followed by:
 
 ```powershell
 python tools/patch_profile_tool.py shoulder-targets `
@@ -80,12 +97,15 @@ branches through every LOD's `RealIndices`, and qualifies every output slot with
 the exact table's FNV-1a fingerprint. It rejects an exact runtime table if the
 same slot has conflicting semantics in another LOD or replacement variant.
 
-The normal preset is a tapered shape adjustment: shoulder entries receive
+The standalone static command defaults to a tapered shape adjustment: shoulder entries receive
 `0.03 m`, depth-one descendants `0.02 m`, depth-two descendants `0.01 m`, and
 depth-three or deeper descendants are left pristine. This reaches zero at the
 hand before the finger chains, avoiding the per-finger rotations observed when
 the old uniform offset was propagated through the whole animated branch. Use
-`--falloff-depth -1` only to reproduce that full-branch diagnostic.
+`--falloff-depth -1` reproduces the old full-branch static diagnostic. The
+`pose-tree` command intentionally uses a uniform full branch: hierarchy chooses
+the affected slots, while runtime pose math derives each slot's required IB
+matrix instead of hardcoding a different displacement at every depth.
 
 ## Build
 
@@ -109,11 +129,12 @@ With the game stopped:
 2. Create `Helldivers 2\bin\HD2ArmatureProfiles`.
 3. Copy the desired `.hd2profile` files into that directory.
 4. Put their filenames, one per line, in `active_profiles.txt` in the same directory.
-5. For the shoulder test, copy a target map as `shoulder_targets.txt` in that directory.
+5. For pose-aware shoulder adjustment, also copy `shoulder_targets.txt` and
+   `palette_markers.txt` from the same generated directory.
 
 If `active_profiles.txt` is absent, the add-on loads every `.hd2profile` in the directory. An explicit list is recommended because it prevents stale profiles from silently becoming active.
 
-The add-on validates profile structure and checksums, then looks only for complete exact 48-byte-per-entry table matches. One `F8` press records a persistent requested-ON state. The runtime applies it to every valid live table instance, retires stale addresses, scans known productive regions every two seconds, schedules a full scan after resource churn, and performs a full fallback scan every 30 seconds. A new valid instance is edited automatically without another key press. The next `F8` press requests OFF and restores only tables whose complete bytes still equal this add-on's expected override. `F9` manually requests a full discovery pass without changing the F8 state.
+The add-on validates profile structure and checksums, then looks only for complete exact 48-byte-per-entry table matches. One `F8` press records a persistent requested-ON state. With marker metadata present, the first guarded write changes only the unweighted probe. The add-on passively scans game-mapped upload buffers for the repeated tail, verifies the probe code/revision, and reconstructs each arm slot's current native skin transform. One common inward correction is then conjugated through each slot's live pose to derive the next IB table. Scene recovery rebinds new exact table instances and re-establishes the probe automatically. The next `F8` press requests OFF and restores only tables whose complete bytes still equal this add-on's expected override. `F9` manually requests a full discovery pass without changing the F8 state.
 
 `shoulder_targets.txt` uses one target per line:
 
@@ -161,8 +182,8 @@ Telemetry is written to `%LOCALAPPDATA%\HD2ArmatureAdjuster\telemetry.json`; tes
 
 ## Resource monitoring
 
-The console and telemetry separate the recurring add-on work into scanner,
-per-frame maintenance, and rebind costs. Scanner CPU is reported as a percentage
+The console and telemetry separate the recurring add-on work into IB scanner,
+live-palette scanner, pose driver, per-frame maintenance, and rebind costs. Scanner CPU is reported as a percentage
 of one logical core; maintenance and rebind percentages are their measured wall
 time divided by the latest one-second sample interval. Whole-process CPU is
 normalized across all logical processors and is included only for correlation.
@@ -170,8 +191,9 @@ normalized across all logical processors and is included only for correlation.
 Every run also creates
 `%LOCALAPPDATA%\HD2ArmatureAdjuster\resource-monitor-<session>.csv`, with one row
 per second. It records scan requests and coalescing, full versus priority runs,
-bytes and CPU time spent scanning, table-maintenance reads and timing, rebind
-timing, and the game's working/private memory. Summarize the newest session with:
+bytes and CPU time spent scanning, live-palette bytes/hits and timing, pose
+updates/skips and timing, table-maintenance reads, rebind timing, and the game's
+working/private memory. Summarize the newest session with:
 
 ```powershell
 python tools/summarize_resource_monitor.py
@@ -183,10 +205,10 @@ sampling thread or change scan/rebind scheduling.
 
 ## Scope
 
-This prototype now provides external-profile discovery, persistent edit intent,
-scene-change instance recovery, reversible writes, and offline hierarchy-aware
-shoulder branch expansion with configurable depth falloff. The configured
-translation remains a bind/model-space pre-offset rather than a pose-aware
-shoulder-width control. The tapered preset limits distal animation artifacts; it
-does not replace the future live-pose correction. A general naming database and
-interactive editor remain future work.
+This prototype now implements external-profile discovery, persistent edit
+intent, scene-change instance recovery, reversible writes, offline hierarchy
+selection, patch marker generation, live-palette association, and pose-derived
+full-arm IB updates. The pose-aware path has unit and offline tests but still
+requires its first in-game validation; the previously validated tapered static
+path remains the fallback when marker metadata is absent. A general naming
+database and interactive editor remain future work.

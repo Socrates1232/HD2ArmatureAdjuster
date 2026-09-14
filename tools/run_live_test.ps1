@@ -41,6 +41,8 @@ $installedProfileDirectory = Join-Path $gameBin 'HD2ArmatureProfiles'
 $activeProfilesPath = Join-Path $installedProfileDirectory 'active_profiles.txt'
 $installedShoulderTargets = Join-Path $installedProfileDirectory 'shoulder_targets.txt'
 $installedShoulderReport = Join-Path $installedProfileDirectory 'shoulder_targets.json'
+$installedPaletteMarkers = Join-Path $installedProfileDirectory 'palette_markers.txt'
+$installedPaletteReport = Join-Path $installedProfileDirectory 'palette_markers.json'
 $runtimeDirectory = Join-Path $env:LOCALAPPDATA 'HD2ArmatureAdjuster'
 $telemetryPath = Join-Path $runtimeDirectory 'telemetry.json'
 $automationPath = Join-Path $runtimeDirectory 'automation.request'
@@ -185,6 +187,8 @@ if ($RecoverOnly) {
 $ProfileDirectory = (Resolve-Path -LiteralPath $ProfileDirectory).Path
 $sourceShoulderTargets = Join-Path $ProfileDirectory 'shoulder_targets.txt'
 $sourceShoulderReport = Join-Path $ProfileDirectory 'shoulder_targets.json'
+$sourcePaletteMarkers = Join-Path $ProfileDirectory 'palette_markers.txt'
+$sourcePaletteReport = Join-Path $ProfileDirectory 'palette_markers.json'
 $sourceActiveProfiles = Join-Path $ProfileDirectory 'active_profiles.txt'
 if (Test-Path -LiteralPath $sourceActiveProfiles) {
     $requestedProfiles = @(Get-Content -LiteralPath $sourceActiveProfiles | Where-Object { $_ })
@@ -275,6 +279,12 @@ if (!$NoDeploy) {
              (Get-FileHash -LiteralPath $installedShoulderTargets -Algorithm SHA256).Hash)) {
             throw 'The game is running and installed shoulder_targets.txt differs. Close the game and rerun.'
         }
+        if ((Test-Path -LiteralPath $sourcePaletteMarkers) -and
+            (!(Test-Path -LiteralPath $installedPaletteMarkers) -or
+             (Get-FileHash -LiteralPath $sourcePaletteMarkers -Algorithm SHA256).Hash -ne
+             (Get-FileHash -LiteralPath $installedPaletteMarkers -Algorithm SHA256).Hash)) {
+            throw 'The game is running and installed palette_markers.txt differs. Close the game and rerun.'
+        }
     }
     else {
         New-Item -ItemType Directory -Force -Path $installedProfileDirectory | Out-Null
@@ -287,6 +297,12 @@ if (!$NoDeploy) {
         }
         if (Test-Path -LiteralPath $sourceShoulderReport) {
             Copy-Item -LiteralPath $sourceShoulderReport -Destination $installedShoulderReport -Force
+        }
+        if (Test-Path -LiteralPath $sourcePaletteMarkers) {
+            Copy-Item -LiteralPath $sourcePaletteMarkers -Destination $installedPaletteMarkers -Force
+        }
+        if (Test-Path -LiteralPath $sourcePaletteReport) {
+            Copy-Item -LiteralPath $sourcePaletteReport -Destination $installedPaletteReport -Force
         }
     }
 }
@@ -313,6 +329,12 @@ else {
          (Get-FileHash -LiteralPath $sourceShoulderTargets -Algorithm SHA256).Hash -ne
          (Get-FileHash -LiteralPath $installedShoulderTargets -Algorithm SHA256).Hash)) {
         throw 'The installed shoulder_targets.txt differs while -NoDeploy is active.'
+    }
+    if ((Test-Path -LiteralPath $sourcePaletteMarkers) -and
+        (!(Test-Path -LiteralPath $installedPaletteMarkers) -or
+         (Get-FileHash -LiteralPath $sourcePaletteMarkers -Algorithm SHA256).Hash -ne
+         (Get-FileHash -LiteralPath $installedPaletteMarkers -Algorithm SHA256).Hash)) {
+        throw 'The installed palette_markers.txt differs while -NoDeploy is active.'
     }
 }
 

@@ -63,6 +63,20 @@ def summarize(path: Path) -> dict[str, object]:
             "cpu_core_percent_peak_sample": peak("scan_cpu_core_percent"),
             "cpu_core_percent_session": number(last, "scan_session_cpu_core_percent"),
         },
+        "palette_scanner": {
+            "calls": int(number(last, "palette_scan_calls")),
+            "total_mib_read": number(last, "palette_scan_total_mib"),
+            "wall_ms_peak_scan": peak("palette_scan_max_ms"),
+            "wall_percent_peak_sample": peak("palette_scan_wall_percent"),
+            "marker_hits": int(number(last, "palette_marker_hits")),
+        },
+        "pose_driver": {
+            "calls": int(number(last, "pose_driver_calls")),
+            "wall_us_peak_call": peak("pose_driver_max_us"),
+            "wall_percent_peak_sample": peak("pose_driver_wall_percent"),
+            "updates": int(number(last, "pose_updates")),
+            "skips": int(number(last, "pose_update_skips")),
+        },
         "maintenance": {
             "calls": int(number(last, "maintenance_calls")),
             "table_checks": int(number(last, "maintenance_table_checks")),

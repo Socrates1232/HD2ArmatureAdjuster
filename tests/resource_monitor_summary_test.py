@@ -21,6 +21,10 @@ def main() -> int:
         "maintenance_table_checks", "maintenance_read_mib", "maintenance_max_us",
         "maintenance_wall_percent", "rebind_calls", "rebind_candidates",
         "rebind_instances_added", "rebind_max_us", "rebind_wall_percent",
+        "palette_scan_calls", "palette_scan_total_mib", "palette_scan_max_ms",
+        "palette_scan_wall_percent", "palette_marker_hits", "pose_driver_calls",
+        "pose_driver_max_us", "pose_driver_wall_percent", "pose_updates",
+        "pose_update_skips",
     ]
     rows = [
         dict.fromkeys(fields, "0") | {
@@ -40,6 +44,11 @@ def main() -> int:
             "maintenance_wall_percent": "0.2", "rebind_calls": "2",
             "rebind_candidates": "6", "rebind_instances_added": "2",
             "rebind_max_us": "40", "rebind_wall_percent": "0.05",
+            "palette_scan_calls": "60", "palette_scan_total_mib": "240",
+            "palette_scan_max_ms": "2.5", "palette_scan_wall_percent": "4.0",
+            "palette_marker_hits": "12", "pose_driver_calls": "10",
+            "pose_driver_max_us": "80", "pose_driver_wall_percent": "0.08",
+            "pose_updates": "8", "pose_update_skips": "2",
         },
     ]
     with tempfile.TemporaryDirectory() as temporary:
@@ -59,6 +68,8 @@ def main() -> int:
     assert result["process"]["working_set_mib_peak"] == 8100.0
     assert result["scanner"]["runs"] == 2
     assert result["scanner"]["cpu_core_percent_peak_sample"] == 7.0
+    assert result["palette_scanner"]["marker_hits"] == 12
+    assert result["pose_driver"]["updates"] == 8
     assert result["maintenance"]["wall_us_peak_call"] == 30.0
     assert result["rebind"]["instances_added"] == 2
     return 0
