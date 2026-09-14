@@ -155,6 +155,28 @@ An edit is attempted only after a full profile-table match. Every target must st
 
 Telemetry is written to `%LOCALAPPDATA%\HD2ArmatureAdjuster\telemetry.json`; test artifacts go to `test-results/<timestamp>`.
 
+## Resource monitoring
+
+The console and telemetry separate the recurring add-on work into scanner,
+per-frame maintenance, and rebind costs. Scanner CPU is reported as a percentage
+of one logical core; maintenance and rebind percentages are their measured wall
+time divided by the latest one-second sample interval. Whole-process CPU is
+normalized across all logical processors and is included only for correlation.
+
+Every run also creates
+`%LOCALAPPDATA%\HD2ArmatureAdjuster\resource-monitor-<session>.csv`, with one row
+per second. It records scan requests and coalescing, full versus priority runs,
+bytes and CPU time spent scanning, table-maintenance reads and timing, rebind
+timing, and the game's working/private memory. Summarize the newest session with:
+
+```powershell
+python tools/summarize_resource_monitor.py
+```
+
+Pass a CSV path to summarize an older session. The monitor performs one process
+resource query and one short CSV append per second; it does not add another
+sampling thread or change scan/rebind scheduling.
+
 ## Scope
 
 This prototype now provides external-profile discovery, persistent edit intent,

@@ -20,6 +20,7 @@ target_compile_features(HD2PaletteProbe PRIVATE cxx_std_17)
 target_include_directories(HD2PaletteProbe PRIVATE
 	"${RESHADE_INCLUDE_DIR}")
 target_compile_definitions(HD2PaletteProbe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(HD2PaletteProbe PRIVATE Psapi)
 
 set_target_properties(HD2PaletteProbe PROPERTIES
     PREFIX ""
@@ -80,4 +81,6 @@ if(BUILD_TESTING)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/profile_pipeline_test.py")
     add_test(NAME shoulder_branch_pipeline
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/branch_target_pipeline_test.py")
+    add_test(NAME resource_monitor_summary
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/resource_monitor_summary_test.py")
 endif()

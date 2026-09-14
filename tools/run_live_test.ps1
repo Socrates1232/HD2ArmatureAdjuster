@@ -493,8 +493,15 @@ $status = if ($loadError) { 'failed-load' }
     else { 'passed-converted-scan' }
 
 $interestingLog | Set-Content -LiteralPath (Join-Path $resultDir 'reshade-tail.log') -Encoding utf8
+$resourceMonitorArtifact = $null
 if ($telemetrySeen) {
     $latestTelemetry | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $resultDir 'telemetry.json') -Encoding utf8
+    if ($latestTelemetry.resource_monitor_path -and
+        (Test-Path -LiteralPath $latestTelemetry.resource_monitor_path)) {
+        $resourceMonitorArtifact = 'resource-monitor.csv'
+        Copy-Item -LiteralPath $latestTelemetry.resource_monitor_path `
+            -Destination (Join-Path $resultDir $resourceMonitorArtifact)
+    }
 }
 if ($SteamCapture) {
     $newScreenshots = @(Get-ChildItem -LiteralPath $steamScreenshotDirectory -File |
@@ -558,6 +565,7 @@ $summary = [ordered]@{
     heartbeat_age_seconds = $heartbeatAge
     process_alive = $processAlive
     runtime_active = $runtimeActive
+    resource_monitor_file = $resourceMonitorArtifact
     experiment_mode = $experimentMode
     expected_experiment_mode = $expectedMode
     max_converted_ib_hits = $maxHits

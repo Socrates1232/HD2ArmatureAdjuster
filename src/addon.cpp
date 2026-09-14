@@ -6,6 +6,7 @@
 #include "runtime_profile.hpp"
 
 #include <Windows.h>
+#include <Psapi.h>
 
 #include <algorithm>
 #include <array>
@@ -29,6 +30,7 @@ using namespace reshade::api;
 
 namespace
 {
+constexpr char k_runtime_version[] = "1.1";
 constexpr size_t k_scan_chunk_bytes = 4 * 1024 * 1024;
 constexpr size_t k_candidate_region_bytes = 64 * 1024;
 constexpr size_t k_max_hits = 256;
@@ -104,6 +106,17 @@ struct edit_state
 	uint32_t error = 0;
 };
 
+struct resource_sample
+{
+	double process_cpu_percent = 0.0;
+	uint64_t process_working_set_bytes = 0;
+	uint64_t process_private_bytes = 0;
+	uint64_t interval_us = 0;
+	double scan_cpu_core_percent = 0.0;
+	double maintenance_wall_percent = 0.0;
+	double rebind_wall_percent = 0.0;
+};
+
 std::mutex g_mutex;
 device *g_device = nullptr;
 HMODULE g_addon_module = nullptr;
@@ -131,6 +144,18 @@ std::atomic<bool> g_hunt_full_current { true };
 std::atomic<uint64_t> g_discovery_generation { 0 };
 std::atomic<uint32_t> g_last_scan_hits { 0 };
 std::atomic<uint32_t> g_last_scan_new_instances { 0 };
+std::atomic<uint64_t> g_scan_requests { 0 };
+std::atomic<uint64_t> g_scan_requests_coalesced { 0 };
+std::atomic<uint64_t> g_scan_runs { 0 };
+std::atomic<uint64_t> g_scan_full_runs { 0 };
+std::atomic<uint64_t> g_scan_priority_runs { 0 };
+std::atomic<uint64_t> g_scan_total_bytes { 0 };
+std::atomic<uint64_t> g_scan_total_wall_us { 0 };
+std::atomic<uint64_t> g_scan_total_cpu_us { 0 };
+std::atomic<uint64_t> g_scan_last_bytes { 0 };
+std::atomic<uint64_t> g_scan_last_wall_us { 0 };
+std::atomic<uint64_t> g_scan_last_cpu_us { 0 };
+std::atomic<uint64_t> g_scan_max_wall_us { 0 };
 HANDLE g_hunt_thread = nullptr;
 std::chrono::steady_clock::time_point g_hunt_deadline;
 std::chrono::steady_clock::time_point g_hunt_not_before;
@@ -142,7 +167,28 @@ std::atomic<uint32_t> g_last_draws { 0 };
 std::chrono::steady_clock::time_point g_last_console;
 std::chrono::steady_clock::time_point g_last_telemetry;
 
+std::atomic<uint64_t> g_maintenance_calls { 0 };
+std::atomic<uint64_t> g_maintenance_table_checks { 0 };
+std::atomic<uint64_t> g_maintenance_read_bytes { 0 };
+std::atomic<uint64_t> g_maintenance_total_wall_us { 0 };
+std::atomic<uint64_t> g_maintenance_last_wall_us { 0 };
+std::atomic<uint64_t> g_maintenance_max_wall_us { 0 };
+std::atomic<uint64_t> g_rebind_calls { 0 };
+std::atomic<uint64_t> g_rebind_candidates { 0 };
+std::atomic<uint64_t> g_rebind_instances_added_metric { 0 };
+std::atomic<uint64_t> g_rebind_total_wall_us { 0 };
+std::atomic<uint64_t> g_rebind_last_wall_us { 0 };
+std::atomic<uint64_t> g_rebind_max_wall_us { 0 };
+uint64_t g_monitor_started_tick_ms = 0;
+uint64_t g_previous_sample_tick_ms = 0;
+uint64_t g_previous_process_cpu_100ns = 0;
+uint64_t g_previous_scan_cpu_us = 0;
+uint64_t g_previous_maintenance_wall_us = 0;
+uint64_t g_previous_rebind_wall_us = 0;
+resource_sample g_resource_sample;
+
 std::wstring g_telemetry_path;
+std::wstring g_resource_log_path;
 std::wstring g_automation_path;
 uint64_t g_session_id = 0;
 HWND g_game_window = nullptr;
@@ -498,6 +544,74 @@ const char *scan_reason_name(scan_reason reason)
 	}
 }
 
+uint64_t file_time_100ns(const FILETIME &value)
+{
+	return (static_cast<uint64_t>(value.dwHighDateTime) << 32) | value.dwLowDateTime;
+}
+
+uint64_t current_thread_cpu_us()
+{
+	FILETIME created = {}, exited = {}, kernel = {}, user = {};
+	if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user))
+		return 0;
+	return (file_time_100ns(kernel) + file_time_100ns(user)) / 10;
+}
+
+void update_max(std::atomic<uint64_t> &target, uint64_t value)
+{
+	uint64_t current = target.load(std::memory_order_relaxed);
+	while (current < value &&
+		!target.compare_exchange_weak(current, value, std::memory_order_relaxed))
+	{
+	}
+}
+
+void record_scan_performance(bool full_scan,
+	std::chrono::steady_clock::time_point started, uint64_t cpu_started)
+{
+	const uint64_t wall_us = static_cast<uint64_t>(std::chrono::duration_cast<
+		std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+	const uint64_t cpu_now = current_thread_cpu_us();
+	const uint64_t cpu_us = cpu_now >= cpu_started ? cpu_now - cpu_started : 0;
+	const uint64_t bytes = g_hunt_bytes.load(std::memory_order_relaxed);
+	g_scan_runs.fetch_add(1, std::memory_order_relaxed);
+	(full_scan ? g_scan_full_runs : g_scan_priority_runs).fetch_add(1,
+		std::memory_order_relaxed);
+	g_scan_total_bytes.fetch_add(bytes, std::memory_order_relaxed);
+	g_scan_total_wall_us.fetch_add(wall_us, std::memory_order_relaxed);
+	g_scan_total_cpu_us.fetch_add(cpu_us, std::memory_order_relaxed);
+	g_scan_last_bytes.store(bytes, std::memory_order_relaxed);
+	g_scan_last_wall_us.store(wall_us, std::memory_order_relaxed);
+	g_scan_last_cpu_us.store(cpu_us, std::memory_order_relaxed);
+	update_max(g_scan_max_wall_us, wall_us);
+}
+
+void record_maintenance_performance(std::chrono::steady_clock::time_point started,
+	uint64_t table_checks, uint64_t read_bytes)
+{
+	const uint64_t wall_us = static_cast<uint64_t>(std::chrono::duration_cast<
+		std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+	g_maintenance_calls.fetch_add(1, std::memory_order_relaxed);
+	g_maintenance_table_checks.fetch_add(table_checks, std::memory_order_relaxed);
+	g_maintenance_read_bytes.fetch_add(read_bytes, std::memory_order_relaxed);
+	g_maintenance_total_wall_us.fetch_add(wall_us, std::memory_order_relaxed);
+	g_maintenance_last_wall_us.store(wall_us, std::memory_order_relaxed);
+	update_max(g_maintenance_max_wall_us, wall_us);
+}
+
+void record_rebind_performance(std::chrono::steady_clock::time_point started,
+	uint64_t candidates, uint64_t instances_added)
+{
+	const uint64_t wall_us = static_cast<uint64_t>(std::chrono::duration_cast<
+		std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+	g_rebind_calls.fetch_add(1, std::memory_order_relaxed);
+	g_rebind_candidates.fetch_add(candidates, std::memory_order_relaxed);
+	g_rebind_instances_added_metric.fetch_add(instances_added, std::memory_order_relaxed);
+	g_rebind_total_wall_us.fetch_add(wall_us, std::memory_order_relaxed);
+	g_rebind_last_wall_us.store(wall_us, std::memory_order_relaxed);
+	update_max(g_rebind_max_wall_us, wall_us);
+}
+
 void publish_hunt_results(const std::vector<instance_lifecycle::instance> &found_hits,
 	uint64_t partial, uint32_t best_partial)
 {
@@ -521,6 +635,8 @@ void publish_hunt_results(const std::vector<instance_lifecycle::instance> &found
 
 DWORD WINAPI hunt_thread_proc(void *)
 {
+	const auto performance_started = std::chrono::steady_clock::now();
+	const uint64_t cpu_started = current_thread_cpu_us();
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 	std::vector<loaded_table_profile> profiles;
 	std::vector<edit_request> shoulder_targets;
@@ -544,6 +660,7 @@ DWORD WINAPI hunt_thread_proc(void *)
 	}
 	if (profiles.empty() || (!full_scan && known_regions.empty()))
 	{
+		record_scan_performance(full_scan, performance_started, cpu_started);
 		publish_hunt_results({}, 0, 0);
 		return 0;
 	}
@@ -567,6 +684,7 @@ DWORD WINAPI hunt_thread_proc(void *)
 	}
 	if (views.empty())
 	{
+		record_scan_performance(full_scan, performance_started, cpu_started);
 		publish_hunt_results({}, 0, 0);
 		return 0;
 	}
@@ -681,6 +799,7 @@ DWORD WINAPI hunt_thread_proc(void *)
 		}
 	}
 
+	record_scan_performance(full_scan, performance_started, cpu_started);
 	publish_hunt_results(found_hits, partial, best_partial);
 	return 0;
 }
@@ -727,11 +846,13 @@ bool ensure_hunt_thread()
 
 void request_discovery(bool full_scan, scan_reason reason)
 {
+	g_scan_requests.fetch_add(1, std::memory_order_relaxed);
 	if (full_scan)
 		g_hunt_full_next.store(true, std::memory_order_release);
 	g_hunt_reason_next.store(static_cast<uint32_t>(reason), std::memory_order_release);
 	if (g_hunt_phase.load(std::memory_order_acquire) == 1)
 	{
+		g_scan_requests_coalesced.fetch_add(1, std::memory_order_relaxed);
 		g_hunt_again.store(true, std::memory_order_release);
 		return;
 	}
@@ -833,6 +954,8 @@ size_t active_target_count()
 
 size_t append_discovered_edits_locked(const std::vector<edit_request> &requests)
 {
+	const auto performance_started = std::chrono::steady_clock::now();
+	const uint64_t candidates = g_hits.size();
 	size_t instances_added = 0;
 	for (const instance_lifecycle::instance &hit : g_hits)
 	{
@@ -871,6 +994,7 @@ size_t append_discovered_edits_locked(const std::vector<edit_request> &requests)
 		g_active_targets.push_back(std::move(target));
 		++instances_added;
 	}
+	record_rebind_performance(performance_started, candidates, instances_added);
 	return instances_added;
 }
 
@@ -921,6 +1045,9 @@ size_t maintain_edit()
 	std::unique_lock lock(g_mutex, std::try_to_lock);
 	if (!lock.owns_lock() || !g_edit.active)
 		return 0;
+	const auto performance_started = std::chrono::steady_clock::now();
+	uint64_t table_checks = 0;
+	uint64_t read_bytes = 0;
 	size_t retired = 0;
 	for (auto item = g_active_targets.begin(); item != g_active_targets.end();)
 	{
@@ -932,6 +1059,8 @@ size_t maintain_edit()
 			continue;
 		}
 		const loaded_table_profile &profile = g_profiles[target.profile_index];
+		++table_checks;
+		read_bytes += profile.t48.size();
 		std::vector<uint8_t> current(profile.t48.size());
 		if (!read_process_bytes(target.address, current.data(), current.size()))
 		{
@@ -971,6 +1100,7 @@ size_t maintain_edit()
 	}
 	g_edit.active = !g_active_targets.empty();
 	g_edit_active.store(g_edit.active, std::memory_order_release);
+	record_maintenance_performance(performance_started, table_checks, read_bytes);
 	return retired;
 }
 
@@ -1135,9 +1265,12 @@ void initialize_runtime_files()
 		directory.push_back(L'\\');
 	directory += L"HD2ArmatureAdjuster";
 	CreateDirectoryW(directory.c_str(), nullptr);
-	g_telemetry_path = directory + L"\\telemetry.json";
-	g_automation_path = directory + L"\\automation.request";
 	g_session_id = (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^ GetTickCount64();
+	g_telemetry_path = directory + L"\\telemetry.json";
+	g_resource_log_path = directory + L"\\resource-monitor-" +
+		std::to_wstring(g_session_id) + L".csv";
+	g_automation_path = directory + L"\\automation.request";
+	g_monitor_started_tick_ms = GetTickCount64();
 }
 
 uint64_t unix_time_ms()
@@ -1148,6 +1281,124 @@ uint64_t unix_time_ms()
 	ticks.LowPart = file_time.dwLowDateTime;
 	ticks.HighPart = file_time.dwHighDateTime;
 	return (ticks.QuadPart - 116444736000000000ull) / 10000ull;
+}
+
+double percent_of_interval(uint64_t busy_us, uint64_t interval_us)
+{
+	return interval_us == 0 ? 0.0 :
+		100.0 * static_cast<double>(busy_us) / static_cast<double>(interval_us);
+}
+
+double scan_session_cpu_percent()
+{
+	const uint64_t elapsed_ms = GetTickCount64() - g_monitor_started_tick_ms;
+	return percent_of_interval(g_scan_total_cpu_us.load(std::memory_order_relaxed),
+		elapsed_ms * 1000);
+}
+
+void update_resource_sample()
+{
+	const uint64_t now_tick_ms = GetTickCount64();
+	FILETIME created = {}, exited = {}, kernel = {}, user = {};
+	uint64_t process_cpu_100ns = 0;
+	if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user))
+		process_cpu_100ns = file_time_100ns(kernel) + file_time_100ns(user);
+
+	PROCESS_MEMORY_COUNTERS_EX memory = {};
+	memory.cb = sizeof(memory);
+	if (GetProcessMemoryInfo(GetCurrentProcess(),
+		reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&memory), sizeof(memory)))
+	{
+		g_resource_sample.process_working_set_bytes = memory.WorkingSetSize;
+		g_resource_sample.process_private_bytes = memory.PrivateUsage;
+	}
+
+	const uint64_t scan_cpu_us = g_scan_total_cpu_us.load(std::memory_order_relaxed);
+	const uint64_t maintenance_wall_us =
+		g_maintenance_total_wall_us.load(std::memory_order_relaxed);
+	const uint64_t rebind_wall_us = g_rebind_total_wall_us.load(std::memory_order_relaxed);
+	if (g_previous_sample_tick_ms != 0 && now_tick_ms > g_previous_sample_tick_ms)
+	{
+		const uint64_t interval_us = (now_tick_ms - g_previous_sample_tick_ms) * 1000;
+		g_resource_sample.interval_us = interval_us;
+		g_resource_sample.scan_cpu_core_percent = percent_of_interval(
+			scan_cpu_us - g_previous_scan_cpu_us, interval_us);
+		g_resource_sample.maintenance_wall_percent = percent_of_interval(
+			maintenance_wall_us - g_previous_maintenance_wall_us, interval_us);
+		g_resource_sample.rebind_wall_percent = percent_of_interval(
+			rebind_wall_us - g_previous_rebind_wall_us, interval_us);
+		if (process_cpu_100ns >= g_previous_process_cpu_100ns)
+		{
+			const uint64_t process_cpu_us =
+				(process_cpu_100ns - g_previous_process_cpu_100ns) / 10;
+			const DWORD processors = std::max<DWORD>(1,
+				GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+			g_resource_sample.process_cpu_percent = percent_of_interval(
+				process_cpu_us, interval_us * processors);
+		}
+	}
+	g_previous_sample_tick_ms = now_tick_ms;
+	g_previous_process_cpu_100ns = process_cpu_100ns;
+	g_previous_scan_cpu_us = scan_cpu_us;
+	g_previous_maintenance_wall_us = maintenance_wall_us;
+	g_previous_rebind_wall_us = rebind_wall_us;
+}
+
+void append_resource_monitor_row()
+{
+	if (g_resource_log_path.empty())
+		return;
+	HANDLE file = CreateFileW(g_resource_log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
+		nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE)
+		return;
+	LARGE_INTEGER size = {};
+	if (GetFileSizeEx(file, &size) && size.QuadPart == 0)
+	{
+		const char header[] =
+			"unix_ms,frame,scan_active,scan_requests,scan_coalesced,scan_runs,full_scans,priority_scans,"
+			"scan_total_mib,scan_last_mib,scan_last_wall_ms,scan_last_cpu_ms,scan_cpu_core_percent,"
+			"scan_session_cpu_core_percent,maintenance_calls,maintenance_table_checks,maintenance_read_mib,"
+			"maintenance_last_us,maintenance_max_us,maintenance_wall_percent,rebind_calls,rebind_candidates,"
+			"rebind_instances_added,rebind_last_us,rebind_max_us,rebind_wall_percent,process_cpu_percent,"
+			"working_set_mib,private_mib\r\n";
+		DWORD written = 0;
+		WriteFile(file, header, static_cast<DWORD>(sizeof(header) - 1), &written, nullptr);
+	}
+	constexpr double mib = 1024.0 * 1024.0;
+	std::ostringstream row;
+	row << std::fixed << std::setprecision(3)
+		<< unix_time_ms() << ',' << g_frame << ','
+		<< (g_hunt_phase.load(std::memory_order_relaxed) == 1 ? 1 : 0) << ','
+		<< g_scan_requests.load(std::memory_order_relaxed) << ','
+		<< g_scan_requests_coalesced.load(std::memory_order_relaxed) << ','
+		<< g_scan_runs.load(std::memory_order_relaxed) << ','
+		<< g_scan_full_runs.load(std::memory_order_relaxed) << ','
+		<< g_scan_priority_runs.load(std::memory_order_relaxed) << ','
+		<< g_scan_total_bytes.load(std::memory_order_relaxed) / mib << ','
+		<< g_scan_last_bytes.load(std::memory_order_relaxed) / mib << ','
+		<< g_scan_last_wall_us.load(std::memory_order_relaxed) / 1000.0 << ','
+		<< g_scan_last_cpu_us.load(std::memory_order_relaxed) / 1000.0 << ','
+		<< g_resource_sample.scan_cpu_core_percent << ',' << scan_session_cpu_percent() << ','
+		<< g_maintenance_calls.load(std::memory_order_relaxed) << ','
+		<< g_maintenance_table_checks.load(std::memory_order_relaxed) << ','
+		<< g_maintenance_read_bytes.load(std::memory_order_relaxed) / mib << ','
+		<< g_maintenance_last_wall_us.load(std::memory_order_relaxed) << ','
+		<< g_maintenance_max_wall_us.load(std::memory_order_relaxed) << ','
+		<< g_resource_sample.maintenance_wall_percent << ','
+		<< g_rebind_calls.load(std::memory_order_relaxed) << ','
+		<< g_rebind_candidates.load(std::memory_order_relaxed) << ','
+		<< g_rebind_instances_added_metric.load(std::memory_order_relaxed) << ','
+		<< g_rebind_last_wall_us.load(std::memory_order_relaxed) << ','
+		<< g_rebind_max_wall_us.load(std::memory_order_relaxed) << ','
+		<< g_resource_sample.rebind_wall_percent << ','
+		<< g_resource_sample.process_cpu_percent << ','
+		<< g_resource_sample.process_working_set_bytes / mib << ','
+		<< g_resource_sample.process_private_bytes / mib << "\r\n";
+	const std::string bytes = row.str();
+	DWORD written = 0;
+	WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
+	CloseHandle(file);
 }
 
 bool game_has_focus()
@@ -1516,8 +1767,18 @@ void draw_console(uint32_t draws)
 	size_t mapped = 0;
 	for (const auto &[unused, buffer] : g_buffers)
 		mapped += buffer.map_ptr != nullptr;
+	const uint64_t maintenance_calls = g_maintenance_calls.load(std::memory_order_relaxed);
+	const uint64_t rebind_calls = g_rebind_calls.load(std::memory_order_relaxed);
+	const double maintenance_average_us = maintenance_calls == 0 ? 0.0 :
+		static_cast<double>(g_maintenance_total_wall_us.load(std::memory_order_relaxed)) /
+		maintenance_calls;
+	const double rebind_average_us = rebind_calls == 0 ? 0.0 :
+		static_cast<double>(g_rebind_total_wall_us.load(std::memory_order_relaxed)) /
+		rebind_calls;
+	constexpr double mib = 1024.0 * 1024.0;
 	out << "\x1b[2J\x1b[H"
-		<< "HD2 Armature Profile Runtime 1.0  |  " << experiment_mode_name() << "  |  D3D12\n\n"
+		<< "HD2 Armature Profile Runtime " << k_runtime_version << "  |  "
+		<< experiment_mode_name() << "  |  D3D12\n\n"
 		<< "frame " << g_frame << "  draws " << draws << "  buffers " << g_buffers.size()
 		<< " (mapped " << mapped << ")\n"
 		<< "profiles " << g_profile_files << " files / " << g_profiles.size()
@@ -1535,6 +1796,23 @@ void draw_console(uint32_t draws)
 		<< static_cast<double>(g_hunt_bytes.load(std::memory_order_relaxed)) / (1024.0 * 1024.0)
 		<< " MiB  partial " << g_partial_candidates.load(std::memory_order_relaxed)
 		<< " (best " << g_best_partial_entries.load(std::memory_order_relaxed) << ")\n"
+		<< "monitor process " << std::fixed << std::setprecision(1)
+		<< g_resource_sample.process_cpu_percent << "% CPU  "
+		<< g_resource_sample.process_working_set_bytes / mib << " MiB working  "
+		<< g_resource_sample.process_private_bytes / mib << " MiB private\n"
+		<< "scan cost " << g_resource_sample.scan_cpu_core_percent << "% of one core now / "
+		<< scan_session_cpu_percent() << "% session  runs "
+		<< g_scan_runs.load(std::memory_order_relaxed) << " ("
+		<< g_scan_full_runs.load(std::memory_order_relaxed) << " full, "
+		<< g_scan_priority_runs.load(std::memory_order_relaxed) << " priority)  last "
+		<< g_scan_last_wall_us.load(std::memory_order_relaxed) / 1000.0 << " ms wall / "
+		<< g_scan_last_cpu_us.load(std::memory_order_relaxed) / 1000.0 << " ms CPU\n"
+		<< "maintain " << g_resource_sample.maintenance_wall_percent
+		<< "% frame time  avg/max " << maintenance_average_us << '/'
+		<< g_maintenance_max_wall_us.load(std::memory_order_relaxed) << " us  rebind avg/max "
+		<< rebind_average_us << '/' << g_rebind_max_wall_us.load(std::memory_order_relaxed)
+		<< " us  scan queue " << g_scan_requests_coalesced.load(std::memory_order_relaxed)
+		<< '/' << g_scan_requests.load(std::memory_order_relaxed) << " coalesced\n"
 		<< "F8 shoulder narrowing "
 		<< (!g_shoulder_desired.load(std::memory_order_relaxed) ? "OFF" :
 			g_shoulder_active.load(std::memory_order_relaxed) ? "ACTIVE" : "WAITING")
@@ -1576,6 +1854,8 @@ void write_telemetry(uint32_t draws)
 	if (g_telemetry_path.empty() || now - g_last_telemetry < std::chrono::seconds(1))
 		return;
 	g_last_telemetry = now;
+	update_resource_sample();
+	append_resource_monitor_row();
 	struct profile_summary
 	{
 		std::string patch_name;
@@ -1615,8 +1895,9 @@ void write_telemetry(uint32_t draws)
 
 	std::ostringstream json;
 	json << "{\n"
-		<< "  \"schema\": 6,\n"
+		<< "  \"schema\": 7,\n"
 		<< "  \"addon\": \"HD2 Armature Profile Runtime\",\n"
+		<< "  \"addon_version\": \"" << k_runtime_version << "\",\n"
 		<< "  \"experiment_mode\": \"" << experiment_mode_name() << "\",\n"
 		<< "  \"api_version\": " << RESHADE_API_VERSION << ",\n"
 		<< "  \"process_id\": " << GetCurrentProcessId() << ",\n"
@@ -1662,6 +1943,70 @@ void write_telemetry(uint32_t draws)
 		<< "  \"ib_last_scan_hits\": " << g_last_scan_hits.load(std::memory_order_relaxed) << ",\n"
 		<< "  \"ib_last_scan_new_instances\": "
 		<< g_last_scan_new_instances.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"resource_monitor_path\": \""
+		<< json_escape(utf8(g_resource_log_path.c_str())) << "\",\n"
+		<< "  \"resource_sample_interval_ms\": "
+		<< g_resource_sample.interval_us / 1000.0 << ",\n"
+		<< "  \"process_cpu_percent\": " << std::fixed << std::setprecision(3)
+		<< g_resource_sample.process_cpu_percent << ",\n"
+		<< "  \"process_working_set_bytes\": "
+		<< g_resource_sample.process_working_set_bytes << ",\n"
+		<< "  \"process_private_bytes\": " << g_resource_sample.process_private_bytes << ",\n"
+		<< "  \"scan_active\": "
+		<< (g_hunt_phase.load(std::memory_order_relaxed) == 1 ? "true" : "false") << ",\n"
+		<< "  \"scan_requests_total\": " << g_scan_requests.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"scan_requests_coalesced\": "
+		<< g_scan_requests_coalesced.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"scan_runs_total\": " << g_scan_runs.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"scan_full_runs_total\": "
+		<< g_scan_full_runs.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"scan_priority_runs_total\": "
+		<< g_scan_priority_runs.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"scan_bytes_total\": "
+		<< g_scan_total_bytes.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"scan_bytes_last\": " << g_scan_last_bytes.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"scan_wall_ms_total\": "
+		<< g_scan_total_wall_us.load(std::memory_order_relaxed) / 1000.0 << ",\n"
+		<< "  \"scan_wall_ms_last\": "
+		<< g_scan_last_wall_us.load(std::memory_order_relaxed) / 1000.0 << ",\n"
+		<< "  \"scan_wall_ms_max\": "
+		<< g_scan_max_wall_us.load(std::memory_order_relaxed) / 1000.0 << ",\n"
+		<< "  \"scan_cpu_ms_total\": "
+		<< g_scan_total_cpu_us.load(std::memory_order_relaxed) / 1000.0 << ",\n"
+		<< "  \"scan_cpu_ms_last\": "
+		<< g_scan_last_cpu_us.load(std::memory_order_relaxed) / 1000.0 << ",\n"
+		<< "  \"scan_cpu_core_percent_sample\": "
+		<< g_resource_sample.scan_cpu_core_percent << ",\n"
+		<< "  \"scan_cpu_core_percent_session\": " << scan_session_cpu_percent() << ",\n"
+		<< "  \"maintenance_calls_total\": "
+		<< g_maintenance_calls.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"maintenance_table_checks_total\": "
+		<< g_maintenance_table_checks.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"maintenance_read_bytes_total\": "
+		<< g_maintenance_read_bytes.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"maintenance_wall_ms_total\": "
+		<< g_maintenance_total_wall_us.load(std::memory_order_relaxed) / 1000.0 << ",\n"
+		<< "  \"maintenance_wall_us_last\": "
+		<< g_maintenance_last_wall_us.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"maintenance_wall_us_max\": "
+		<< g_maintenance_max_wall_us.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"maintenance_wall_percent_sample\": "
+		<< g_resource_sample.maintenance_wall_percent << ",\n"
+		<< "  \"rebind_calls_total\": " << g_rebind_calls.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"rebind_candidates_total\": "
+		<< g_rebind_candidates.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"rebind_instances_added_total\": "
+		<< g_rebind_instances_added_metric.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"rebind_wall_ms_total\": "
+		<< g_rebind_total_wall_us.load(std::memory_order_relaxed) / 1000.0 << ",\n"
+		<< "  \"rebind_wall_us_last\": "
+		<< g_rebind_last_wall_us.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"rebind_wall_us_max\": "
+		<< g_rebind_max_wall_us.load(std::memory_order_relaxed) << ",\n"
+		<< "  \"rebind_wall_percent_sample\": "
+		<< g_resource_sample.rebind_wall_percent << ",\n"
+		<< "  \"resource_events_total\": "
+		<< g_resource_generation.load(std::memory_order_relaxed) << ",\n"
 		<< "  \"converted_ib_hits\": " << hits.size() << ",\n"
 		<< "  \"converted_ib_partial_candidates\": " << g_partial_candidates.load(std::memory_order_relaxed) << ",\n"
 		<< "  \"converted_ib_best_partial_entries\": " << g_best_partial_entries.load(std::memory_order_relaxed) << ",\n"
