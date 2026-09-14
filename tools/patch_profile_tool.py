@@ -653,6 +653,10 @@ def build_parser() -> argparse.ArgumentParser:
     pose_command.add_argument("--root", required=True)
     pose_command.add_argument("--out-root", required=True)
     pose_command.add_argument("--marker-min", type=int, default=8)
+    pose_command.add_argument("--left-translate", type=float, nargs=3,
+                              default=(0.03, 0.0, 0.0), metavar=("X", "Y", "Z"))
+    pose_command.add_argument("--right-translate", type=float, nargs=3,
+                              default=(-0.03, 0.0, 0.0), metavar=("X", "Y", "Z"))
 
     branch_command = commands.add_parser(
         "shoulder-targets",
@@ -717,6 +721,13 @@ def main() -> int:
         elif args.command == "pose-tree":
             if args.marker_min < 4:
                 raise ValueError("--marker-min must be at least four")
+            left = tuple(args.left_translate)
+            right = tuple(args.right_translate)
+            if (not all(math.isfinite(value) and abs(value) <= 10.0
+                        for value in left + right) or
+                    not any(value != 0.0 for value in left) or
+                    not any(value != 0.0 for value in right)):
+                raise ValueError("branch translations must be finite, nonzero, and within +/-10 metres")
             result = prepare_pose_tree(args.root, args.out_root, args.marker_min)
             profile_directory = os.path.join(os.path.abspath(args.out_root),
                                              "HD2ArmatureProfiles")
@@ -737,7 +748,7 @@ def main() -> int:
                 args.out_root,
                 os.path.join(profile_directory, "shoulder_targets.txt"),
                 os.path.join(profile_directory, "shoulder_targets.json"),
-                (0.03, 0.0, 0.0), (-0.03, 0.0, 0.0),
+                left, right,
                 profile_directory, -1, False)
             print(json.dumps({
                 "output_root": os.path.abspath(args.out_root),

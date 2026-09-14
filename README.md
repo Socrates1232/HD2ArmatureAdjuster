@@ -74,7 +74,9 @@ tree. The output must not already exist and is a separate, installable copy:
 ```powershell
 python tools/patch_profile_tool.py pose-tree `
   --root "C:\path\to\finished-mod" `
-  --out-root "C:\path\to\finished-mod-pose-aware"
+  --out-root "C:\path\to\finished-mod-pose-aware" `
+  --left-translate 0.03 0 0 `
+  --right-translate -0.03 0 0
 ```
 
 This appends one unweighted probe slot followed by a variant-specific repeated
@@ -106,6 +108,8 @@ the old uniform offset was propagated through the whole animated branch. Use
 `pose-tree` command intentionally uses a uniform full branch: hierarchy chooses
 the affected slots, while runtime pose math derives each slot's required IB
 matrix instead of hardcoding a different displacement at every depth.
+The two translation arguments are the only requested shoulder corrections;
+change them to tune width without editing code or individual descendants.
 
 ## Build
 

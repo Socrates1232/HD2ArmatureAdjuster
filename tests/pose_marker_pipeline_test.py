@@ -33,7 +33,9 @@ def main() -> int:
 
         completed = subprocess.run(
             [sys.executable, str(ROOT / "tools" / "patch_profile_tool.py"),
-             "pose-tree", "--root", str(source), "--out-root", str(output)],
+             "pose-tree", "--root", str(source), "--out-root", str(output),
+             "--left-translate", "0.04", "0.01", "0",
+             "--right-translate", "-0.04", "0.01", "0"],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
         )
         if completed.returncode:
@@ -65,7 +67,7 @@ def main() -> int:
         if len(targets) != 12 or any(int(row[2]) >= 8 for row in targets):
             raise AssertionError("marker slots leaked into arm targets")
         if {tuple(row[3:]) for row in targets} != {
-                ("+0.03", "+0", "+0"), ("-0.03", "+0", "+0")}:
+                ("+0.04", "+0.01", "+0"), ("-0.04", "+0.01", "+0")}:
             raise AssertionError("arm descendants did not receive one uniform request per side")
 
     print("pose marker copy/profile/full-branch pipeline passed")

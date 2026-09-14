@@ -116,7 +116,9 @@ identical; variants with different table bytes must both remain active.
 ```powershell
 python tools\patch_profile_tool.py pose-tree `
   --root "C:\path\to\finished-mod" `
-  --out-root "C:\path\to\finished-mod-pose-aware"
+  --out-root "C:\path\to\finished-mod-pose-aware" `
+  --left-translate 0.03 0 0 `
+  --right-translate -0.03 0 0
 ```
 
 This is the complete post-build hook for the dynamic armature path. It copies
@@ -124,6 +126,9 @@ the tree, appends an unweighted probe plus repeated tail to shoulder-bearing
 palettes, profiles the marked patches, unions redundant runtime tables, and
 generates `palette_markers.txt` plus a uniform full-arm `shoulder_targets.txt`.
 The original tree is never modified and the output cannot be a game directory.
+The left/right vectors configure the two logical shoulder corrections; every
+selected descendant inherits its side's request and receives a pose-derived IB
+matrix at runtime.
 
 The repeated tail identifies the palette layout in mapped GPU-upload memory.
 The probe is changed only at runtime and carries a table-instance code and
