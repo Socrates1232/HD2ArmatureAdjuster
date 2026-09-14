@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 import pathlib
 
@@ -10,13 +11,21 @@ from bpy.props import BoolProperty, EnumProperty, PointerProperty, StringPropert
 from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Matrix
 
-from .core import bone_name_hash, build_rig, parent_matches, read_source, write_rig
+from . import core as _core
+
+
+_core = importlib.reload(_core)
+bone_name_hash = _core.bone_name_hash
+build_rig = _core.build_rig
+parent_matches = _core.parent_matches
+read_source = _core.read_source
+write_rig = _core.write_rig
 
 
 bl_info = {
     "name": "HD2 Armature Adapter",
     "author": "HD2ArmatureAdjuster contributors",
-    "version": (1, 1, 1),
+    "version": (1, 1, 2),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > HD2AA",
     "description": "Port compatible custom rest armatures to HD2RIG1",
