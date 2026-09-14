@@ -100,3 +100,22 @@ The external profile pipeline has crossed the intended validation gates:
 8. every changed target restores exactly.
 
 This validates the profile boundary and runtime edit channel. It does not add semantic bone naming or vertex ownership; those remain separate offline mapping work.
+
+## Load-time union regression
+
+Run `20260914-093828` loaded two separately named copies of the same package to exercise composition and exact cross-file deduplication:
+
+| Counter | Value |
+| --- | ---: |
+| Profile files | 2 |
+| Source table records | 6 |
+| Duplicate records merged | 3 |
+| Unique runtime tables | 3 |
+| Exact runtime hits | 4 |
+| Partial candidates | 0 |
+| Targets written/restored | 4 / 4 |
+| Present-time readbacks | 600 |
+| Profile/edit errors | 0 / 0 |
+| Exact-process shutdown | succeeded |
+
+The result was `passed-converted-edit`. This demonstrates that profile files remain patch-level provenance artifacts while the add-on operates on a deduplicated per-unit/per-table union. Duplicate inputs did not double the scan hits or write targets.

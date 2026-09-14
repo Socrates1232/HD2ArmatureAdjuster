@@ -47,6 +47,7 @@ struct loaded_table_profile
 	uint32_t lod_mask = 0;
 	uint32_t entries = 0;
 	uint32_t first_lod = 0;
+	uint32_t source_records = 1;
 	std::vector<uint8_t> t48;
 };
 
@@ -103,6 +104,8 @@ std::vector<converted_hit> g_hits;
 std::vector<active_target> g_active_targets;
 std::wstring g_profile_directory;
 uint32_t g_profile_files = 0;
+uint32_t g_profile_records = 0;
+uint32_t g_profile_duplicates = 0;
 
 std::atomic<uint32_t> g_hunt_phase { 0 }; // 0 idle, 1 scanning, 2 found, 3 exhausted/error
 std::atomic<uint32_t> g_hunt_passes { 0 };
@@ -112,6 +115,7 @@ std::atomic<uint32_t> g_best_partial_entries { 0 };
 std::atomic<bool> g_hunt_stop { false };
 HANDLE g_hunt_thread = nullptr;
 std::chrono::steady_clock::time_point g_hunt_deadline;
+std::chrono::steady_clock::time_point g_hunt_not_before;
 
 HANDLE g_console = INVALID_HANDLE_VALUE;
 uint64_t g_frame = 0;
@@ -226,6 +230,8 @@ void load_profiles()
 	g_profiles.clear();
 	g_profile_errors.clear();
 	g_profile_files = 0;
+	g_profile_records = 0;
+	g_profile_duplicates = 0;
 	wchar_t module_path[32768] = {};
 	const DWORD length = GetModuleFileNameW(g_addon_module, module_path,
 		static_cast<DWORD>(sizeof(module_path) / sizeof(module_path[0])));
@@ -314,13 +320,27 @@ void load_profiles()
 		}
 		for (armature_profile::table &table : package.tables)
 		{
+			++g_profile_records;
+			auto duplicate = std::find_if(g_profiles.begin(), g_profiles.end(),
+				[&table](const loaded_table_profile &loaded) {
+					return armature_profile::same_runtime_table(loaded.unit_id, loaded.entries,
+						loaded.t48, table);
+				});
+			if (duplicate != g_profiles.end())
+			{
+				duplicate->lod_mask |= table.lod_mask;
+				duplicate->first_lod = std::min(duplicate->first_lod, table.first_lod);
+				++duplicate->source_records;
+				++g_profile_duplicates;
+				continue;
+			}
 			if (g_profiles.size() >= k_max_profile_tables)
 			{
 				g_profile_errors.push_back("runtime table-profile limit reached");
 				break;
 			}
 			g_profiles.push_back({ package.patch_name, utf8(name.c_str()), table.unit_id,
-				table.lod_mask, table.entries, table.first_lod, std::move(table.t48) });
+				table.lod_mask, table.entries, table.first_lod, 1, std::move(table.t48) });
 		}
 		++g_profile_files;
 	}
@@ -509,6 +529,7 @@ void request_rescan()
 	std::lock_guard lock(g_mutex);
 	g_hits.clear();
 	g_hunt_phase.store(0, std::memory_order_release);
+	g_hunt_not_before = std::chrono::steady_clock::now();
 }
 
 bool read_process_bytes(uintptr_t address, void *data, size_t size)
@@ -841,7 +862,9 @@ void begin_scene_delay(std::chrono::steady_clock::time_point now)
 	release_keys();
 	if (!request_screenshot(false))
 		g_automation_error = 3;
-	g_automation_deadline = now + std::chrono::milliseconds(g_automation_delay_ms);
+	const uint32_t delay = g_edit.requested ? std::min(g_automation_delay_ms, 1000u) :
+		g_automation_delay_ms;
+	g_automation_deadline = now + std::chrono::milliseconds(delay);
 	g_automation_stage = 3;
 }
 
@@ -1067,7 +1090,8 @@ void draw_console(uint32_t draws)
 		<< "frame " << g_frame << "  draws " << draws << "  buffers " << g_buffers.size()
 		<< " (mapped " << mapped << ")\n"
 		<< "profiles " << g_profile_files << " files / " << g_profiles.size()
-		<< " tables  load errors " << g_profile_errors.size() << '\n'
+		<< " unique tables / " << g_profile_records << " records ("
+		<< g_profile_duplicates << " duplicates)  load errors " << g_profile_errors.size() << '\n'
 		<< "hunt phase " << g_hunt_phase.load(std::memory_order_relaxed)
 		<< "  passes " << g_hunt_passes.load(std::memory_order_relaxed)
 		<< "  hits " << g_hits.size()
@@ -1112,25 +1136,28 @@ void write_telemetry(uint32_t draws)
 		uint64_t unit_id;
 		uint32_t lod_mask;
 		uint32_t entries;
+		uint32_t source_records;
 	};
 	std::vector<converted_hit> hits;
 	std::vector<profile_summary> profiles;
 	std::vector<std::string> profile_errors;
 	edit_state edit;
 	size_t buffer_count = 0, mapped_count = 0;
-	uint32_t profile_files = 0;
+	uint32_t profile_files = 0, profile_records = 0, profile_duplicates = 0;
 	{
 		std::lock_guard lock(g_mutex);
 		hits = g_hits;
 		for (const loaded_table_profile &profile : g_profiles)
 			profiles.push_back({ profile.patch_name, profile.profile_file, profile.unit_id,
-				profile.lod_mask, profile.entries });
+				profile.lod_mask, profile.entries, profile.source_records });
 		profile_errors = g_profile_errors;
 		edit = g_edit;
 		buffer_count = g_buffers.size();
 		for (const auto &[unused, buffer] : g_buffers)
 			mapped_count += buffer.map_ptr != nullptr;
 		profile_files = g_profile_files;
+		profile_records = g_profile_records;
+		profile_duplicates = g_profile_duplicates;
 	}
 
 	std::ostringstream json;
@@ -1149,6 +1176,8 @@ void write_telemetry(uint32_t draws)
 		<< "  \"mapped_buffers\": " << mapped_count << ",\n"
 		<< "  \"profile_directory\": \"" << json_escape(utf8(g_profile_directory.c_str())) << "\",\n"
 		<< "  \"profile_files_loaded\": " << profile_files << ",\n"
+		<< "  \"profile_table_records\": " << profile_records << ",\n"
+		<< "  \"profile_duplicate_records\": " << profile_duplicates << ",\n"
 		<< "  \"profile_tables_loaded\": " << profiles.size() << ",\n"
 		<< "  \"profile_load_errors\": " << profile_errors.size() << ",\n"
 		<< "  \"ib_hunt_phase\": " << g_hunt_phase.load(std::memory_order_relaxed) << ",\n"
@@ -1172,7 +1201,8 @@ void write_telemetry(uint32_t draws)
 				<< "\",\"patch\":\"" << json_escape(profile.patch_name)
 				<< "\",\"unit\":\"" << std::hex << std::setw(16) << std::setfill('0')
 				<< profile.unit_id << "\",\"lod_mask\":\"0x" << std::setw(8)
-				<< profile.lod_mask << "\",\"entries\":" << std::dec << profile.entries;
+				<< profile.lod_mask << "\",\"entries\":" << std::dec << profile.entries
+				<< ",\"source_records\":" << profile.source_records;
 		}
 		json << ",\"region_base\":\"0x" << std::hex << hit.region_base << "\",\"region_size\":"
 			<< std::dec << hit.region_size << ",\"protection\":" << hit.protection << '}';
@@ -1240,6 +1270,7 @@ void on_init_device(device *device)
 	if (g_device != nullptr)
 		return;
 	g_device = device;
+	g_hunt_not_before = std::chrono::steady_clock::now() + std::chrono::seconds(10);
 	initialize_runtime_files();
 	load_profiles();
 	open_console();
@@ -1318,7 +1349,8 @@ void on_present(command_queue *queue, swapchain *, const rect *, const rect *, u
 	g_last_draws.store(draws, std::memory_order_relaxed);
 	if (GetAsyncKeyState(VK_F9) & 1)
 		request_rescan();
-	if (g_hunt_phase.load(std::memory_order_acquire) == 0)
+	if (g_hunt_phase.load(std::memory_order_acquire) == 0 &&
+		std::chrono::steady_clock::now() >= g_hunt_not_before)
 		ensure_hunt_thread();
 	maintain_edit();
 	draw_console(draws);

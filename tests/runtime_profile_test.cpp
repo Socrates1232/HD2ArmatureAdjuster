@@ -65,6 +65,26 @@ int main()
 		std::cerr << "valid runtime profile failed: " << error << '\n';
 		return 1;
 	}
+	auto same = parsed.tables[0];
+	same.lod_mask = 0xF0;
+	if (!armature_profile::same_runtime_table(parsed.tables[0], same))
+	{
+		std::cerr << "LOD variants of the same runtime table did not compare equal\n";
+		return 1;
+	}
+	same.unit_id += 1;
+	if (armature_profile::same_runtime_table(parsed.tables[0], same))
+	{
+		std::cerr << "different unit IDs compared equal\n";
+		return 1;
+	}
+	same = parsed.tables[0];
+	same.t48.back() ^= 1;
+	if (armature_profile::same_runtime_table(parsed.tables[0], same))
+	{
+		std::cerr << "different runtime bytes compared equal\n";
+		return 1;
+	}
 	file.back() ^= 1;
 	if (armature_profile::parse(file.data(), file.size(), parsed, error))
 	{

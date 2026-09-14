@@ -33,6 +33,17 @@ struct package
 	std::vector<table> tables;
 };
 
+inline bool same_runtime_table(uint64_t unit_id, uint32_t entries,
+	const std::vector<uint8_t> &t48, const table &right)
+{
+	return unit_id == right.unit_id && entries == right.entries && t48 == right.t48;
+}
+
+inline bool same_runtime_table(const table &left, const table &right)
+{
+	return same_runtime_table(left.unit_id, left.entries, left.t48, right);
+}
+
 inline uint32_t read_u32(const uint8_t *data)
 {
 	uint32_t value = 0;

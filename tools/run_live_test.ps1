@@ -333,6 +333,8 @@ $maxHits = 0
 $maxPartial = 0
 $maxBestPartial = 0
 $profileFilesLoaded = 0
+$profileTableRecords = 0
+$profileDuplicateRecords = 0
 $profileTablesLoaded = 0
 $profileLoadErrors = 0
 $experimentMode = $null
@@ -372,6 +374,8 @@ while ([DateTime]::UtcNow -lt $deadline) {
         }
         $experimentMode = [string](Get-TelemetryValue $sample 'experiment_mode' '')
         $profileFilesLoaded = [Math]::Max($profileFilesLoaded, [int](Get-TelemetryValue $sample 'profile_files_loaded' 0))
+        $profileTableRecords = [Math]::Max($profileTableRecords, [int](Get-TelemetryValue $sample 'profile_table_records' 0))
+        $profileDuplicateRecords = [Math]::Max($profileDuplicateRecords, [int](Get-TelemetryValue $sample 'profile_duplicate_records' 0))
         $profileTablesLoaded = [Math]::Max($profileTablesLoaded, [int](Get-TelemetryValue $sample 'profile_tables_loaded' 0))
         $profileLoadErrors = [Math]::Max($profileLoadErrors, [int](Get-TelemetryValue $sample 'profile_load_errors' 0))
         $maxHits = [Math]::Max($maxHits, [int](Get-TelemetryValue $sample 'converted_ib_hits' 0))
@@ -400,7 +404,7 @@ while ([DateTime]::UtcNow -lt $deadline) {
             elseif (([DateTime]::UtcNow - $completedAt).TotalSeconds -ge 5) { break }
         }
     }
-    if ($latestTelemetry -and ([DateTime]::UtcNow - $lastProgressAt).TotalSeconds -ge 20) {
+    if ($latestTelemetry -and ([DateTime]::UtcNow - $lastProgressAt).TotalSeconds -ge 60) {
         Write-Warning "Telemetry stopped advancing at frame $lastFrame."
         break
     }
@@ -500,6 +504,8 @@ $summary = [ordered]@{
     addon_load_error = $loadError
     runtime_profiles = $profileMetadata
     profile_files_loaded = $profileFilesLoaded
+    profile_table_records = $profileTableRecords
+    profile_duplicate_records = $profileDuplicateRecords
     profile_tables_loaded = $profileTablesLoaded
     profile_load_errors = $profileLoadErrors
     telemetry_seen = $telemetrySeen

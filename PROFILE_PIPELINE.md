@@ -99,7 +99,7 @@ Helldivers 2\bin\HD2ArmatureProfiles\
 
 `active_profiles.txt` contains one profile filename per line. The runner creates this file without a byte-order mark. Names cannot contain directory separators and must end in `.hd2profile`.
 
-Every listed package is loaded. Therefore separate armor, helmet, cape, body, or other patch outputs can contribute separate profiles. The add-on does not assume that one patch describes the whole character or that all body parts share one runtime table. If two records describe the same exact physical table, scan results and edit targets are address-deduplicated.
+Every listed package is loaded and flattened into one runtime registry. Therefore separate armor, helmet, cape, body, or other patch outputs can contribute separate profiles. Exact duplicate records are merged only when unit ID, entry count, and all converted table bytes agree; their LOD masks are combined. Distinct variants of the same unit remain separate so the resident version can match. The add-on does not assume that one patch describes the whole character or that all body parts share one runtime table. Scan results and edit targets are also physical-address-deduplicated.
 
 If no active-list file exists, all profile files in the directory are loaded. This is useful for manual use but less reproducible than an explicit list.
 

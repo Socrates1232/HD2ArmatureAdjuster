@@ -22,7 +22,7 @@ HD2ArmatureProfiles beside the add-on
 ReShade add-on: exact locate -> guarded slot edit -> readback -> restore
 ```
 
-Each profile represents one finished main patch bundle. It may contain several unit IDs and LOD tables. Identical tables shared by multiple LODs are stored once with an LOD mask. Multiple active profile files compose at runtime.
+Each profile represents one finished main patch bundle. It may contain several unit IDs and LOD tables. Identical tables shared by multiple LODs are stored once with an LOD mask. Multiple active profile files compose into one runtime registry; records with the same unit ID, entry count, and exact table bytes are merged during loading.
 
 The current example profile contains B-01 unit `fa269172bd08695b`: one 88-entry table shared by LODs 0-3 and separate 2-entry and 4-entry reduced LOD tables.
 
