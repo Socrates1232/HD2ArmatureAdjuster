@@ -78,18 +78,19 @@ Run the same export twice if reproducibility matters; byte-identical inputs prod
 
 ## 2. Author a target in Blender
 
-Install `hd2_armature_porter-1.1.0.zip` through Blender's **Preferences → Get Extensions → Install from Disk**. In the 3D View sidebar, open **HD2AA**.
+Install `hd2_armature_porter-1.3.0.zip` through Blender's **Preferences → Get Extensions → Install from Disk**. In the 3D View sidebar, open **HD2AA**.
 
 For an armature already modified from an exported HD2 avatar rig:
 
 1. Select the modified armature object and click **Use Selected Armature**.
-2. If the armature already carries `hd2_source_reference`, the add-on resolves it automatically. Otherwise select the generated `*.hd2source.json` once. A `.patch_N` file is not a source contract.
-3. Optionally click **Check Automatic Mapping**. The porter maps explicit stable IDs or readable Blender bone names within the skinning-table dependency closure. Unnamed decimal nodes and non-skinning structural nodes such as `game_mesh` remain unchanged. When the union contract contains several structural variants of a named bone, only variants compatible with the target bone's parent are selected.
-4. Leave **Basis mode** at `Preserved` and **Capability** at `Automatic`.
-5. Click **Validate Target**. Source-only bones absent from this particular avatar armature remain unchanged; every mapped bone must preserve the expected parent relationship.
-6. Choose an output ending in `.hd2rig.json`, then click **Validate & Export Port**.
+2. In Edit Mode, select only the bone roots whose local rest transforms you intentionally changed, then click **Mark Selected for Port**. Moving a complete shoulder branch normally requires marking its shoulder root, not every unchanged descendant.
+3. If the armature already carries `hd2_source_reference`, the add-on resolves it automatically. Otherwise select the generated `*.hd2source.json` once. A `.patch_N` file is not a source contract.
+4. Optionally click **Check Automatic Mapping**. Only explicitly marked runtime bones are matched; every other source record remains unchanged. Non-skinning structural nodes such as `game_mesh` are excluded. When the union contract contains several structural variants of a marked bone, only variants compatible with the target bone's parent are selected.
+5. Leave **Basis mode** at `Preserved` and **Capability** at `Automatic`.
+6. Click **Validate Target** and require `linear_rest_translation` for the Stage-1 runtime. If validation selects `full_native_pose`, review the marked bones or deliberately use position normalization; do not deploy it to the Stage-1 runtime.
+7. Choose an output ending in `.hd2rig.json`, then click **Validate & Export Port**.
 
-Exact-name mapping expands one display-name match to every structurally distinct stable source identity. Stable IDs, not names, are written into the package contract.
+Marked-name mapping expands a selected target bone to the parent-compatible stable source identities used by the active tables. Stable IDs, not names, are written into the package contract.
 
 The alternate source-first workflow remains available: select the contract, click **Import Source**, click **Duplicate Imported Source**, and make rest-pose changes to that duplicate.
 

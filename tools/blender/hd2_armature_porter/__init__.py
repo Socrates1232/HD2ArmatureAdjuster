@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import pathlib
 
@@ -27,7 +28,7 @@ write_rig = _core.write_rig
 bl_info = {
     "name": "HD2 Armature Adapter",
     "author": "HD2ArmatureAdjuster contributors",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > HD2AA",
     "description": "Port compatible custom rest armatures to HD2RIG1",
@@ -38,6 +39,7 @@ bl_info = {
 STABLE_ID = "hd2_stable_id"
 SOURCE_PATH = "hd2_source_reference"
 EXACT_NAME_MAPPING = "hd2_exact_name_mapping"
+PORT_BONES = "hd2_port_bones"
 
 
 def _matrix(values):
@@ -130,25 +132,38 @@ def collect_target(obj, source_path=None):
     return local, parents
 
 
+def marked_bone_names(obj):
+    value = obj.get(PORT_BONES, "")
+    return set(json.loads(value)) if value else set()
+
+
 def target_mappings(obj, source):
     source_by_id = {bone["stable_id"]: bone for bone in source["bones"]}
     required = runtime_dependency_ids(source)
+    target_stable_ids = {bone.get(STABLE_ID) for bone in obj.data.bones
+                         if bone.get(STABLE_ID)}
+    exact_complete = required <= target_stable_ids
+    marked = set() if exact_complete else marked_bone_names(obj)
+    if not exact_complete and not marked:
+        raise ValueError("select the rest bones you changed and click Mark Selected for Port")
     by_hash = {}
     for record in source["bones"]:
         if record["stable_id"] in required:
             by_hash.setdefault(record["name_hash"].lower(), []).append(record)
     mappings = {}
+    unmatched = []
     for bone in obj.data.bones:
+        if not exact_complete and bone.name not in marked:
+            continue
         stable_id = bone.get(STABLE_ID)
         if stable_id in required:
             records = [source_by_id[stable_id]]
             exact = True
-        elif stable_id is None and not bone.name.isdecimal():
-            records = by_hash.get(f"{bone_name_hash(bone.name):08x}", [])
-            exact = False
         else:
-            continue
+            records = by_hash.get(f"{armature_name_hash(bone.name):08x}", [])
+            exact = False
         if not records:
+            unmatched.append(bone.name)
             continue
         actual_parent = bone.parent
         actual_name = None if actual_parent is None else actual_parent.name
@@ -169,8 +184,11 @@ def target_mappings(obj, source):
                 raise ValueError(f"{record['display_name']}: multiple target bones map to one "
                                  "source identity")
             mappings[record["stable_id"]] = bone
+    if unmatched:
+        raise ValueError("marked bones are absent from the runtime dependency graph: " +
+                         ", ".join(unmatched))
     if not mappings:
-        raise ValueError("the selected armature has no named runtime-bone matches with the source")
+        raise ValueError("the selected armature has no marked runtime-bone matches with the source")
     return [(source_by_id[stable_id], bone) for stable_id, bone in mappings.items()]
 
 
@@ -178,7 +196,7 @@ def mapping_summary(obj, source_path):
     source = read_source(source_path)
     required = runtime_dependency_ids(source)
     mappings = target_mappings(obj, source)
-    mode = "stable IDs" if all(bone.get(STABLE_ID) for _, bone in mappings) else "named bones"
+    mode = "stable IDs" if all(bone.get(STABLE_ID) for _, bone in mappings) else "marked bones"
     return mode, len(mappings), len(required)
 
 
@@ -229,6 +247,40 @@ class HD2AA_OT_use_selected(Operator):
             settings.source_path = target.get(SOURCE_PATH)
         settings.status = "Target selected; choose the source contract if it was not embedded"
         self.report({"INFO"}, "Using selected armature: " + target.name)
+        return {"FINISHED"}
+
+
+class HD2AA_OT_mark_selected_bones(Operator):
+    bl_idname = "hd2aa.mark_selected_bones"
+    bl_label = "Mark Selected for Port"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.hd2aa
+        target = settings.target_object
+        if target is None or target.type != "ARMATURE":
+            self.report({"ERROR"}, "select the target armature first")
+            return {"CANCELLED"}
+        selected = sorted(bone.name for bone in target.data.bones if bone.select)
+        if not selected:
+            self.report({"ERROR"}, "select the rest bones that you intentionally changed")
+            return {"CANCELLED"}
+        target[PORT_BONES] = json.dumps(selected)
+        settings.status = f"Marked {len(selected)} bone(s) for port: " + ", ".join(selected)
+        self.report({"INFO"}, f"Marked {len(selected)} bone(s) for port")
+        return {"FINISHED"}
+
+
+class HD2AA_OT_clear_marked_bones(Operator):
+    bl_idname = "hd2aa.clear_marked_bones"
+    bl_label = "Clear Port Marks"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        target = context.scene.hd2aa.target_object
+        if target is not None and PORT_BONES in target:
+            del target[PORT_BONES]
+        context.scene.hd2aa.status = "Port bone marks cleared"
         return {"FINISHED"}
 
 
@@ -349,12 +401,18 @@ class HD2AA_PT_panel(Panel):
         layout.prop(settings, "target_object")
         layout.operator("hd2aa.use_selected")
         layout.label(text="Exports rest bones; Pose Mode changes are ignored", icon="INFO")
+        row = layout.row(align=True)
+        row.operator("hd2aa.mark_selected_bones")
+        row.operator("hd2aa.clear_marked_bones")
+        target = settings.target_object
+        marked = 0 if target is None else len(marked_bone_names(target))
+        layout.label(text=f"Explicitly marked bones: {marked}")
         layout.separator()
         layout.label(text="2. Binding contract (resolved once)")
         layout.prop(settings, "source_path")
         layout.label(text="Use *.hd2source.json, not *.patch_N", icon="INFO")
         layout.operator("hd2aa.map_exact_names", text="Check Automatic Mapping")
-        layout.label(text="Maps named runtime bones; anonymous nodes stay unchanged")
+        layout.label(text="Only marked bones are ported; all others stay unchanged")
         row = layout.row(align=True)
         row.operator("hd2aa.import_source", text="Import Source")
         row.operator("hd2aa.duplicate_target", text="Duplicate Imported Source")
@@ -371,7 +429,8 @@ class HD2AA_PT_panel(Panel):
         box.label(text=settings.status)
 
 
-CLASSES = (HD2AASettings, HD2AA_OT_use_selected, HD2AA_OT_import_source, HD2AA_OT_duplicate_target,
+CLASSES = (HD2AASettings, HD2AA_OT_use_selected, HD2AA_OT_mark_selected_bones,
+           HD2AA_OT_clear_marked_bones, HD2AA_OT_import_source, HD2AA_OT_duplicate_target,
            HD2AA_OT_map_exact_names, HD2AA_OT_validate, HD2AA_OT_export, HD2AA_PT_panel)
 
 
