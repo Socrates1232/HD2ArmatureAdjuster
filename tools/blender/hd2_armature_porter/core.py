@@ -6,12 +6,50 @@ import hashlib
 import json
 import math
 import pathlib
+import struct
 
 
 IDENTITY = [1.0, 0.0, 0.0, 0.0,
             0.0, 1.0, 0.0, 0.0,
             0.0, 0.0, 1.0, 0.0,
             0.0, 0.0, 0.0, 1.0]
+MASK64 = 0xFFFFFFFFFFFFFFFF
+
+
+def bone_name_hash(name: str) -> int:
+    data = name.encode("utf-8")
+    multiplier = 0xC6A4A7935BD1E995
+    value = (len(data) * multiplier) & MASK64
+    whole = len(data) // 8
+    for index in range(whole):
+        item = struct.unpack_from("<Q", data, index * 8)[0]
+        item = (item * multiplier) & MASK64
+        item ^= item >> 47
+        item = (item * multiplier) & MASK64
+        value ^= item
+        value = (value * multiplier) & MASK64
+    tail = data[whole * 8:]
+    for index in range(len(tail) - 1, -1, -1):
+        value ^= tail[index] << (8 * index)
+    if tail:
+        value = (value * multiplier) & MASK64
+    value ^= value >> 47
+    value = (value * multiplier) & MASK64
+    value ^= value >> 47
+    return value >> 32
+
+
+def parent_matches(source_by_id: dict, expected_parent_id: str | None,
+                   actual_parent_name: str | None,
+                   actual_parent_id: str | None = None) -> bool:
+    if expected_parent_id is None:
+        return actual_parent_name is None
+    if actual_parent_id == expected_parent_id:
+        return True
+    if actual_parent_name is None:
+        return False
+    expected_hash = source_by_id[expected_parent_id]["name_hash"].lower()
+    return f"{bone_name_hash(actual_parent_name):08x}" == expected_hash
 
 
 def canonical_bytes(value: object) -> bytes:

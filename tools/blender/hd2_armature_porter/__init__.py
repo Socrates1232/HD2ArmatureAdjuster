@@ -10,13 +10,13 @@ from bpy.props import BoolProperty, EnumProperty, PointerProperty, StringPropert
 from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Matrix
 
-from .core import build_rig, read_source, write_rig
+from .core import bone_name_hash, build_rig, parent_matches, read_source, write_rig
 
 
 bl_info = {
     "name": "HD2 Armature Adapter",
     "author": "HD2ArmatureAdjuster contributors",
-    "version": (1, 1, 0),
+    "version": (1, 1, 1),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > HD2AA",
     "description": "Port compatible custom rest armatures to HD2RIG1",
@@ -111,37 +111,36 @@ def collect_target(obj, source_path=None):
     stable_values = [bone.get(STABLE_ID) for bone in obj.data.bones if bone.get(STABLE_ID)]
     if len(stable_values) != len(set(stable_values)):
         raise ValueError("target contains duplicate stable IDs")
-    stable_ids = set(stable_values)
-    if not source_by_id.keys() <= stable_ids:
-        by_name = {bone.name: bone for bone in obj.data.bones}
-        mapped = 0
-        for record in source["bones"]:
-            name = record.get("display_name") or record["stable_id"]
-            bone = by_name.get(name)
-            if bone is None:
-                continue
-            parent_id = record["parent_id"]
-            expected_parent = None if parent_id is None else \
-                source_by_id[parent_id].get("display_name", parent_id)
-            actual_parent = None if bone.parent is None else bone.parent.name
-            if actual_parent != expected_parent:
-                raise ValueError(f"{name}: target parent {actual_parent!r} differs from "
-                                 f"source parent {expected_parent!r}")
-            matrix = bone.matrix_local if bone.parent is None else \
-                bone.parent.matrix_local.inverted() @ bone.matrix_local
-            local[record["stable_id"]] = _flat(matrix)
-            parents[record["stable_id"]] = parent_id
-            mapped += 1
-        if mapped == 0:
-            raise ValueError("the selected armature has no exact bone-name matches with the source")
-        return local, parents
+    by_stable_id = {bone.get(STABLE_ID): bone for bone in obj.data.bones
+                    if bone.get(STABLE_ID)}
+    by_name_hash = {}
     for bone in obj.data.bones:
-        stable_id = bone.get(STABLE_ID)
-        if not stable_id or stable_id not in source_by_id:
+        by_name_hash.setdefault(f"{bone_name_hash(bone.name):08x}", []).append(bone)
+    mapped = 0
+    for record in source["bones"]:
+        bone = by_stable_id.get(record["stable_id"])
+        if bone is None:
+            candidates = by_name_hash.get(record["name_hash"].lower(), [])
+            if len(candidates) > 1:
+                raise ValueError(f"{record['display_name']}: multiple target bones have the "
+                                 "same HD2 name hash")
+            bone = candidates[0] if candidates else None
+        if bone is None:
             continue
+        parent_id = record["parent_id"]
+        actual_parent = bone.parent
+        actual_parent_name = None if actual_parent is None else actual_parent.name
+        actual_parent_id = None if actual_parent is None else actual_parent.get(STABLE_ID)
+        if not parent_matches(source_by_id, parent_id, actual_parent_name, actual_parent_id):
+            expected = None if parent_id is None else source_by_id[parent_id]["name_hash"]
+            raise ValueError(f"{bone.name}: target parent {actual_parent_name!r} differs from "
+                             f"source parent hash {expected!r}")
         matrix = bone.matrix_local if bone.parent is None else bone.parent.matrix_local.inverted() @ bone.matrix_local
-        local[stable_id] = _flat(matrix)
-        parents[stable_id] = None if bone.parent is None else bone.parent.get(STABLE_ID)
+        local[record["stable_id"]] = _flat(matrix)
+        parents[record["stable_id"]] = parent_id
+        mapped += 1
+    if mapped == 0:
+        raise ValueError("the selected armature has no HD2 bone-name matches with the source")
     return local, parents
 
 
@@ -151,10 +150,10 @@ def mapping_summary(obj, source_path):
     stable_ids = {bone.get(STABLE_ID) for bone in obj.data.bones if bone.get(STABLE_ID)}
     if source_ids <= stable_ids:
         return "stable IDs", len(source_ids), len(source_ids)
-    names = {bone.name for bone in obj.data.bones}
-    mapped = sum((bone.get("display_name") or bone["stable_id"]) in names
+    name_hashes = {f"{bone_name_hash(bone.name):08x}" for bone in obj.data.bones}
+    mapped = sum(bone["stable_id"] in stable_ids or bone["name_hash"].lower() in name_hashes
                  for bone in source["bones"])
-    return "exact names", mapped, len(source["bones"])
+    return "stable IDs/name hashes", mapped, len(source["bones"])
 
 
 def package_from_scene(settings):

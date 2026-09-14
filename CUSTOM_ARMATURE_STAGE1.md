@@ -84,7 +84,7 @@ For an armature already modified from an exported HD2 avatar rig:
 
 1. Select the modified armature object and click **Use Selected Armature**.
 2. If the armature already carries `hd2_source_reference`, the add-on resolves it automatically. Otherwise select the generated `*.hd2source.json` once. A `.patch_N` file is not a source contract.
-3. Optionally click **Check Automatic Mapping**. Exact-name matching is performed automatically during validation, so this is only a coverage preview.
+3. Optionally click **Check Automatic Mapping**. Stable IDs and HD2 hashes calculated from Blender bone names are matched automatically during validation, so this is only a coverage preview. Generated contract names such as `node_c4787b4e_<variant>` therefore match a Blender bone named `l_clavicle` when their HD2 name hash is the same.
 4. Leave **Basis mode** at `Preserved` and **Capability** at `Automatic`.
 5. Click **Validate Target**. Source-only bones absent from this particular avatar armature remain unchanged; every mapped bone must preserve the expected parent relationship.
 6. Choose an output ending in `.hd2rig.json`, then click **Validate & Export Port**.
