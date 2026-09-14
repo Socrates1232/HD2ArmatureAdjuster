@@ -63,6 +63,16 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME inverse_bind_replacement_generator COMMAND ib_replacement_generator_test)
 
+    add_executable(retarget_core_test tests/retarget_core_test.cpp
+        src/retarget/math_affine.hpp src/retarget/evaluator.hpp src/retarget/plan_encoder.hpp
+        src/ib_layout.hpp)
+    target_compile_features(retarget_core_test PRIVATE cxx_std_17)
+    target_include_directories(retarget_core_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if(MSVC)
+        target_compile_options(retarget_core_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME custom_armature_retarget_core COMMAND retarget_core_test)
+
     add_executable(profile_scan_test tests/profile_scan_test.cpp src/profile_scan.hpp)
     target_compile_features(profile_scan_test PRIVATE cxx_std_17)
     target_include_directories(profile_scan_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
