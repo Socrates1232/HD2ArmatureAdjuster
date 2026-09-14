@@ -107,4 +107,6 @@ if(BUILD_TESTING)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/pose_branch_plan_test.py")
     add_test(NAME resource_monitor_summary
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/resource_monitor_summary_test.py")
+    add_test(NAME custom_armature_pipeline
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/custom_armature_pipeline_test.py")
 endif()
