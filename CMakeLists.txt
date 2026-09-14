@@ -14,8 +14,8 @@ if(NOT EXISTS "${RESHADE_INCLUDE_DIR}/reshade.hpp")
 endif()
 
 add_library(HD2PaletteProbe SHARED src/addon.cpp)
-target_sources(HD2PaletteProbe PRIVATE src/matrix_scan.hpp src/fingerprint_data.hpp
-    src/ib_layout.hpp src/ib_profile_data.hpp src/profile_scan.hpp src/wc_read.hpp)
+target_sources(HD2PaletteProbe PRIVATE src/ib_layout.hpp src/profile_scan.hpp
+    src/runtime_profile.hpp)
 target_compile_features(HD2PaletteProbe PRIVATE cxx_std_17)
 target_include_directories(HD2PaletteProbe PRIVATE
 	"${RESHADE_INCLUDE_DIR}")
@@ -33,6 +33,8 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+	find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
     add_executable(addon_load_test tests/addon_load_test.cpp)
     target_compile_features(addon_load_test PRIVATE cxx_std_17)
     target_include_directories(addon_load_test PRIVATE "${RESHADE_INCLUDE_DIR}")
@@ -42,8 +44,7 @@ if(BUILD_TESTING)
     add_test(NAME addon_loads_and_registers
         COMMAND addon_load_test "$<TARGET_FILE:HD2PaletteProbe>")
 
-    add_executable(ib_layout_test tests/ib_layout_test.cpp src/ib_layout.hpp
-        src/ib_profile_data.hpp)
+    add_executable(ib_layout_test tests/ib_layout_test.cpp src/ib_layout.hpp)
     target_compile_features(ib_layout_test PRIVATE cxx_std_17)
     target_include_directories(ib_layout_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     if(MSVC)
@@ -51,12 +52,21 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME inverse_bind_layouts COMMAND ib_layout_test)
 
-    add_executable(profile_scan_test tests/profile_scan_test.cpp
-        src/ib_profile_data.hpp src/profile_scan.hpp)
+    add_executable(profile_scan_test tests/profile_scan_test.cpp src/profile_scan.hpp)
     target_compile_features(profile_scan_test PRIVATE cxx_std_17)
     target_include_directories(profile_scan_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     if(MSVC)
         target_compile_options(profile_scan_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME converted_profile_scan COMMAND profile_scan_test)
+
+    add_executable(runtime_profile_test tests/runtime_profile_test.cpp src/runtime_profile.hpp)
+    target_compile_features(runtime_profile_test PRIVATE cxx_std_17)
+    target_include_directories(runtime_profile_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if(MSVC)
+        target_compile_options(runtime_profile_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME runtime_profile_format COMMAND runtime_profile_test)
+    add_test(NAME runtime_profile_pipeline
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/profile_pipeline_test.py")
 endif()

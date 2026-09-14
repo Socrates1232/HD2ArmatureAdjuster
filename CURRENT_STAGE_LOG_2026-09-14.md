@@ -2,7 +2,9 @@
 
 Snapshot date: 2026-09-14
 
-Validated implementation commit: `1a9b1cc`
+Mechanism-validation commit: `1a9b1cc`
+
+> **Architecture update (later on 2026-09-14):** the patch-specific A/B tables described in the historical sections below are no longer compiled into the add-on. The current implementation extracts immutable `HD2IBP1` packages from each finished patch and loads any selected set at runtime. See [`PROFILE_PIPELINE.md`](PROFILE_PIPELINE.md) and [`DYNAMIC_PROFILE_VALIDATION_2026-09-14.md`](DYNAMIC_PROFILE_VALIDATION_2026-09-14.md). The external path reproduced four exact hits, four guarded writes, 588 present-time readbacks, and exact restoration of all four targets. The old A/B run remains the evidence that established the underlying mechanism; its hardcoded packaging is superseded.
 
 Game: Helldivers 2
 
@@ -39,7 +41,7 @@ The decisive test used a deliberately exaggerated 1.5 m displacement of slot 7. 
 
 This proves live render control at the converted inverse-bind layer. It does not yet provide a general armature editor, automatic semantic bone names, per-vertex ownership display, arbitrary interactive transforms, or support for every armor component.
 
-The prototype is also no longer dependency-free in the strict discovery sense. It requires no VRM, armature file, or cheat sheet at runtime, but its current locator depends on an offline-generated A/B profile compiled into the add-on. That is an intentional validation bridge. A generalized offline fingerprint and mapping format remains future work.
+The prototype is also no longer dependency-free in the strict discovery sense. It requires no VRM, armature file, or cheat sheet at runtime, but its locator depends on offline profiles extracted from finished patches. Those profiles are external runtime data, not compiled constants. General semantic naming and vertex/remap mapping remain future work.
 
 ## Evidence level reached
 
@@ -188,10 +190,10 @@ The already validated 0.15 m A/B delta was scaled by ten with [`tools/scale_slot
 - byte-identical GPU and stream resources; and
 - selected slot present in the chosen profile LOD.
 
-It emits:
+At the original mechanism-validation commit it emitted:
 
 - [`profiles/b01_slot7_ab.json`](profiles/b01_slot7_ab.json), containing hashes, sizes, LOD records, and exact slot bytes; and
-- [`src/ib_profile_data.hpp`](src/ib_profile_data.hpp), containing the exact 88-entry A and B `t48` tables compiled into the add-on.
+- `src/ib_profile_data.hpp`, containing the exact 88-entry A and B `t48` tables compiled into the add-on. This generated header has since been removed.
 
 The profile JSON stores patch basenames, not local machine paths. The generated binary patch workspaces remain local and are not committed.
 
@@ -681,9 +683,11 @@ The current focused test suite contains:
 
 - `addon_loads_and_registers`: loads the add-on and verifies callback registration;
 - `inverse_bind_layouts`: verifies nontrivial `file64`/`t48` conversion, translation indices, affine inversion, and bind-space identity; and
-- `converted_profile_scan`: plants exact A/B tables among slot-anchor decoys and verifies classification and exclusion rules.
+- `converted_profile_scan`: plants multiple dynamic tables among slot-anchor decoys and verifies matching and exclusion rules;
+- `runtime_profile_format`: validates package parsing and corruption rejection; and
+- `runtime_profile_pipeline`: constructs a synthetic patch and validates extraction and LOD deduplication.
 
-All three passed after the final edit implementation.
+All five pass in the external-profile implementation.
 
 ### Read-only live validation
 
@@ -752,9 +756,11 @@ It does not yet have:
 
 The old anonymous candidate display should not be mistaken for the future slot interface. A clean interface should display only tables that have passed unit/profile ownership validation.
 
-## Recommended development workflow from here
+## Development workflow and current milestone status
 
 ### Milestone 1: extract the verified core
+
+Status: completed by the external-profile refactor.
 
 - Remove or isolate anonymous scanning, marker-tail upload code, hard-coded draw-index filters, and old residency probes.
 - Keep the `file64`/`t48` codec, exact profile scanner, telemetry, edit/restore guard, and runner.
@@ -772,6 +778,8 @@ Exit condition: the smaller add-on reproduces the same four hits and B/A/B edit 
 Exit condition: the console consistently reports the same validated unit slots without anonymous false positives.
 
 ### Milestone 3: add bounded arbitrary editing
+
+Status: translation editing completed and live-validated; rotation and scale are not implemented.
 
 - Replace exact A/B switching with a small user-selected transform delta.
 - Compose the desired adjustment using the verified matrix convention rather than modifying guessed float positions.
@@ -825,6 +833,6 @@ The original idea was partly correct but needed one architectural correction.
 
 It is feasible to alter visible skinned geometry at runtime by changing inverse-bind relationships while vanilla animation continues. The successful location is the loader-converted private `t48` table, not an arbitrary animated matrix array and not necessarily a downstream upload-ring copy.
 
-Pure runtime semantic armature reconstruction is not a dependable basis for the product. A small offline unit-analysis/profile stage is required to establish unit ownership, slot identity, hierarchy, remaps, and vertex influence. That stage does not need VRM or the reference project's runtime, but the current prototype still uses an exact compiled A/B profile rather than a generalized format.
+Pure runtime semantic armature reconstruction is not a dependable basis for the product. A small offline unit-analysis/profile stage is required to establish unit ownership, slot identity, hierarchy, remaps, and vertex influence. That stage does not need VRM or the reference project's runtime. The prototype now loads versioned external profiles containing the inverse-bind tables extracted from each finished patch; semantic hierarchy, remaps, and vertex influence are not yet part of the format.
 
-The next justified step is therefore no longer another broad scan. It is to strip the add-on around the verified converted-table path, expose those validated slots cleanly, and then add bounded arbitrary editing before expanding the offline semantic mapping.
+The next justified step is to extend the offline profile with semantic hierarchy, material remaps, and vertex influence, then expose stable human-readable controls above the validated unit-and-slot edit channel.

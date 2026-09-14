@@ -1,73 +1,109 @@
 # HD2 Armature Adjuster
 
-> **Validated mechanism:** the add-on found four B-01 converted inverse-bind tables and produced a reversible visible slot-7 deformation by switching exact B/A/B bytes. See [`LIVE_VALIDATION_2026-09-14.md`](LIVE_VALIDATION_2026-09-14.md). [`REVIEW_RESPONSE_2026-09-14.md`](REVIEW_RESPONSE_2026-09-14.md) records the architectural correction, and [`TEST_REPORT_2026-09-14.md`](TEST_REPORT_2026-09-14.md) preserves the earlier 69-run ledger.
+This prototype locates and edits Helldivers 2 loader-converted inverse-bind tables from external patch profiles. Patch-specific bytes are no longer compiled into the ReShade add-on.
 
-[`CURRENT_STAGE_LOG_2026-09-14.md`](CURRENT_STAGE_LOG_2026-09-14.md) is the authoritative consolidated description of the current mechanism, implementation, workflow, evidence, limitations, and next milestones.
+The validated mechanism is documented in [`CURRENT_STAGE_LOG_2026-09-14.md`](CURRENT_STAGE_LOG_2026-09-14.md). The external profile workflow and format are documented in [`PROFILE_PIPELINE.md`](PROFILE_PIPELINE.md), with live refactor evidence in [`DYNAMIC_PROFILE_VALIDATION_2026-09-14.md`](DYNAMIC_PROFILE_VALIDATION_2026-09-14.md).
 
-The current validation build searches process memory for an exact offline-generated A/B profile of B-01's converted inverse binds. Its default scan is read-only. An explicit automated edit test can switch the known slot between exact A and B bytes and restore the installed state.
+## Current architecture
 
-The older generic mapped-buffer and upload-ring experiments remain in the history, but they are not the verified control path.
+```text
+finished .patch_N
+        |
+        v
+extract_runtime_profile.py
+        |
+        +-- .hd2profile       exact converted IB tables + patch identity
+        +-- .hd2profile.json  reviewable manifest
+                    |
+                    v
+HD2ArmatureProfiles beside the add-on
+                    |
+                    v
+ReShade add-on: exact locate -> guarded slot edit -> readback -> restore
+```
+
+Each profile represents one finished main patch bundle. It may contain several unit IDs and LOD tables. Identical tables shared by multiple LODs are stored once with an LOD mask. Multiple active profile files compose at runtime.
+
+The current example profile contains B-01 unit `fa269172bd08695b`: one 88-entry table shared by LODs 0-3 and separate 2-entry and 4-entry reduced LOD tables.
+
+## Generate a profile
+
+Run this after a patch has reached its final form:
+
+```powershell
+python tools/extract_runtime_profile.py `
+  --patch "path\to\0123456789abcdef.patch_0" `
+  --out "profiles\runtime\0123456789abcdef.patch_0.hd2profile"
+```
+
+By default every parseable unit resource in the patch is extracted. To restrict the output, repeat `--unit`:
+
+```powershell
+python tools/extract_runtime_profile.py `
+  --patch "path\to\0123456789abcdef.patch_0" `
+  --unit fa269172bd08695b `
+  --out "profiles\runtime\b01-chest.hd2profile"
+```
+
+The command also writes `<output>.json`. Treat a nonzero exit as a patch-pipeline failure. Do not modify the patch after extraction; its SHA-256 is embedded in the profile.
 
 ## Build
 
-The build uses the official ReShade 6.5.1 headers at API version 17, matching the runtime currently installed with the game. The pinned SDK revision is `f1332dfe8fb1c61a726d53af069cc2a2fcacae7f`.
-
-Prepare the build-only dependency from the repository root:
+The build uses the official ReShade 6.5.1 headers at add-on API 17. The pinned SDK revision is `f1332dfe8fb1c61a726d53af069cc2a2fcacae7f`.
 
 ```powershell
 git clone --depth 1 --branch v6.5.1 --filter=blob:none --sparse https://github.com/crosire/reshade.git deps/reshade
 git -C deps/reshade sparse-checkout set --no-cone /include/ /LICENSE.md
-```
-
-Then build with a 64-bit Visual Studio generator:
-
-```powershell
 cmake -S . -B build -A x64
 cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-The add-on is produced at `build/bin/Release/HD2PaletteProbe.addon64`.
+The Visual Studio build produces `build/bin/Release/HD2PaletteProbe.addon64`.
 
-## Run
+## Install
 
-Use a 64-bit ReShade installation with full add-on support. This build requests API version 17 and is tested against ReShade 6.5.1. Copy `HD2PaletteProbe.addon64` beside ReShade in the game's executable directory and launch the game. The separate console reports full A/B converted-table hits and partial-anchor diagnostics. `F9` requests another scan after the current worker has finished.
+With the game stopped:
 
-The scanner excludes mapped graphics buffers, its own module, and its scratch storage. A hit is accepted only when all 88 entries equal profile A or profile B.
+1. Copy `HD2PaletteProbe.addon64` into `Helldivers 2\bin`, beside ReShade's `dxgi.dll`.
+2. Create `Helldivers 2\bin\HD2ArmatureProfiles`.
+3. Copy the desired `.hd2profile` files into that directory.
+4. Put their filenames, one per line, in `active_profiles.txt` in the same directory.
 
-## Automated live test
+If `active_profiles.txt` is absent, the add-on loads every `.hd2profile` in the directory. An explicit list is recommended because it prevents stale profiles from silently becoming active.
 
-The add-on writes a one-second heartbeat to `%LOCALAPPDATA%\HD2ArmatureAdjuster\telemetry.json`.
+The add-on validates profile structure and checksums, then looks only for complete exact 48-byte-per-entry table matches. `F9` requests a rescan. The standalone console reports loaded files, tables, errors, unit IDs, LOD masks, entry counts, and matched addresses.
 
-Before launch, the runner requires the installed B-01 patch triplet to match exact profile A or B. Any other patch intentionally fails this gate. After installing a controlled triplet and building, run:
+## Automated validation
+
+The runner validates that each profile's embedded main-patch basename and SHA-256 match the installed patch before deploying anything:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/run_live_test.ps1 `
   -GameRoot "F:\Steam\steamapps\common\Helldivers 2" `
-  -ObserveSeconds 90
+  -PreflightOnly
 ```
 
-For the explicit reversible A/B edit and Steam evidence captures:
+Run a read-only exact-match test:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/run_live_test.ps1 `
-  -ObserveSeconds 90 -AutomateInput -EditTest -SteamCapture -ShutdownAfterTest
+  -ObserveSeconds 90 -AutomateInput -SteamCapture -ShutdownAfterTest
 ```
 
-The runner validates and deploys the newest DLL, launches through Steam if necessary, reads only the latest 600 ReShade log lines, watches telemetry, and saves `test-results/<timestamp>/summary.json`. A pass requires fresh telemetry from the exact process, `experiment_mode == converted_ib_scan`, and at least one full converted-table match. Anonymous motion and CPU write/readback are not pass conditions.
+Run an explicit reversible edit, expressed as a world-space translation in metres:
 
-Add-on capture and direct window capture remain disabled. With `-AutomateInput -SteamCapture`, a scan run records named load, ready, walk, and stretch states. Adding `-EditTest` switches every exact converted-table hit from the installed A/B slot bytes to the opposite profile, holds the state, captures before/active/restored through Steam, and restores the installed bytes. `-ShutdownAfterTest` terminates only the exact tested process; omit it to leave the game open.
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/run_live_test.ps1 `
+  -ObserveSeconds 90 -AutomateInput -EditTest `
+  -EditUnit fa269172bd08695b -EditSlot 7 -EditX -1.5 `
+  -SteamCapture -ShutdownAfterTest
+```
 
-Run `tools/run_live_test.ps1 -RecoverOnly` after a crash. It checks live and half-terminated `helldivers2.exe` entries, attempts ordinary exact-PID cleanup, and verifies that the installed add-on is unlocked. If an already-exited process remains, `tools/recover_game_elevated.ps1` can repeat exact-PID cleanup through a UAC prompt. Both procedures refuse PID reuse and never manage Steam. If Windows still retains the process, restart Windows instead of terminating individual threads.
+An edit is attempted only after a full profile-table match. Every target must still equal the profiled source bytes immediately before writing. The add-on verifies its write, maintains it if the engine refills the exact source value, and restores only values that still equal its injected bytes. Unknown third-party or engine states are not overwritten.
 
-Synthetic input may be ignored by the game or its anti-cheat. The runner waits for normal scene rendering and reports `failed-input` instead of claiming a walking pass when the opening movie remains active.
+Telemetry is written to `%LOCALAPPDATA%\HD2ArmatureAdjuster\telemetry.json`; test artifacts go to `test-results/<timestamp>`.
 
-Use `-PreflightOnly` to validate the paths, exact A/B patch state, ReShade installation, DLL architecture, hash, and deployment without launching the game.
+## Scope
 
-Positive report states are `passed-converted-scan` and `passed-converted-edit`. A clean run with no exact match reports `failed-no-converted-match`; inspect the partial-candidate fields before changing the search.
-
-`runtime_active` requires a heartbeat no more than five seconds old. The report also records whether the game process is alive and whether ReShade's last add-on event was registration or unregistration, so a frozen or detached runtime is not reported as a pass.
-
-## What a useful result looks like
-
-An exact A/B hit establishes the profiled converted representation. A reversible visible B/A/B edit establishes render consumption. Both gates passed for B-01 slot 7; general unit discovery and semantic armature reconstruction remain future work.
+This proves external-profile-driven inverse-bind discovery and reversible slot control. It does not yet provide semantic bone names, vertex-to-slot ownership, an interactive editor, or an automatic choice of which unit/slot a user intends to change. Those require additional offline metadata and mapping stages.

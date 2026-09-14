@@ -48,4 +48,13 @@ inline void file64_to_t48(const void *file64, void *t48)
 {
 	encode_t48(decode_file64(file64), t48);
 }
+
+inline void translate_world_t48(const void *source, float x, float y, float z, void *destination)
+{
+	auto matrix = decode_t48(source);
+	for (size_t column = 0; column < 3; ++column)
+		matrix[12 + column] += x * matrix[column] + y * matrix[4 + column] +
+			z * matrix[8 + column];
+	encode_t48(matrix, destination);
+}
 }

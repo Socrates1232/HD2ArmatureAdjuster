@@ -1,5 +1,4 @@
 #include "ib_layout.hpp"
-#include "ib_profile_data.hpp"
 
 #include <algorithm>
 #include <array>
@@ -86,33 +85,16 @@ int main()
 		return 1;
 	}
 
-	std::array<uint8_t, 48> profile_a {};
-	std::array<uint8_t, 48> profile_b {};
-	armature_probe::file64_to_t48(armature_ib_profile::a_file64_slot.data(), profile_a.data());
-	armature_probe::file64_to_t48(armature_ib_profile::b_file64_slot.data(), profile_b.data());
-	const size_t profile_offset = static_cast<size_t>(armature_ib_profile::slot) * 48;
-	if (std::memcmp(profile_a.data(), armature_ib_profile::a_t48.data() + profile_offset,
-		profile_a.size()) != 0 ||
-		std::memcmp(profile_b.data(), armature_ib_profile::b_t48.data() + profile_offset,
-		profile_b.size()) != 0)
+	std::array<uint8_t, 48> translated_bytes {};
+	armature_probe::translate_world_t48(packed_bytes.data(), 0.5f, -0.25f, 2.0f,
+		translated_bytes.data());
+	affine_matrix translated = source;
+	for (size_t column = 0; column < 3; ++column)
+		translated[12 + column] += 0.5f * source[column] - 0.25f * source[4 + column] +
+			2.0f * source[8 + column];
+	if (armature_probe::decode_t48(translated_bytes.data()) != translated)
 	{
-		std::cerr << "generated A/B profile conversion failed\n";
-		return 1;
-	}
-	const auto a_profile_matrix = armature_probe::decode_t48(profile_a.data());
-	const auto b_profile_matrix = armature_probe::decode_t48(profile_b.data());
-	for (size_t index = 0; index < 16; ++index)
-		if (index != 12 && index != 13 && index != 14 &&
-			a_profile_matrix[index] != b_profile_matrix[index])
-		{
-			std::cerr << "A/B profile changed a non-translation component\n";
-			return 1;
-		}
-	if (a_profile_matrix[12] == b_profile_matrix[12] &&
-		a_profile_matrix[13] == b_profile_matrix[13] &&
-		a_profile_matrix[14] == b_profile_matrix[14])
-	{
-		std::cerr << "A/B profile has no translation change\n";
+		std::cerr << "world-space t48 translation failed\n";
 		return 1;
 	}
 

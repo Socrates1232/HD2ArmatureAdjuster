@@ -1,5 +1,9 @@
 #!/usr/bin/env python
-"""Build an exact file64/t48 A/B profile from two HD2 patch bundles."""
+"""Build a JSON-only A/B evidence report from two HD2 patch bundles.
+
+Runtime packages are produced by extract_runtime_profile.py. This historical
+validator intentionally does not emit C++ headers.
+"""
 
 from __future__ import annotations
 
@@ -94,49 +98,6 @@ def triplet_hashes(main_path: str) -> dict:
     return result
 
 
-def bytes_literal(data: bytes) -> str:
-    rows = []
-    for offset in range(0, len(data), 16):
-        rows.append("\t" + ", ".join(f"0x{value:02X}" for value in data[offset:offset + 16]))
-    return ",\n".join(rows)
-
-
-def write_header(path: str, profile: dict, a_t48: bytes, b_t48: bytes,
-                 a_slot: bytes, b_slot: bytes) -> None:
-    profile_record = next(item for item in profile["lods"]
-                          if item["lod"] == profile["profile_lod"])
-    text = f"""#pragma once
-
-#include <array>
-#include <cstddef>
-#include <cstdint>
-
-namespace armature_ib_profile
-{{
-constexpr uint64_t unit_id = 0x{profile['unit_id']}ull;
-constexpr uint32_t lod = {profile['profile_lod']};
-constexpr uint32_t slot = {profile['slot']};
-constexpr uint32_t count = {profile_record['bones']};
-constexpr size_t t48_bytes = count * 48;
-
-constexpr std::array<uint8_t, 64> a_file64_slot = {{
-{bytes_literal(a_slot)}
-}};
-constexpr std::array<uint8_t, 64> b_file64_slot = {{
-{bytes_literal(b_slot)}
-}};
-constexpr std::array<uint8_t, t48_bytes> a_t48 = {{
-{bytes_literal(a_t48)}
-}};
-constexpr std::array<uint8_t, t48_bytes> b_t48 = {{
-{bytes_literal(b_t48)}
-}};
-}}
-"""
-    with open(path, "w", encoding="utf-8", newline="\n") as stream:
-        stream.write(text)
-
-
 def build(a_path: str, b_path: str, unit_id: int, slot: int, profile_lod: int) -> tuple[dict, bytes, bytes, bytes, bytes]:
     a_bundle = read_file(a_path)
     b_bundle = read_file(b_path)
@@ -223,7 +184,6 @@ def main() -> int:
     parser.add_argument("--slot", required=True, type=int)
     parser.add_argument("--lod", type=int, default=0)
     parser.add_argument("--out", required=True, help="output JSON profile")
-    parser.add_argument("--header", required=True, help="output C++ profile header")
     args = parser.parse_args()
 
     profile, a_t48, b_t48, a_slot, b_slot = build(
@@ -232,7 +192,6 @@ def main() -> int:
     with open(args.out, "w", encoding="utf-8", newline="\n") as stream:
         json.dump(profile, stream, indent=2)
         stream.write("\n")
-    write_header(args.header, profile, a_t48, b_t48, a_slot, b_slot)
     print(json.dumps({"unit": profile["unit_id"], "slot": profile["slot"],
                       "lod": profile["profile_lod"],
                       "main_bytes_changed": profile["main_bytes_changed"],
