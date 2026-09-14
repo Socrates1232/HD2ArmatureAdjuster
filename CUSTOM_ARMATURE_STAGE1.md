@@ -5,11 +5,11 @@
 Stage 1 now has two connected deliverables:
 
 - `HD2 Armature Adapter`, a Blender 4.2+ extension and headless exporter that turns a compatible edited rest armature into a deterministic `HD2RIG1` package.
-- `HD2 Armature Profile Runtime 1.2`, a ReShade add-on that associates that package with exact active patch profiles, recovers current native bone motion from a live skinning palette, generates replacement inverse-bind values, and publishes/restores them with guarded revision ownership.
+- `HD2 Armature Profile Runtime 1.3`, a ReShade add-on that associates that package with exact active patch profiles, recovers current native bone motion from a live skinning palette, generates replacement inverse-bind values, and publishes/restores them with guarded revision ownership.
 
 The original patches and `.vrm` files are read-only inputs. The workflow neither fingerprints nor rewrites them.
 
-The offline implementation and the real 257-bone/27-table package have passed the repository test suite and the runtime's strict C++ package parser. The first live deployment loaded the package successfully, but pressing F8 froze the game before the runtime recorded an accepted toggle or built a replacement plan. Stage 1 is therefore not live-validated. See [`CUSTOM_ARMATURE_LIVE_FAILURE_2026-09-14.md`](CUSTOM_ARMATURE_LIVE_FAILURE_2026-09-14.md).
+The offline implementation and the real 257-bone/27-table package have passed the repository test suite and the runtime's strict C++ package parser. The first live deployment loaded the package successfully, but pressing F8 froze the game. Runtime 1.3 removes the synchronous scan/service path that caused the freeze and is offline-verified, but it has not yet passed the replacement live gate. See [`CUSTOM_ARMATURE_LIVE_FAILURE_2026-09-14.md`](CUSTOM_ARMATURE_LIVE_FAILURE_2026-09-14.md).
 
 ## Supported Stage-1 edit class
 
@@ -186,7 +186,7 @@ A valid custom rig takes ownership of F8. If no valid custom rig is configured, 
 
 ## 5. Runtime behavior
 
-F8 toggles persistent desired state:
+F8 publishes only a persistent atomic desired-state revision and wakes a below-normal-priority worker:
 
 - ON: discover a unique matching IB instance, locate a qualifying live palette, recover native bone transforms, build the current plan, then publish it.
 - OFF: restore the exact pristine table only when the complete live bytes still equal this runtime's last verified revision.
@@ -209,7 +209,7 @@ B_write_i = translate(inverse(linear(W_i)) * d_i) * B_mesh_i
 
 This is why every descendant follows a moved clavicle while retaining its current animated orientation. The add-on does not contain shoulder slot numbers, bone names, or hand-authored per-level offsets.
 
-The pose provider validates parent/child rest-length evidence before accepting a matrix-shaped region. A currently mapped buffer is scanned in bounded 256 KiB slices; scan rounds rotate across mapped resources. Once a pose is found, a bounded 256 KiB neighborhood around that resource is preferred for continuity. All associated table layouts share one scan pass, and no new game buffer maps are issued by this scanner.
+The pose provider validates parent/child rest-length evidence before accepting a matrix-shaped region. The worker scans a 16 KiB payload with 8 KiB overlap per step and rotates across mapped resources. Once a pose is found, a bounded neighborhood around that resource is preferred for continuity. Map callbacks only copy one small candidate window into a single replaceable mailbox; pose matching, planning, and publication never run on the presentation callback. All associated table layouts share one scan pass, and no new game buffer maps are issued by this scanner.
 
 The publisher has one owner per table and a monotonic revision. Each changed 48-byte slot is written and read back. A partial failure rolls back to the last verified complete image. If a scene refills a retained table with exact pristine bytes, ownership rebases and the desired rig is reapplied. Unknown readable bytes are not overwritten.
 
@@ -227,7 +227,7 @@ Runtime status is explicit:
 
 ## 6. Monitoring
 
-The console and `%LOCALAPPDATA%\HD2ArmatureAdjuster\telemetry.json` report custom mapped bytes, candidate palettes, qualified samples, built plans, publications, restores, scan calls, last/max scan time, and scan wall-time percentage.
+The console and `%LOCALAPPDATA%\HD2ArmatureAdjuster\telemetry.json` report custom mapped bytes, candidate palettes, qualified samples, built plans, publications, restores, scan calls, last/max scan time, requested/accepted intent revisions, worker busy state, and worker cycle time.
 
 Each session also appends these custom fields to `resource-monitor-<session>.csv`. They separate the live-palette sweep from the existing process-memory IB discovery, maintenance, and rebind measurements.
 
@@ -246,9 +246,9 @@ The current offline gate covers:
 - add-on loading and ReShade callback registration;
 - the pre-existing profile, shoulder, scene-sidecar, monitoring, and lifecycle tests.
 
-The test suite currently reports 16/16 passing. The real validation package contains 257 logical bones, 27 exact tables, and 1,625 slot mappings, and it loads successfully through the runtime's C++ `HD2RIG1` parser.
+The test suite currently reports 18/18 passing, including the atomic intent-mailbox and non-blocking presentation-path regressions. The real validation package contains 257 logical bones, 27 exact tables, and 1,625 slot mappings, and it loads successfully through the runtime's C++ `HD2RIG1` parser.
 
-The remaining gate is a controlled in-game run after the F8 freeze is diagnosed. Until a run reaches `APPLIED`, visibly follows animation, restores on F8, and survives a scene transition, the runtime should be described as implemented and offline-verified—not live-validated.
+The remaining gate is a controlled in-game run of runtime 1.3. Until a run remains responsive after F8, reaches `APPLIED`, visibly follows animation, restores on F8, and survives a scene transition, the runtime should be described as implemented and offline-verified—not live-validated.
 
 ## Implementation record
 

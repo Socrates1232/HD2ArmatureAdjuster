@@ -21,6 +21,8 @@ def main() -> int:
         "maintenance_table_checks", "maintenance_read_mib", "maintenance_max_us",
         "maintenance_wall_percent", "rebind_calls", "rebind_candidates",
         "rebind_instances_added", "rebind_max_us", "rebind_wall_percent",
+        "custom_worker_busy", "custom_worker_cycles", "custom_worker_last_us",
+        "custom_worker_max_us", "custom_worker_total_ms",
     ]
     rows = [
         dict.fromkeys(fields, "0") | {
@@ -40,6 +42,9 @@ def main() -> int:
             "maintenance_wall_percent": "0.2", "rebind_calls": "2",
             "rebind_candidates": "6", "rebind_instances_added": "2",
             "rebind_max_us": "40", "rebind_wall_percent": "0.05",
+            "custom_worker_busy": "1", "custom_worker_cycles": "4",
+            "custom_worker_last_us": "200", "custom_worker_max_us": "350",
+            "custom_worker_total_ms": "0.8",
         },
     ]
     with tempfile.TemporaryDirectory() as temporary:
@@ -61,6 +66,9 @@ def main() -> int:
     assert result["scanner"]["cpu_core_percent_peak_sample"] == 7.0
     assert result["maintenance"]["wall_us_peak_call"] == 30.0
     assert result["rebind"]["instances_added"] == 2
+    assert result["custom_worker"]["cycles"] == 4
+    assert result["custom_worker"]["busy_samples"] == 1
+    assert result["custom_worker"]["wall_us_peak_cycle"] == 350.0
     return 0
 
 

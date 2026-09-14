@@ -16,6 +16,7 @@ endif()
 add_library(HD2PaletteProbe SHARED src/addon.cpp)
 target_sources(HD2PaletteProbe PRIVATE src/ib_layout.hpp src/instance_lifecycle.hpp
     src/profile_scan.hpp src/runtime_profile.hpp src/retarget/custom_runtime.hpp
+    src/retarget/custom_intent.hpp
     src/retarget/live_palette.hpp src/retarget/publisher.hpp src/retarget/runtime_adapter.hpp
     src/retarget/rig_package.hpp src/retarget/json.hpp src/retarget/sha256.hpp
     src/retarget/plan_encoder.hpp src/retarget/evaluator.hpp src/retarget/math_affine.hpp)
@@ -99,6 +100,15 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME custom_armature_live_palette COMMAND live_palette_test)
 
+    add_executable(custom_intent_test tests/custom_intent_test.cpp
+        src/retarget/custom_intent.hpp)
+    target_compile_features(custom_intent_test PRIVATE cxx_std_17)
+    target_include_directories(custom_intent_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if(MSVC)
+        target_compile_options(custom_intent_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME custom_armature_intent_mailbox COMMAND custom_intent_test)
+
     add_executable(publisher_test tests/publisher_test.cpp src/retarget/publisher.hpp)
     target_compile_features(publisher_test PRIVATE cxx_std_17)
     target_include_directories(publisher_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -143,4 +153,6 @@ if(BUILD_TESTING)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/resource_monitor_summary_test.py")
     add_test(NAME custom_armature_pipeline
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/custom_armature_pipeline_test.py")
+    add_test(NAME nonblocking_present_path
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/present_path_test.py")
 endif()

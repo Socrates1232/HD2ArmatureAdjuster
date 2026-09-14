@@ -56,13 +56,29 @@ custom_scan_wall_us_max      3562622
 shoulder_toggle_count        0
 ```
 
-The snapshot did not record the F8 transition. Therefore the available evidence only bounds the fault to the interval between the user's key press and the next successful telemetry publication. It does not yet distinguish among the input callback, synchronous activation work, a deadlock, a long blocking scan, or a process crash.
+Runtime 1.2 had no custom intent counter. `shoulder_toggle_count` belongs to the inactive legacy shoulder controller and says nothing about the custom F8 transition. The final snapshot therefore cannot establish the last accepted custom intent from `custom_desired_enabled` alone.
 
-The scanner cost is independently suspicious and must be reviewed: 60 calls consumed 19.1 seconds of aggregate wall time, with one call lasting 3.56 seconds. That correlation is not proof that scanning caused the freeze.
+## Diagnosis
+
+Source inspection found the blocking path in runtime 1.2:
+
+```text
+on_present
+  -> F8 toggles custom runtime
+  -> scan_custom_pose_input
+       -> scan and validate about 264 KiB against every rig table
+  -> custom_runtime.service
+```
+
+This is not merely a correlation. The expensive scan and service were directly invoked by the ReShade presentation callback. Telemetry measured 19.1 seconds of aggregate scan wall time across 60 calls, with one call taking 3.56 seconds. Repeating that work on the render thread explains the visible freeze.
+
+Runtime 1.3 removes both operations from `on_present`. F8 now publishes one atomic intent revision, enables or disables small mapped-window capture, and signals a below-normal-priority worker. The worker owns pose matching, plan construction, guarded publication, and restoration. Scan steps are reduced to a 16 KiB payload plus 8 KiB overlap, and the generic hunt-thread cleanup no longer waits for up to one second on the presentation callback.
+
+Telemetry schema 9 records the requested intent/revision separately from the worker-accepted revision and exposes worker busy/cycle timing. The resource CSV contains the same worker cost fields.
 
 ## Review target
 
-The next review should trace the F8 path from key-edge detection to desired-state publication and identify any blocking work performed on the presentation/input thread. No further live deployment should be treated as a validation run until activation is bounded and observable before expensive discovery begins.
+The next review should verify that `on_present` contains no custom scan, plan, publication, restoration, or blocking worker wait. The next live test should first establish responsiveness and intent acknowledgement before judging deformation.
 
 Minimum required instrumentation for the next build:
 
@@ -77,4 +93,4 @@ PUBLISH_STARTED
 PUBLISH_FINISHED
 ```
 
-Each event should be append-only and timestamped so a freeze cannot erase the last reached transition.
+Runtime 1.3 exposes the equivalent requested/accepted boundary through telemetry counters. Append-only transition logging remains a useful follow-up if another process-ending fault prevents the periodic snapshot from being written.

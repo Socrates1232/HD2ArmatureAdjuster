@@ -77,6 +77,15 @@ def summarize(path: Path) -> dict[str, object]:
             "wall_us_peak_call": peak("rebind_max_us"),
             "wall_percent_peak_sample": peak("rebind_wall_percent"),
         },
+        "custom_worker": {
+            "cycles": int(number(last, "custom_worker_cycles")),
+            "busy_samples": sum(
+                1 for row in rows if number(row, "custom_worker_busy") != 0
+            ),
+            "wall_us_last": number(last, "custom_worker_last_us"),
+            "wall_us_peak_cycle": peak("custom_worker_max_us"),
+            "wall_ms_total": number(last, "custom_worker_total_ms"),
+        },
     }
 
 
