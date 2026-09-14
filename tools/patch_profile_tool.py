@@ -17,6 +17,7 @@ from build_ib_profile import (file64_to_t48, inverse_bind_tables, read_file, sha
 from extract_runtime_profile import (HEADER_SIZE, MAGIC, RECORD_HEADER_SIZE,
                                      UNIT_TYPE, bundle_entries, fnv1a, generate_profile,
                                      write_atomic)
+from rig_sidecar import export_rig_tree
 
 
 PATCH_NAME = re.compile(r"^[0-9a-fA-F]{16}\.patch_[0-9]+$")
@@ -620,6 +621,15 @@ def build_parser() -> argparse.ArgumentParser:
     tree_command.add_argument("--out-dir", required=True)
     tree_command.add_argument("--force", action="store_true")
 
+    rig_command = commands.add_parser(
+        "rig-sidecars", help="export per-unit semantic rig sidecars without editing patches")
+    rig_command.add_argument("--root", required=True)
+    rig_command.add_argument("--out-dir", required=True)
+    rig_command.add_argument(
+        "--role", action="append", default=[], metavar="ROLE=NODE_NAME",
+        help="assign a known chest/shoulder/elbow/hand node name; repeatable")
+    rig_command.add_argument("--force", action="store_true")
+
     branch_command = commands.add_parser(
         "shoulder-targets",
         help="derive table-qualified shoulder and descendant slots from scene graphs")
@@ -679,6 +689,14 @@ def main() -> int:
                 "unique_runtime_tables": result["unique_runtime_tables"],
                 "distinct_units": result["distinct_units"],
                 "skipped_patches": len(result["skipped_patches"]),
+            }, indent=2))
+        elif args.command == "rig-sidecars":
+            result = export_rig_tree(args.root, args.out_dir, args.role, args.force)
+            print(json.dumps({
+                "output_directory": os.path.abspath(args.out_dir),
+                "sidecars": len(result["sidecars"]),
+                "skipped_units": len(result["skipped_units"]),
+                "configured_roles": result["configured_roles"],
             }, indent=2))
         elif args.command == "shoulder-targets":
             left = tuple(args.left_translate)

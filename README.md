@@ -80,6 +80,27 @@ branches through every LOD's `RealIndices`, and qualifies every output slot with
 the exact table's FNV-1a fingerprint. It rejects an exact runtime table if the
 same slot has conflicting semantics in another LOD or replacement variant.
 
+The isolated pose-correct producer work starts with semantic sidecars:
+
+```powershell
+python tools/patch_profile_tool.py rig-sidecars `
+  --root "build\converted-mod" `
+  --out-dir "build\converted-mod\HD2ArmatureProfiles" `
+  --role chest=KNOWN_CHEST_NAME `
+  --role left_elbow=KNOWN_LEFT_ELBOW_NAME `
+  --role right_elbow=KNOWN_RIGHT_ELBOW_NAME `
+  --role left_hand=KNOWN_LEFT_HAND_NAME `
+  --role right_hand=KNOWN_RIGHT_HAND_NAME
+```
+
+`l_shoulder` and `r_shoulder` are the only default role names because they are
+already established by the existing pipeline. Other roles must be supplied from
+known asset data; the exporter does not guess animation-node names. Each
+`*.hd2rig.json` retains the raw local TransformData, stored rest matrices, raw
+and validated parents, per-LOD slot mapping, exact table identities, and complete
+shoulder branches without falloff. This command reads patches and writes only
+JSON sidecars. The current runtime does not consume them yet.
+
 The normal preset is a tapered shape adjustment: shoulder entries receive
 `0.03 m`, depth-one descendants `0.02 m`, depth-two descendants `0.01 m`, and
 depth-three or deeper descendants are left pristine. This reaches zero at the

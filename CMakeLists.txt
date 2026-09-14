@@ -53,6 +53,16 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME inverse_bind_layouts COMMAND ib_layout_test)
 
+    add_executable(ib_replacement_generator_test tests/ib_replacement_generator_test.cpp
+        src/ib_replacement_generator.hpp src/ib_layout.hpp)
+    target_compile_features(ib_replacement_generator_test PRIVATE cxx_std_17)
+    target_include_directories(ib_replacement_generator_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if(MSVC)
+        target_compile_options(ib_replacement_generator_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME inverse_bind_replacement_generator COMMAND ib_replacement_generator_test)
+
     add_executable(profile_scan_test tests/profile_scan_test.cpp src/profile_scan.hpp)
     target_compile_features(profile_scan_test PRIVATE cxx_std_17)
     target_include_directories(profile_scan_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -81,6 +91,8 @@ if(BUILD_TESTING)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/profile_pipeline_test.py")
     add_test(NAME shoulder_branch_pipeline
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/branch_target_pipeline_test.py")
+    add_test(NAME semantic_rig_sidecar_pipeline
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/rig_sidecar_pipeline_test.py")
     add_test(NAME resource_monitor_summary
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/resource_monitor_summary_test.py")
 endif()
