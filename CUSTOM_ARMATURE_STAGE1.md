@@ -241,3 +241,18 @@ The current offline gate covers:
 The test suite currently reports 16/16 passing. The real validation package contains 257 logical bones, 27 exact tables, and 1,625 slot mappings, and it loads successfully through the runtime's C++ `HD2RIG1` parser.
 
 The remaining gate is a controlled in-game run of this new binary and package. Until that run reaches `APPLIED`, visibly follows animation, restores on F8, and survives a scene transition, the runtime should be described as implemented and offline-verified—not live-validated.
+
+## Implementation record
+
+- Working branch: `custom-armature-stage1`
+- Pre-Stage-1 source head: `83d04e805ae170de7f2e40c2b93ed109819cd9d3`
+- Working-baseline merge base: `361928ef11797570bfc8fdf2bba3d6eef4e0917b`
+- Retarget-core commit: `8f65553`
+- Porter-pipeline commit: `b0dd16d`
+- Runtime commit: `a220a55`
+- Completed workflow commit: `41bafe0`
+- Installed legacy add-on observed before deployment: SHA-256 `dc6a72aa8b8e9770e3e7ae62f25385e2cc2e140b9091882bea282d3488a639f4`, 432,640 bytes
+- Real source export: SHA-256 `80eff04df8d8a5690a1917ef5c0a61eb2972351035a2ff5111f109ac88b83372`; a second independent export was byte-identical
+- Real example rig: SHA-256 `5284c789b0343329ecbc5125d101e2551c6fa113016ee6c442c214077d5cdc23`
+
+The supplied NumPy oracle passed its 20 tests before implementation. Blender itself was not present on this machine, so the extension source was syntax-checked and its archive layout verified, but its UI operators still require a Blender smoke test.
